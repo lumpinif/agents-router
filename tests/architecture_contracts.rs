@@ -96,6 +96,67 @@ fn continuation_support_does_not_define_parallel_fact_sources() {
     }
 }
 
+#[test]
+fn response_surface_policy_does_not_hardcode_provider_or_agent_modes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let policy_path = root.join("src/response_surface_policy.rs");
+    let content = production_rust_content(&policy_path);
+
+    for pattern in [
+        "ProviderType::Slack",
+        "ProviderType::FeishuLark",
+        "ProviderType::Webhook",
+        "ProviderMode::SlackApp",
+        "ProviderMode::SlackIncomingWebhook",
+        "ProviderMode::FeishuLarkAppBot",
+        "ProviderMode::FeishuLarkCustomBot",
+        "codex_desktop",
+        "claude_code",
+    ] {
+        assert!(
+            !content.contains(pattern),
+            "`src/response_surface_policy.rs` contains `{pattern}` in production code; policy must consume catalog facts instead of hardcoding provider modes or agent ids"
+        );
+    }
+}
+
+#[test]
+fn response_surface_policy_does_not_depend_on_runtime_surfaces() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let policy_path = root.join("src/response_surface_policy.rs");
+    let content = production_rust_content(&policy_path);
+
+    for pattern in [
+        "RawConfig",
+        "response_surface_ledger",
+        "agent_controller",
+        "ProviderConfigDetail",
+        "provider.send",
+    ] {
+        assert!(
+            !content.contains(pattern),
+            "`src/response_surface_policy.rs` contains `{pattern}`; Step 2 policy must not read raw config, write ledger, call controller, or depend on provider runtime details"
+        );
+    }
+}
+
+#[test]
+fn setup_paths_do_not_expose_response_surface_controls() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_files(&root.join("src/setup"), &mut files);
+    collect_rust_files(&root.join("src/cli"), &mut files);
+
+    for file in files {
+        let content = production_rust_content(&file);
+        assert!(
+            !content.contains("response_surface"),
+            "`{}` references `response_surface`; Step 2 must not expose replies in setup or CLI flows",
+            file.strip_prefix(&root).unwrap_or(&file).display()
+        );
+    }
+}
+
 fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));
@@ -110,4 +171,13 @@ fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn production_rust_content(path: &Path) -> String {
+    let content = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));
+    content
+        .split_once("\n#[cfg(test)]")
+        .map_or(content.as_str(), |(production, _tests)| production)
+        .to_string()
 }

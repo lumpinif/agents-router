@@ -14,6 +14,7 @@ pub mod process;
 pub mod provider_catalog;
 pub mod provider_urls;
 pub mod providers;
+pub mod response_surface_policy;
 pub mod router;
 pub mod runtime;
 pub mod service;

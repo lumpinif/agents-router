@@ -203,6 +203,17 @@ impl SourceType {
             Self::ClaudeCode => "claude_code",
         }
     }
+
+    pub fn from_signal_value(value: &str) -> Option<Self> {
+        match value {
+            "agents_router" | "agents_notifier" => Some(Self::AgentsRouter),
+            "agent_hook" => Some(Self::AgentHook),
+            "codex_desktop" => Some(Self::CodexDesktop),
+            "codex_cli" => Some(Self::CodexCli),
+            "claude_code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -515,6 +526,24 @@ pub struct RouteConfig {
     pub minimum_task_duration_minutes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub only_forward_from_project_paths: Vec<String>,
+    #[serde(skip)]
+    pub response_surface: ResponseSurfaceRouteConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResponseSurfaceRouteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl ResponseSurfaceRouteConfig {
+    pub fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
 }
 
 impl RouteConfig {
@@ -524,6 +553,7 @@ impl RouteConfig {
             providers,
             minimum_task_duration_minutes: None,
             only_forward_from_project_paths: Vec::new(),
+            response_surface: ResponseSurfaceRouteConfig::disabled(),
         }
     }
 

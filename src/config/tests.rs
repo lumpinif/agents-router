@@ -140,6 +140,46 @@ only_forward_from_project_paths = [
     let serialized = toml::to_string_pretty(&loaded.raw).expect("config should serialize");
     assert!(serialized.contains("minimum_task_duration_minutes = 5"));
     assert!(serialized.contains("only_forward_from_project_paths"));
+    assert!(!serialized.contains("response_surface"));
+}
+
+#[test]
+fn route_response_surface_is_disabled_by_default_and_not_serialized() {
+    let loaded = LoadedConfig::from_toml_str(VALID_CONFIG).expect("valid config should parse");
+
+    assert!(!loaded.validated.routes[0].response_surface.enabled);
+    assert!(!loaded.raw.routes[0].response_surface.enabled);
+
+    let serialized = toml::to_string_pretty(&loaded.raw).expect("config should serialize");
+    assert!(!serialized.contains("response_surface"));
+    assert!(!serialized.contains("enabled = false"));
+}
+
+#[test]
+fn route_response_surface_toml_is_ignored_until_user_visible_replies_are_available() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_desktop"
+type = "codex_desktop"
+
+[[providers]]
+id = "debug_webhook"
+type = "webhook"
+url = "https://example.com/hook"
+
+[[routes]]
+sources = ["codex_desktop"]
+providers = ["debug_webhook"]
+response_surface = { enabled = true }
+"#;
+
+    let loaded = LoadedConfig::from_toml_str(raw)
+        .expect("future response surface TOML should not break current config parsing");
+
+    assert!(!loaded.raw.routes[0].response_surface.enabled);
+    assert!(!loaded.validated.routes[0].response_surface.enabled);
 }
 
 #[test]
