@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::config::{ProviderConfig, ProviderConfigDetail, ProviderType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +25,8 @@ pub struct ProviderModeCapability {
     pub delivery_receipt: DeliveryReceiptCapability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderMode {
     NtfyTopic,
     Webhook,

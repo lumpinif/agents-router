@@ -75,6 +75,10 @@ pub fn delivery_safety_state_path() -> anyhow::Result<PathBuf> {
     Ok(delivery_safety_state_path_for_home(&home_dir()?))
 }
 
+pub fn response_surface_ledger_path() -> anyhow::Result<PathBuf> {
+    Ok(response_surface_ledger_path_for_home(&home_dir()?))
+}
+
 pub fn codex_sessions_dir_path() -> anyhow::Result<PathBuf> {
     Ok(codex_sessions_dir_path_for_home(&home_dir()?))
 }
@@ -164,6 +168,10 @@ pub fn codex_desktop_source_state_path_for_home(home: &Path) -> PathBuf {
 
 pub fn delivery_safety_state_path_for_home(home: &Path) -> PathBuf {
     app_support_dir_path_for_home(home).join("delivery-safety-state.json")
+}
+
+pub fn response_surface_ledger_path_for_home(home: &Path) -> PathBuf {
+    app_support_dir_path_for_home(home).join("response-surface-ledger.json")
 }
 
 pub fn codex_sessions_dir_path_for_home(home: &Path) -> PathBuf {
@@ -341,6 +349,17 @@ mod tests {
         assert_eq!(
             path,
             expected_state_dir(&home).join("codex-desktop-source-state.json")
+        );
+    }
+
+    #[test]
+    fn builds_response_surface_ledger_path() {
+        let home = test_home();
+        let path = response_surface_ledger_path_for_home(&home);
+
+        assert_eq!(
+            path,
+            expected_state_dir(&home).join("response-surface-ledger.json")
         );
     }
 

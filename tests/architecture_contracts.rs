@@ -83,8 +83,7 @@ fn continuation_support_does_not_define_parallel_fact_sources() {
 
     let forbidden = ["AgentControllerCapabilityCatalog", "controller_supported"];
     for file in files {
-        let content = fs::read_to_string(&file)
-            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", file.display()));
+        let content = production_rust_content(&file);
         for pattern in forbidden {
             assert!(
                 !content.contains(pattern),
@@ -136,6 +135,35 @@ fn response_surface_policy_does_not_depend_on_runtime_surfaces() {
         assert!(
             !content.contains(pattern),
             "`src/response_surface_policy.rs` contains `{pattern}`; Step 2 policy must not read raw config, write ledger, call controller, or depend on provider runtime details"
+        );
+    }
+}
+
+#[test]
+fn response_surface_ledger_does_not_store_content_or_product_facts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ledger_path = root.join("src/response_surface_ledger.rs");
+    let content = production_rust_content(&ledger_path);
+
+    for pattern in [
+        "prompt",
+        "answer",
+        "reply_text",
+        "raw_inbound_payload",
+        "provider_message_body",
+        "rendered_payload",
+        "agent_transcript",
+        "tool_output",
+        "controller_supported",
+        "AgentControllerKind",
+        "ContinuationSupportStatus",
+        "ContinuationCapability",
+        "agent_integration_catalog",
+        "agent_controller",
+    ] {
+        assert!(
+            !content.contains(pattern),
+            "`src/response_surface_ledger.rs` contains `{pattern}` in production code; ledger must stay a minimal binding and dedup index, not a history store or product fact source"
         );
     }
 }
