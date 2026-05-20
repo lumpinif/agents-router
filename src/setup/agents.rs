@@ -1,1 +1,1 @@
-pub use crate::source_integration_catalog::SourceIntegrationId;
+pub use crate::agent_integration_catalog::AgentIntegrationId;

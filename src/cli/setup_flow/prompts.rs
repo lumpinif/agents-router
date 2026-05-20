@@ -1,9 +1,9 @@
 use super::*;
 
 pub(in crate::cli) fn prompt_for_agent(
-    default: Option<setup::SourceIntegrationId>,
+    default: Option<setup::AgentIntegrationId>,
     i18n: I18n,
-) -> anyhow::Result<setup::SourceIntegrationId> {
+) -> anyhow::Result<setup::AgentIntegrationId> {
     let options = supported_agent_options();
     let supported_default =
         default.filter(|agent| options.iter().any(|(_, candidate)| candidate == agent));
@@ -35,27 +35,27 @@ pub(in crate::cli) fn prompt_for_agent(
     Ok(options[selection].1)
 }
 
-pub(in crate::cli) fn supported_agent_options() -> Vec<(String, setup::SourceIntegrationId)> {
+pub(in crate::cli) fn supported_agent_options() -> Vec<(String, setup::AgentIntegrationId)> {
     supported_agent_options_for_platform(RuntimePlatform::current())
 }
 
 pub(in crate::cli) fn supported_agent_options_for_platform(
     platform: RuntimePlatform,
-) -> Vec<(String, setup::SourceIntegrationId)> {
-    setup_source_integration_descriptors_for_platform(platform)
+) -> Vec<(String, setup::AgentIntegrationId)> {
+    setup_agent_integration_descriptors_for_platform(platform)
         .enumerate()
         .map(|(index, descriptor)| ((index + 1).to_string(), descriptor.id))
         .collect()
 }
 
-pub(in crate::cli) fn default_agent_for_platform() -> setup::SourceIntegrationId {
+pub(in crate::cli) fn default_agent_for_platform() -> setup::AgentIntegrationId {
     default_agent_for_runtime_platform(RuntimePlatform::current())
 }
 
 pub(in crate::cli) fn default_agent_for_runtime_platform(
     platform: RuntimePlatform,
-) -> setup::SourceIntegrationId {
-    default_source_integration_for_platform(platform).id
+) -> setup::AgentIntegrationId {
+    default_agent_integration_for_platform(platform).id
 }
 
 pub(in crate::cli) fn prompt_for_answer_detail(

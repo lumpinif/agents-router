@@ -14,6 +14,11 @@ use qrcode::render::unicode;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
+use agents_router::agent_integration_catalog::{
+    HookCommandTemplate, RuntimePlatform, SetupIntegrationKind, SourceIngestFormat,
+    agent_integration_descriptor, agent_integration_for_source,
+    default_agent_integration_for_platform, setup_agent_integration_descriptors_for_platform,
+};
 use agents_router::config::{
     AnswerDetail, CliConfig, CliLanguage, ConfigError, EmailSmtpSecurity,
     LoadedConfig as ParsedConfig, PromptDetail, ProviderType, RawConfig, RawProviderConfig,
@@ -52,11 +57,6 @@ use agents_router::service::{
 };
 use agents_router::setup;
 use agents_router::signal::{SignalLifecycle, SignalLifecycleStatus};
-use agents_router::source_integration_catalog::{
-    HookCommandTemplate, RuntimePlatform, SetupIntegrationKind, SourceIngestFormat,
-    default_source_integration_for_platform, setup_source_integration_descriptors_for_platform,
-    source_integration_descriptor, source_integration_for_source,
-};
 use agents_router::sources::{
     agent_hook, claude_code, codex_cli, codex_desktop, gemini_cli, github_copilot_cli, opencode_cli,
 };
@@ -622,23 +622,26 @@ fn configured_agents(config: &RawConfig) -> Vec<String> {
         .iter()
         .filter_map(|source| match source.source_type {
             SourceType::CodexDesktop => Some(
-                source_integration_descriptor(setup::SourceIntegrationId::CodexDesktop)
+                agent_integration_descriptor(setup::AgentIntegrationId::CodexDesktop)
+                    .source_capability
                     .display_name
                     .to_string(),
             ),
             SourceType::CodexCli => Some(
-                source_integration_descriptor(setup::SourceIntegrationId::CodexCli)
+                agent_integration_descriptor(setup::AgentIntegrationId::CodexCli)
+                    .source_capability
                     .display_name
                     .to_string(),
             ),
             SourceType::ClaudeCode => Some(
-                source_integration_descriptor(setup::SourceIntegrationId::ClaudeCode)
+                agent_integration_descriptor(setup::AgentIntegrationId::ClaudeCode)
+                    .source_capability
                     .display_name
                     .to_string(),
             ),
             SourceType::AgentHook => Some(
-                source_integration_for_source(&source.id, source.source_type)
-                    .map(|descriptor| descriptor.display_name.to_string())
+                agent_integration_for_source(&source.id, source.source_type)
+                    .map(|descriptor| descriptor.source_capability.display_name.to_string())
                     .unwrap_or_else(|| format!("Agent hook ({})", source.id)),
             ),
             SourceType::AgentsRouter => None,
@@ -646,15 +649,15 @@ fn configured_agents(config: &RawConfig) -> Vec<String> {
         .collect()
 }
 
-fn first_configured_agent(config: &RawConfig) -> Option<setup::SourceIntegrationId> {
+fn first_configured_agent(config: &RawConfig) -> Option<setup::AgentIntegrationId> {
     config
         .sources
         .iter()
         .find_map(|source| match source.source_type {
-            SourceType::CodexDesktop => Some(setup::SourceIntegrationId::CodexDesktop),
-            SourceType::CodexCli => Some(setup::SourceIntegrationId::CodexCli),
-            SourceType::ClaudeCode => Some(setup::SourceIntegrationId::ClaudeCode),
-            SourceType::AgentHook => source_integration_for_source(&source.id, source.source_type)
+            SourceType::CodexDesktop => Some(setup::AgentIntegrationId::CodexDesktop),
+            SourceType::CodexCli => Some(setup::AgentIntegrationId::CodexCli),
+            SourceType::ClaudeCode => Some(setup::AgentIntegrationId::ClaudeCode),
+            SourceType::AgentHook => agent_integration_for_source(&source.id, source.source_type)
                 .map(|descriptor| descriptor.id),
             SourceType::AgentsRouter => None,
         })
@@ -926,10 +929,10 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
     Ok(())
 }
 
-fn print_source_integration_setup_note(source_integration: setup::SourceIntegrationId, i18n: I18n) {
-    let descriptor = source_integration_descriptor(source_integration);
+fn print_source_integration_setup_note(source_integration: setup::AgentIntegrationId, i18n: I18n) {
+    let descriptor = agent_integration_descriptor(source_integration);
 
-    match descriptor.setup_integration {
+    match descriptor.source_capability.setup_integration {
         SetupIntegrationKind::CodexDesktopWatch => {
             if i18n.language() == CliLanguage::SimplifiedChinese {
                 println!("Agents Router 会监听这台电脑上的 Codex Desktop 完成事件。");
@@ -968,15 +971,15 @@ fn print_source_integration_setup_note(source_integration: setup::SourceIntegrat
         SetupIntegrationKind::ManualHookCommand { integration_point } => {
             if i18n.language() == CliLanguage::SimplifiedChinese {
                 print_chinese_hook_command_note(
-                    descriptor.display_name,
+                    descriptor.source_capability.display_name,
                     integration_point.simplified_chinese(),
-                    descriptor.hook_command,
+                    descriptor.source_capability.hook_command,
                 );
             } else {
                 print_english_hook_command_note(
-                    descriptor.display_name,
+                    descriptor.source_capability.display_name,
                     integration_point.english(),
-                    descriptor.hook_command,
+                    descriptor.source_capability.hook_command,
                 );
             }
         }

@@ -7,12 +7,12 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::agent_integration_catalog::{AgentIntegrationId, agent_integration_descriptor};
 use crate::notification_detail_policy::{rejects_full_answer, rejects_prompt_detail};
 use crate::provider_urls::{
     validate_custom_webhook_url, validate_discord_webhook_url, validate_feishu_lark_webhook_url,
     validate_microsoft_teams_webhook_url, validate_slack_webhook_url,
 };
-use crate::source_integration_catalog::{SourceIntegrationId, source_integration_descriptor};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
@@ -826,11 +826,15 @@ fn canonical_source_id_requirement(
 ) -> Option<CanonicalSourceIdRequirement> {
     match source_type {
         SourceType::CodexCli => Some(CanonicalSourceIdRequirement {
-            expected_id: source_integration_descriptor(SourceIntegrationId::CodexCli).source_id,
+            expected_id: agent_integration_descriptor(AgentIntegrationId::CodexCli)
+                .source_capability
+                .canonical_source_id,
             reason: "Codex CLI has one global Stop hook",
         }),
         SourceType::ClaudeCode => Some(CanonicalSourceIdRequirement {
-            expected_id: source_integration_descriptor(SourceIntegrationId::ClaudeCode).source_id,
+            expected_id: agent_integration_descriptor(AgentIntegrationId::ClaudeCode)
+                .source_capability
+                .canonical_source_id,
             reason: "Claude Code has one global settings file",
         }),
         SourceType::AgentsRouter | SourceType::AgentHook | SourceType::CodexDesktop => None,

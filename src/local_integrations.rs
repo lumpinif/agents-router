@@ -8,14 +8,14 @@ use serde_json::{Map, Value, json};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
-use crate::config::{SourceType, ValidatedConfig};
-use crate::paths::{claude_code_settings_path, codex_cli_config_path};
-use crate::source_integration_catalog::{
-    LocalIntegrationKind, SourceIntegrationDescriptor, SourceIntegrationId,
+use crate::agent_integration_catalog::{
+    AgentIntegrationDescriptor, AgentIntegrationId, LocalIntegrationKind,
+    agent_integration_descriptor, agent_integration_for_source,
     claude_code_hook_command as catalog_claude_code_hook_command,
     codex_cli_stop_hook_command as catalog_codex_cli_stop_hook_command,
-    source_integration_descriptor, source_integration_for_source,
 };
+use crate::config::{SourceType, ValidatedConfig};
+use crate::paths::{claude_code_settings_path, codex_cli_config_path};
 
 pub fn codex_cli_stop_hook_command() -> String {
     catalog_codex_cli_stop_hook_command()
@@ -128,7 +128,7 @@ pub fn ensure_local_source_integrations_with_paths(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     for descriptor in descriptors {
-        match descriptor.local_integration {
+        match descriptor.source_capability.local_integration {
             LocalIntegrationKind::CodexCliStopHook => {
                 if report.codex_cli_stop_hook.is_none() {
                     report.codex_cli_stop_hook =
@@ -150,11 +150,11 @@ pub fn ensure_local_source_integrations_with_paths(
 
 fn local_integration_descriptor(
     source: &crate::config::SourceConfig,
-) -> anyhow::Result<Option<&'static SourceIntegrationDescriptor>> {
+) -> anyhow::Result<Option<&'static AgentIntegrationDescriptor>> {
     match source.source_type {
         SourceType::CodexCli => {
-            let descriptor = source_integration_descriptor(SourceIntegrationId::CodexCli);
-            if source.id != descriptor.source_id {
+            let descriptor = agent_integration_descriptor(AgentIntegrationId::CodexCli);
+            if source.id != descriptor.source_capability.canonical_source_id {
                 anyhow::bail!(
                     "Codex CLI source id must be `codex_cli` because Codex CLI has one global Stop hook; got `{}`",
                     source.id
@@ -163,8 +163,8 @@ fn local_integration_descriptor(
             Ok(Some(descriptor))
         }
         SourceType::ClaudeCode => {
-            let descriptor = source_integration_descriptor(SourceIntegrationId::ClaudeCode);
-            if source.id != descriptor.source_id {
+            let descriptor = agent_integration_descriptor(AgentIntegrationId::ClaudeCode);
+            if source.id != descriptor.source_capability.canonical_source_id {
                 anyhow::bail!(
                     "Claude Code source id must be `claude_code` because Claude Code has one global settings file; got `{}`",
                     source.id
@@ -172,13 +172,10 @@ fn local_integration_descriptor(
             }
             Ok(Some(descriptor))
         }
-        SourceType::CodexDesktop => Ok(Some(source_integration_descriptor(
-            SourceIntegrationId::CodexDesktop,
+        SourceType::CodexDesktop => Ok(Some(agent_integration_descriptor(
+            AgentIntegrationId::CodexDesktop,
         ))),
-        SourceType::AgentHook => Ok(source_integration_for_source(
-            &source.id,
-            source.source_type,
-        )),
+        SourceType::AgentHook => Ok(agent_integration_for_source(&source.id, source.source_type)),
         SourceType::AgentsRouter => Ok(None),
     }
 }

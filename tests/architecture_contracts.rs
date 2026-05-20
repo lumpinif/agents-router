@@ -74,6 +74,28 @@ fn human_provider_renderers_do_not_interpret_signal_structure_directly() {
     }
 }
 
+#[test]
+fn continuation_support_does_not_define_parallel_fact_sources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = root.join("src");
+    let mut files = Vec::new();
+    collect_rust_files(&src_dir, &mut files);
+
+    let forbidden = ["AgentControllerCapabilityCatalog", "controller_supported"];
+    for file in files {
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", file.display()));
+        for pattern in forbidden {
+            assert!(
+                !content.contains(pattern),
+                "`{}` defines or references `{}`; continuation support facts must live in AgentIntegrationCatalog",
+                file.strip_prefix(&root).unwrap_or(&file).display(),
+                pattern
+            );
+        }
+    }
+}
+
 fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));

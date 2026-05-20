@@ -1,3 +1,4 @@
+pub mod agent_integration_catalog;
 pub mod config;
 pub mod delivery;
 pub mod delivery_safety;

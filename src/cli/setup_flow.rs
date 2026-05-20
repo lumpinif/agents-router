@@ -27,7 +27,7 @@ pub(super) struct SetupRouteFilters {
 pub(super) struct ProviderSetupContext<'a> {
     path: &'a Path,
     mode: ConfigWriteMode,
-    agent: setup::SourceIntegrationId,
+    agent: setup::AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     route_filters: &'a SetupRouteFilters,
@@ -37,38 +37,38 @@ pub(super) struct ProviderSetupContext<'a> {
 
 pub(super) enum GuidedSetup {
     Ntfy {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
         topic: String,
     },
     FeishuLark {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Webhook {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Pushover {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Slack {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Discord {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Telegram {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Whatsapp {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     Wechat {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     MicrosoftTeams {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
     EmailSmtp {
-        agent: setup::SourceIntegrationId,
+        agent: setup::AgentIntegrationId,
     },
 }
 
@@ -94,7 +94,7 @@ pub(super) enum NotificationPreference {
 #[derive(Debug, Clone, Default)]
 pub(super) struct SetupDefaults {
     pub(super) language: Option<CliLanguage>,
-    pub(super) source_integration: Option<setup::SourceIntegrationId>,
+    pub(super) source_integration: Option<setup::AgentIntegrationId>,
     pub(super) answer_detail: Option<AnswerDetail>,
     pub(super) prompt_detail: Option<PromptDetail>,
     pub(super) minimum_task_duration_minutes: Option<u64>,
@@ -136,7 +136,7 @@ impl SetupDefaults {
         let agent_route = first_agent_route(config);
         let source_integration = first_configured_agent(config);
         let supports_duration_filter =
-            source_integration.is_some_and(setup::SourceIntegrationId::supports_duration_filter);
+            source_integration.is_some_and(setup::AgentIntegrationId::supports_duration_filter);
         Self {
             language: Some(config.cli.language),
             source_integration,
@@ -409,7 +409,7 @@ fn write_setup_config_with_route_filters(
     path: &Path,
     config: &mut RawConfig,
     language: CliLanguage,
-    agent: setup::SourceIntegrationId,
+    agent: setup::AgentIntegrationId,
     route_filters: &SetupRouteFilters,
 ) -> anyhow::Result<()> {
     setup::apply_agent_route_filters(

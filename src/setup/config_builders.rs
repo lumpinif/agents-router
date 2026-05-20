@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn build_ntfy_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     topic: &str,
@@ -14,7 +14,7 @@ pub fn build_ntfy_config(
 }
 
 pub fn build_feishu_lark_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     webhook_url: &str,
@@ -29,7 +29,7 @@ pub fn build_feishu_lark_config(
 }
 
 pub fn build_webhook_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     webhook_url: &str,
@@ -42,7 +42,7 @@ pub fn build_webhook_config(
 }
 
 pub fn build_pushover_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     app_token: &str,
@@ -61,7 +61,7 @@ pub fn build_pushover_config(
 }
 
 pub fn build_slack_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     webhook_url: &str,
@@ -73,7 +73,7 @@ pub fn build_slack_config(
 }
 
 pub fn build_discord_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     webhook_url: &str,
@@ -86,7 +86,7 @@ pub fn build_discord_config(
 }
 
 pub fn build_telegram_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     bot_token: &str,
@@ -101,7 +101,7 @@ pub fn build_telegram_config(
 }
 
 pub fn build_whatsapp_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     access_token: &str,
@@ -119,7 +119,7 @@ pub fn build_whatsapp_config(
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_wechat_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     base_url: &str,
@@ -139,7 +139,7 @@ pub fn build_wechat_config(
 }
 
 pub fn build_microsoft_teams_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     webhook_url: &str,
@@ -155,7 +155,7 @@ pub fn build_microsoft_teams_config(
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_email_smtp_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     host: &str,
@@ -183,7 +183,7 @@ pub fn build_email_smtp_config(
 
 pub fn apply_agent_route_filters(
     config: &mut RawConfig,
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     minimum_task_duration_minutes: Option<u64>,
     only_forward_from_project_paths: Vec<String>,
 ) {
@@ -204,7 +204,7 @@ pub fn apply_agent_route_filters(
 }
 
 fn build_config(
-    agent: SourceIntegrationId,
+    agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
     prompt_detail: PromptDetail,
     providers: Vec<RawProviderConfig>,
