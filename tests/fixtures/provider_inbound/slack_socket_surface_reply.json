@@ -1,0 +1,22 @@
+{
+  "type": "events_api",
+  "envelope_id": "envelope-123",
+  "accepts_response_payload": false,
+  "payload": {
+    "token": "verification-token",
+    "team_id": "T123ABC456",
+    "api_app_id": "A123ABC456",
+    "event": {
+      "type": "message",
+      "channel": "C123ABC456",
+      "user": "U123ABC456",
+      "text": "Run the tests and fix the failing one.",
+      "ts": "1716200011.000200",
+      "thread_ts": "1716200000.000100",
+      "event_ts": "1716200011.000200"
+    },
+    "type": "event_callback",
+    "event_id": "Ev123ABC456",
+    "event_time": 1716200011
+  }
+}

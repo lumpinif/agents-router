@@ -5,7 +5,8 @@ use crate::agent_integration_catalog::{
 use crate::config::{RouteConfig, SourceType};
 use crate::provider_catalog::{
     DeliveryReceiptField, InboundReplyMode, ProviderMode, ProviderModeCapability,
-    ProviderReplySurface, RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS, StableEventIdCapability,
+    RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS, RESPONSE_SURFACE_REPLY_SURFACES,
+    StableEventIdCapability,
 };
 use crate::signal::Signal;
 
@@ -82,7 +83,7 @@ pub enum ResponseSurfacePolicySkipReason {
     ProviderInboundReplyNotLocal,
     ProviderRequiresPublicEndpoint,
     ProviderStableEventIdUnavailable,
-    ProviderThreadReplyUnsupported,
+    ProviderReplySurfaceUnsupported,
     ProviderReceiptFieldUnsupported(DeliveryReceiptField),
     AgentIntegrationNotFound,
     AgentIntegrationSourceMismatch,
@@ -123,10 +124,11 @@ pub fn evaluate_response_surface_policy(
         .provider
         .inbound_reply
         .reply_surfaces
-        .contains(&ProviderReplySurface::ThreadReply)
+        .iter()
+        .any(|surface| RESPONSE_SURFACE_REPLY_SURFACES.contains(surface))
     {
         return ResponseSurfacePolicyDecision::Skip(
-            ResponseSurfacePolicySkipReason::ProviderThreadReplyUnsupported,
+            ResponseSurfacePolicySkipReason::ProviderReplySurfaceUnsupported,
         );
     }
 
@@ -245,7 +247,8 @@ mod tests {
         AgentIntegrationId, ContinuationCapability, agent_integration_descriptor,
     };
     use crate::provider_catalog::{
-        DeliveryReceiptCapability, ProviderModeCapability, provider_mode_capability,
+        DeliveryReceiptCapability, ProviderModeCapability, ProviderReplySurface,
+        provider_mode_capability,
     };
     use crate::signal::{
         Signal, SignalConversation, SignalDisplay, SignalEvent, SignalEventKind, SignalSource,
@@ -343,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_provider_modes_without_thread_reply_surface() {
+    fn skips_provider_modes_without_supported_reply_surface() {
         let mut provider = *provider_mode_capability(ProviderMode::SlackApp);
         provider.inbound_reply.reply_surfaces = &[];
         let mut fixture = PolicyFixture::allowable();
@@ -351,8 +354,21 @@ mod tests {
 
         assert_skip(
             fixture.input(),
-            ResponseSurfacePolicySkipReason::ProviderThreadReplyUnsupported,
+            ResponseSurfacePolicySkipReason::ProviderReplySurfaceUnsupported,
         );
+    }
+
+    #[test]
+    fn allows_message_reply_surface_when_other_policy_inputs_are_available() {
+        let mut provider = *provider_mode_capability(ProviderMode::SlackApp);
+        provider.inbound_reply.reply_surfaces = &[ProviderReplySurface::MessageReply];
+        let mut fixture = PolicyFixture::allowable();
+        fixture.provider = &provider;
+
+        assert!(matches!(
+            evaluate_response_surface_policy(fixture.input()),
+            ResponseSurfacePolicyDecision::Allow(_)
+        ));
     }
 
     #[test]

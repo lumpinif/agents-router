@@ -12,6 +12,7 @@ pub mod notification_detail_policy;
 pub mod paths;
 pub mod process;
 pub mod provider_catalog;
+pub mod provider_inbound;
 pub mod provider_urls;
 pub mod providers;
 pub mod response_surface_ledger;

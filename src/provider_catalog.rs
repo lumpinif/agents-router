@@ -94,7 +94,8 @@ pub enum StableEventIdCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderReplySurface {
-    ThreadReply,
+    ThreadRootReply,
+    MessageReply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +156,12 @@ pub enum MessageConstraintEnforcement {
 
 const NO_MESSAGE_CONSTRAINTS: &[ProviderMessageConstraint] = &[];
 const NO_REPLY_SURFACES: &[ProviderReplySurface] = &[];
-const THREAD_REPLY_SURFACES: &[ProviderReplySurface] = &[ProviderReplySurface::ThreadReply];
+const THREAD_ROOT_REPLY_SURFACES: &[ProviderReplySurface] =
+    &[ProviderReplySurface::ThreadRootReply];
+pub const RESPONSE_SURFACE_REPLY_SURFACES: &[ProviderReplySurface] = &[
+    ProviderReplySurface::ThreadRootReply,
+    ProviderReplySurface::MessageReply,
+];
 const NO_DELIVERY_RECEIPT_FIELDS: &[DeliveryReceiptField] = &[];
 pub const RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS: &[DeliveryReceiptField] = &[
     DeliveryReceiptField::ProviderAccountId,
@@ -177,7 +183,7 @@ const SLACK_SOCKET_MODE_INBOUND_REPLY: InboundReplyCapability = InboundReplyCapa
     local_connection_kind: Some(LocalConnectionKind::SocketMode),
     requires_public_endpoint: false,
     stable_event_id: StableEventIdCapability::Available,
-    reply_surfaces: THREAD_REPLY_SURFACES,
+    reply_surfaces: THREAD_ROOT_REPLY_SURFACES,
 };
 
 const FEISHU_LARK_LONG_CONNECTION_INBOUND_REPLY: InboundReplyCapability = InboundReplyCapability {
@@ -185,7 +191,7 @@ const FEISHU_LARK_LONG_CONNECTION_INBOUND_REPLY: InboundReplyCapability = Inboun
     local_connection_kind: Some(LocalConnectionKind::LongConnection),
     requires_public_endpoint: false,
     stable_event_id: StableEventIdCapability::Available,
-    reply_surfaces: THREAD_REPLY_SURFACES,
+    reply_surfaces: THREAD_ROOT_REPLY_SURFACES,
 };
 
 const NO_DELIVERY_RECEIPT_CAPABILITY: DeliveryReceiptCapability = DeliveryReceiptCapability {
@@ -755,7 +761,7 @@ mod tests {
             slack_app
                 .inbound_reply
                 .reply_surfaces
-                .contains(&ProviderReplySurface::ThreadReply)
+                .contains(&ProviderReplySurface::ThreadRootReply)
         );
         assert_eq!(
             slack_app.delivery_receipt.fields,
@@ -781,7 +787,7 @@ mod tests {
             feishu_lark_app
                 .inbound_reply
                 .reply_surfaces
-                .contains(&ProviderReplySurface::ThreadReply)
+                .contains(&ProviderReplySurface::ThreadRootReply)
         );
         assert_eq!(
             feishu_lark_app.delivery_receipt.fields,

@@ -1,0 +1,942 @@
+use anyhow::{Context, ensure};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+
+use crate::provider_catalog::{
+    InboundReplyMode, ProviderMode, ProviderModeCapability, RESPONSE_SURFACE_REPLY_SURFACES,
+    StableEventIdCapability,
+};
+use crate::response_surface_ledger::{
+    InboundEventClaimDecision, InboundEventDedupInput, ResponseSurfaceLedger,
+    ResponseSurfaceLookupQuery, ResponseSurfaceLookupRecord, ResponseSurfaceLookupResult,
+};
+
+const SLACK_SOCKET_MODE_EVENTS_API_TYPE: &str = "events_api";
+const SLACK_EVENT_CALLBACK_TYPE: &str = "event_callback";
+const SLACK_MESSAGE_EVENT_TYPE: &str = "message";
+const FEISHU_LARK_EVENT_SCHEMA: &str = "2.0";
+const FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE: &str = "im.message.receive_v1";
+const FEISHU_LARK_TEXT_MESSAGE_TYPE: &str = "text";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedProviderSurfaceReply {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_mode: ProviderMode,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+    pub provider_event_id: String,
+    pub provider_reply_message_id: Option<String>,
+    pub reply_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderInboundNormalizeResult {
+    SurfaceReply(NormalizedProviderSurfaceReply),
+    Skip(ProviderInboundSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInboundReady {
+    pub reply: NormalizedProviderSurfaceReply,
+    pub surface: ResponseSurfaceLookupRecord,
+    pub provider_event_id_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderInboundDecision {
+    Ready(ProviderInboundReady),
+    Skip(ProviderInboundSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderInboundSkipReason {
+    UnsupportedProviderMode(ProviderMode),
+    UnsupportedEnvelopeType,
+    UnsupportedEventType,
+    IgnoredMessageSubtype,
+    NonUserMessage,
+    NotSurfaceReply,
+    UnsupportedMessageType,
+    EmptyReplyText,
+    SurfaceLookupMiss,
+    SurfaceClosed { surface_id: String },
+    SurfaceExpired { surface_id: String },
+    DuplicateEvent { surface_id: String },
+    EventAlreadyProcessing { surface_id: String },
+}
+
+pub fn normalize_slack_socket_mode_surface_reply(
+    provider_id: &str,
+    raw_event: &[u8],
+) -> anyhow::Result<ProviderInboundNormalizeResult> {
+    ensure_present("provider_id", provider_id)?;
+    let envelope: SlackSocketModeEnvelope =
+        serde_json::from_slice(raw_event).context("failed to parse Slack Socket Mode event")?;
+
+    if optional_field(envelope.kind.as_deref()) != Some(SLACK_SOCKET_MODE_EVENTS_API_TYPE) {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedEnvelopeType,
+        ));
+    }
+
+    required_trimmed("slack envelope_id", envelope.envelope_id.as_deref())?;
+    let payload = envelope
+        .payload
+        .context("Slack Socket Mode event is missing payload")?;
+    if optional_field(payload.kind.as_deref()) != Some(SLACK_EVENT_CALLBACK_TYPE) {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedEventType,
+        ));
+    }
+
+    let event_id = required_owned("slack payload.event_id", payload.event_id.as_deref())?;
+    let team_id = required_owned("slack payload.team_id", payload.team_id.as_deref())?;
+    let event = payload
+        .event
+        .context("Slack event callback payload is missing event")?;
+
+    if optional_field(event.kind.as_deref()) != Some(SLACK_MESSAGE_EVENT_TYPE) {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedEventType,
+        ));
+    }
+
+    if event
+        .subtype
+        .as_deref()
+        .and_then(optional_trimmed)
+        .is_some()
+    {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::IgnoredMessageSubtype,
+        ));
+    }
+
+    if event.bot_id.as_deref().and_then(optional_trimmed).is_some()
+        || event.user.as_deref().and_then(optional_trimmed).is_none()
+    {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::NonUserMessage,
+        ));
+    }
+
+    let reply_message_id = required_owned("slack event.ts", event.ts.as_deref())?;
+    let thread_id = match optional_field(event.thread_ts.as_deref()) {
+        Some(thread_id) if thread_id != reply_message_id => thread_id.to_string(),
+        _ => {
+            return Ok(ProviderInboundNormalizeResult::Skip(
+                ProviderInboundSkipReason::NotSurfaceReply,
+            ));
+        }
+    };
+    let Some(reply_text) = normalized_reply_text(event.text.as_deref()) else {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::EmptyReplyText,
+        ));
+    };
+    let channel_id = required_owned("slack event.channel", event.channel.as_deref())?;
+
+    Ok(ProviderInboundNormalizeResult::SurfaceReply(
+        NormalizedProviderSurfaceReply {
+            provider_id: provider_id.to_string(),
+            provider_type: "slack".to_string(),
+            provider_mode: ProviderMode::SlackApp,
+            provider_account_id: team_id,
+            provider_conversation_id: channel_id,
+            provider_thread_id: thread_id,
+            provider_event_id: event_id,
+            provider_reply_message_id: Some(reply_message_id),
+            reply_text,
+        },
+    ))
+}
+
+pub fn normalize_feishu_lark_long_connection_surface_reply(
+    provider_id: &str,
+    raw_event: &[u8],
+) -> anyhow::Result<ProviderInboundNormalizeResult> {
+    ensure_present("provider_id", provider_id)?;
+    let envelope: FeishuLarkEventEnvelope =
+        serde_json::from_slice(raw_event).context("failed to parse Feishu/Lark event")?;
+
+    if optional_field(envelope.schema.as_deref()) != Some(FEISHU_LARK_EVENT_SCHEMA) {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedEnvelopeType,
+        ));
+    }
+
+    let header = envelope
+        .header
+        .context("Feishu/Lark event is missing header")?;
+    if optional_field(header.event_type.as_deref()) != Some(FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE)
+    {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedEventType,
+        ));
+    }
+
+    let event_id = required_owned("feishu_lark header.event_id", header.event_id.as_deref())?;
+    let tenant_key = required_owned(
+        "feishu_lark header.tenant_key",
+        header.tenant_key.as_deref(),
+    )?;
+    let event = envelope
+        .event
+        .context("Feishu/Lark message event is missing event")?;
+    let sender = event
+        .sender
+        .context("Feishu/Lark message event is missing sender")?;
+    if optional_field(sender.sender_type.as_deref()) != Some("user") {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::NonUserMessage,
+        ));
+    }
+
+    let message = event
+        .message
+        .context("Feishu/Lark message event is missing message")?;
+    if optional_field(message.message_type.as_deref()) != Some(FEISHU_LARK_TEXT_MESSAGE_TYPE) {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::UnsupportedMessageType,
+        ));
+    }
+
+    let reply_message_id = required_owned(
+        "feishu_lark message.message_id",
+        message.message_id.as_deref(),
+    )?;
+    let root_id = match optional_field(message.root_id.as_deref()) {
+        Some(root_id) if root_id != reply_message_id => root_id.to_string(),
+        _ => {
+            return Ok(ProviderInboundNormalizeResult::Skip(
+                ProviderInboundSkipReason::NotSurfaceReply,
+            ));
+        }
+    };
+    let chat_id = required_owned("feishu_lark message.chat_id", message.chat_id.as_deref())?;
+    let content = required_trimmed("feishu_lark message.content", message.content.as_deref())?;
+    let text_content: FeishuLarkTextContent = serde_json::from_str(content)
+        .context("failed to parse Feishu/Lark text message content")?;
+    let Some(reply_text) = normalized_reply_text(text_content.text.as_deref()) else {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::EmptyReplyText,
+        ));
+    };
+
+    Ok(ProviderInboundNormalizeResult::SurfaceReply(
+        NormalizedProviderSurfaceReply {
+            provider_id: provider_id.to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_mode: ProviderMode::FeishuLarkAppBot,
+            provider_account_id: tenant_key,
+            provider_conversation_id: chat_id,
+            provider_thread_id: root_id,
+            provider_event_id: event_id,
+            provider_reply_message_id: Some(reply_message_id),
+            reply_text,
+        },
+    ))
+}
+
+pub fn lookup_and_claim_provider_surface_reply(
+    ledger: &mut ResponseSurfaceLedger,
+    provider: &ProviderModeCapability,
+    reply: NormalizedProviderSurfaceReply,
+    now: DateTime<Utc>,
+    claim_expires_at: DateTime<Utc>,
+) -> anyhow::Result<ProviderInboundDecision> {
+    ensure!(
+        provider.mode == reply.provider_mode,
+        "provider inbound mode `{}` does not match normalized reply mode `{}`",
+        provider.mode.as_str(),
+        reply.provider_mode.as_str()
+    );
+    ensure!(
+        provider.provider_type.as_str() == reply.provider_type,
+        "provider inbound type `{}` does not match normalized reply type `{}`",
+        provider.provider_type.as_str(),
+        reply.provider_type
+    );
+
+    if !provider_mode_accepts_local_surface_replies(provider) {
+        return Ok(ProviderInboundDecision::Skip(
+            ProviderInboundSkipReason::UnsupportedProviderMode(provider.mode),
+        ));
+    }
+
+    let lookup = ledger.lookup_surface_at(
+        ResponseSurfaceLookupQuery {
+            provider_id: reply.provider_id.clone(),
+            provider_account_id: reply.provider_account_id.clone(),
+            provider_conversation_id: reply.provider_conversation_id.clone(),
+            provider_thread_id: reply.provider_thread_id.clone(),
+        },
+        now,
+    )?;
+
+    let surface = match lookup {
+        ResponseSurfaceLookupResult::Hit(surface) => surface,
+        ResponseSurfaceLookupResult::Miss => {
+            return Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::SurfaceLookupMiss,
+            ));
+        }
+        ResponseSurfaceLookupResult::Closed { surface_id } => {
+            return Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::SurfaceClosed { surface_id },
+            ));
+        }
+        ResponseSurfaceLookupResult::Expired { surface_id } => {
+            return Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::SurfaceExpired { surface_id },
+            ));
+        }
+    };
+
+    let claim = ledger.claim_inbound_event_at(
+        InboundEventDedupInput {
+            provider_id: reply.provider_id.clone(),
+            provider_type: reply.provider_type.clone(),
+            provider_account_id: reply.provider_account_id.clone(),
+            provider_event_id: reply.provider_event_id.clone(),
+            surface_id: surface.surface_id.clone(),
+        },
+        now,
+        claim_expires_at,
+    )?;
+
+    match claim {
+        InboundEventClaimDecision::Claimed {
+            provider_event_id_hash,
+        } => Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
+            reply,
+            surface,
+            provider_event_id_hash,
+        })),
+        InboundEventClaimDecision::AlreadyProcessing { surface_id, .. } => {
+            Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::EventAlreadyProcessing { surface_id },
+            ))
+        }
+        InboundEventClaimDecision::DuplicateProcessed { surface_id, .. } => Ok(
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::DuplicateEvent { surface_id }),
+        ),
+    }
+}
+
+fn provider_mode_accepts_local_surface_replies(provider: &ProviderModeCapability) -> bool {
+    provider.inbound_reply.mode == InboundReplyMode::LocalConnection
+        && !provider.inbound_reply.requires_public_endpoint
+        && provider.inbound_reply.stable_event_id == StableEventIdCapability::Available
+        && provider
+            .inbound_reply
+            .reply_surfaces
+            .iter()
+            .any(|surface| RESPONSE_SURFACE_REPLY_SURFACES.contains(surface))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSocketModeEnvelope {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    envelope_id: Option<String>,
+    payload: Option<SlackEventCallbackPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackEventCallbackPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    team_id: Option<String>,
+    event_id: Option<String>,
+    event: Option<SlackMessageEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackMessageEvent {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    subtype: Option<String>,
+    channel: Option<String>,
+    user: Option<String>,
+    bot_id: Option<String>,
+    text: Option<String>,
+    ts: Option<String>,
+    thread_ts: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventEnvelope {
+    schema: Option<String>,
+    header: Option<FeishuLarkEventHeader>,
+    event: Option<FeishuLarkEventBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventHeader {
+    event_id: Option<String>,
+    event_type: Option<String>,
+    tenant_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventBody {
+    sender: Option<FeishuLarkEventSender>,
+    message: Option<FeishuLarkEventMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventSender {
+    sender_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventMessage {
+    message_id: Option<String>,
+    root_id: Option<String>,
+    chat_id: Option<String>,
+    message_type: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkTextContent {
+    text: Option<String>,
+}
+
+fn required_owned(field: &'static str, value: Option<&str>) -> anyhow::Result<String> {
+    Ok(required_trimmed(field, value)?.to_string())
+}
+
+fn required_trimmed<'a>(field: &'static str, value: Option<&'a str>) -> anyhow::Result<&'a str> {
+    let Some(value) = value.and_then(optional_trimmed) else {
+        anyhow::bail!("provider inbound `{field}` must be present");
+    };
+    Ok(value)
+}
+
+fn ensure_present(field: &'static str, value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.trim().is_empty(),
+        "provider inbound `{field}` must be present"
+    );
+    Ok(())
+}
+
+fn normalized_reply_text(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(optional_trimmed)
+        .map(std::string::ToString::to_string)
+}
+
+fn optional_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn optional_field(value: Option<&str>) -> Option<&str> {
+    value.and_then(optional_trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone};
+
+    use super::*;
+    use crate::provider_catalog::{ProviderMode, provider_mode_capability};
+    use crate::response_surface_ledger::{NewResponseSurface, ProcessedInboundEventDecision};
+
+    #[test]
+    fn normalizes_slack_socket_mode_surface_reply_using_thread_ts_as_lookup_key() {
+        let normalized = normalize_slack_socket_mode_surface_reply(
+            "slack-app",
+            include_bytes!("../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"),
+        )
+        .expect("Slack event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderInboundNormalizeResult::SurfaceReply(NormalizedProviderSurfaceReply {
+                provider_id: "slack-app".to_string(),
+                provider_type: "slack".to_string(),
+                provider_mode: ProviderMode::SlackApp,
+                provider_account_id: "T123ABC456".to_string(),
+                provider_conversation_id: "C123ABC456".to_string(),
+                provider_thread_id: "1716200000.000100".to_string(),
+                provider_event_id: "Ev123ABC456".to_string(),
+                provider_reply_message_id: Some("1716200011.000200".to_string()),
+                reply_text: "Run the tests and fix the failing one.".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn slack_socket_mode_root_message_without_thread_ts_is_not_a_surface_reply() {
+        let raw = br#"{
+            "type": "events_api",
+            "envelope_id": "envelope-1",
+            "payload": {
+                "type": "event_callback",
+                "team_id": "T123ABC456",
+                "event_id": "Ev123ABC456",
+                "event": {
+                    "type": "message",
+                    "channel": "C123ABC456",
+                    "user": "U123ABC456",
+                    "text": "ordinary channel message",
+                    "ts": "1716200011.000200"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_slack_socket_mode_surface_reply("slack-app", raw)
+                .expect("Slack event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotSurfaceReply)
+        );
+    }
+
+    #[test]
+    fn slack_socket_mode_mention_without_surface_lookup_key_is_not_a_trigger() {
+        let raw = br#"{
+            "type": "events_api",
+            "envelope_id": "envelope-1",
+            "payload": {
+                "type": "event_callback",
+                "team_id": "T123ABC456",
+                "event_id": "Ev123ABC456",
+                "event": {
+                    "type": "message",
+                    "channel": "C123ABC456",
+                    "user": "U123ABC456",
+                    "text": "<@B123ABC456> continue this task",
+                    "ts": "1716200011.000200"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_slack_socket_mode_surface_reply("slack-app", raw)
+                .expect("Slack event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotSurfaceReply)
+        );
+    }
+
+    #[test]
+    fn slack_socket_mode_bot_message_is_not_a_user_surface_reply() {
+        let raw = br#"{
+            "type": "events_api",
+            "envelope_id": "envelope-1",
+            "payload": {
+                "type": "event_callback",
+                "team_id": "T123ABC456",
+                "event_id": "Ev123ABC456",
+                "event": {
+                    "type": "message",
+                    "subtype": "bot_message",
+                    "channel": "C123ABC456",
+                    "bot_id": "B123ABC456",
+                    "text": "bot message",
+                    "ts": "1716200011.000200",
+                    "thread_ts": "1716200000.000100"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_slack_socket_mode_surface_reply("slack-app", raw)
+                .expect("Slack event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::IgnoredMessageSubtype)
+        );
+    }
+
+    #[test]
+    fn slack_socket_mode_uses_payload_event_id_not_envelope_id_for_dedup() {
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        assert_eq!(reply.provider_event_id, "Ev123ABC456");
+        assert_ne!(reply.provider_event_id, "envelope-123");
+    }
+
+    #[test]
+    fn normalizes_feishu_lark_surface_reply_using_root_id_as_lookup_key() {
+        let normalized = normalize_feishu_lark_long_connection_surface_reply(
+            "lark-app",
+            include_bytes!("../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"),
+        )
+        .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderInboundNormalizeResult::SurfaceReply(NormalizedProviderSurfaceReply {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                provider_thread_id: "om_root_message_id".to_string(),
+                provider_event_id: "5e3702a84e847582be8db7fb73283c02".to_string(),
+                provider_reply_message_id: Some("om_reply_message_id".to_string()),
+                reply_text: "@_user_1 continue with README".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn feishu_lark_mention_without_root_id_is_not_a_trigger_even_with_parent_id() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "5e3702a84e847582be8db7fb73283c02",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_reply_message_id",
+                    "root_id": "",
+                    "parent_id": "om_parent_message_id",
+                    "chat_id": "oc_5ce6d572455d361153b7xx51da133945",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 continue\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_surface_reply("lark-app", raw)
+                .expect("Feishu/Lark event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotSurfaceReply)
+        );
+    }
+
+    #[test]
+    fn lookup_and_claim_returns_surface_bound_work_without_agent_decision() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        let decision = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply,
+            now + Duration::seconds(1),
+            now + Duration::minutes(5),
+        )
+        .expect("lookup should succeed");
+
+        let ProviderInboundDecision::Ready(ready) = decision else {
+            panic!("reply should be ready for the next boundary");
+        };
+        assert_eq!(ready.surface.source_id, "codex_desktop");
+        assert_eq!(ready.surface.source_session_id, "session-1");
+        assert_eq!(
+            ready.reply.reply_text,
+            "Run the tests and fix the failing one."
+        );
+        assert!(!ready.provider_event_id_hash.contains("Ev123ABC456"));
+    }
+
+    #[test]
+    fn lookup_miss_does_not_claim_inbound_event() {
+        let now = test_time();
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        let decision = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply.clone(),
+            now,
+            now + Duration::minutes(5),
+        )
+        .expect("lookup should not fail");
+
+        assert_eq!(
+            decision,
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::SurfaceLookupMiss)
+        );
+
+        let surface = ledger
+            .create_surface_at(slack_surface(now), now + Duration::seconds(1))
+            .expect("surface should still be claimable later");
+        let claim = ledger
+            .claim_inbound_event_at(
+                InboundEventDedupInput {
+                    provider_id: reply.provider_id,
+                    provider_type: reply.provider_type,
+                    provider_account_id: reply.provider_account_id,
+                    provider_event_id: reply.provider_event_id,
+                    surface_id: surface.surface_id,
+                },
+                now + Duration::seconds(2),
+                now + Duration::minutes(5),
+            )
+            .expect("event should not have been claimed on miss");
+
+        assert!(matches!(claim, InboundEventClaimDecision::Claimed { .. }));
+    }
+
+    #[test]
+    fn duplicate_inbound_event_does_not_create_second_ready_work_item() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        let first = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply.clone(),
+            now + Duration::seconds(1),
+            now + Duration::minutes(5),
+        )
+        .expect("first lookup should succeed");
+        let second = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply,
+            now + Duration::seconds(2),
+            now + Duration::minutes(5),
+        )
+        .expect("duplicate lookup should succeed");
+
+        assert!(matches!(first, ProviderInboundDecision::Ready(_)));
+        assert!(matches!(
+            second,
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::EventAlreadyProcessing { .. })
+        ));
+    }
+
+    #[test]
+    fn processed_inbound_event_is_skipped_as_duplicate() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+        let surface_id = match ledger
+            .lookup_surface_at(
+                crate::response_surface_ledger::ResponseSurfaceLookupQuery {
+                    provider_id: reply.provider_id.clone(),
+                    provider_account_id: reply.provider_account_id.clone(),
+                    provider_conversation_id: reply.provider_conversation_id.clone(),
+                    provider_thread_id: reply.provider_thread_id.clone(),
+                },
+                now,
+            )
+            .expect("lookup should succeed")
+        {
+            crate::response_surface_ledger::ResponseSurfaceLookupResult::Hit(surface) => {
+                surface.surface_id
+            }
+            _ => panic!("surface should exist"),
+        };
+        assert!(matches!(
+            ledger
+                .record_processed_inbound_event_at(
+                    InboundEventDedupInput {
+                        provider_id: reply.provider_id.clone(),
+                        provider_type: reply.provider_type.clone(),
+                        provider_account_id: reply.provider_account_id.clone(),
+                        provider_event_id: reply.provider_event_id.clone(),
+                        surface_id,
+                    },
+                    now + Duration::seconds(1),
+                    now + Duration::hours(24),
+                )
+                .expect("processed event should record"),
+            ProcessedInboundEventDecision::Recorded { .. }
+        ));
+
+        let decision = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply,
+            now + Duration::seconds(2),
+            now + Duration::minutes(5),
+        )
+        .expect("duplicate lookup should succeed");
+
+        assert!(matches!(
+            decision,
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::DuplicateEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_provider_mode_does_not_enter_inbound_path() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let ProviderInboundNormalizeResult::SurfaceReply(mut reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+        reply.provider_mode = ProviderMode::SlackIncomingWebhook;
+
+        let decision = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackIncomingWebhook),
+            reply,
+            now,
+            now + Duration::minutes(5),
+        )
+        .expect("unsupported provider should skip");
+
+        assert_eq!(
+            decision,
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::UnsupportedProviderMode(
+                ProviderMode::SlackIncomingWebhook
+            ))
+        );
+    }
+
+    #[test]
+    fn closed_surface_does_not_create_ready_work_item() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let surface = match ledger
+            .lookup_surface_at(slack_lookup_query(), now)
+            .expect("surface should lookup")
+        {
+            crate::response_surface_ledger::ResponseSurfaceLookupResult::Hit(surface) => surface,
+            _ => panic!("surface should exist"),
+        };
+        assert!(
+            ledger
+                .close_surface(&surface.surface_id)
+                .expect("surface should close")
+        );
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        let decision = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply,
+            now + Duration::seconds(1),
+            now + Duration::minutes(5),
+        )
+        .expect("closed surface should skip");
+
+        assert_eq!(
+            decision,
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::SurfaceClosed {
+                surface_id: surface.surface_id,
+            })
+        );
+    }
+
+    fn ledger_with_slack_surface(now: DateTime<Utc>) -> ResponseSurfaceLedger {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        ledger
+            .create_surface_at(slack_surface(now), now)
+            .expect("surface should be created");
+        ledger
+    }
+
+    fn slack_surface(now: DateTime<Utc>) -> NewResponseSurface {
+        NewResponseSurface {
+            signal_id: "signal-1".to_string(),
+            delivery_id: "delivery-1".to_string(),
+            source_id: "codex_desktop".to_string(),
+            source_type: "codex_desktop".to_string(),
+            source_session_id: "session-1".to_string(),
+            source_turn_id: Some("turn-1".to_string()),
+            provider_id: "slack-app".to_string(),
+            provider_type: "slack".to_string(),
+            provider_mode: ProviderMode::SlackApp,
+            provider_account_id: "T123ABC456".to_string(),
+            provider_conversation_id: "C123ABC456".to_string(),
+            provider_message_id: "1716200000.000100".to_string(),
+            provider_thread_id: "1716200000.000100".to_string(),
+            expires_at: now + Duration::hours(24),
+        }
+    }
+
+    fn slack_lookup_query() -> ResponseSurfaceLookupQuery {
+        ResponseSurfaceLookupQuery {
+            provider_id: "slack-app".to_string(),
+            provider_account_id: "T123ABC456".to_string(),
+            provider_conversation_id: "C123ABC456".to_string(),
+            provider_thread_id: "1716200000.000100".to_string(),
+        }
+    }
+
+    fn test_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 20, 1, 2, 3)
+            .single()
+            .expect("test time should be valid")
+    }
+}

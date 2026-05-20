@@ -169,6 +169,28 @@ fn response_surface_ledger_does_not_store_content_or_product_facts() {
 }
 
 #[test]
+fn provider_inbound_does_not_depend_on_agent_or_controller_boundaries() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let inbound_path = root.join("src/provider_inbound.rs");
+    let content = production_rust_content(&inbound_path);
+
+    for pattern in [
+        "agent_integration_catalog",
+        "response_surface_policy",
+        "AgentController",
+        "agent_controller",
+        "ContinuationCapability",
+        "ContinuationSupportStatus",
+        "controller_kind",
+    ] {
+        assert!(
+            !content.contains(pattern),
+            "`src/provider_inbound.rs` contains `{pattern}` in production code; provider inbound must stop at validation, normalization, dedup, and surface lookup"
+        );
+    }
+}
+
+#[test]
 fn setup_paths_do_not_expose_response_surface_controls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
