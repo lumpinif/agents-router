@@ -22,7 +22,7 @@ pub struct ResponseSurfacePolicyInput<'a> {
     pub provider: &'a ProviderModeCapability,
     pub agent_integration: Option<&'a AgentIntegrationDescriptor>,
     pub route: &'a RouteConfig,
-    pub signal: &'a Signal,
+    pub source: ResponseSurfacePolicySource<'a>,
     pub delivery_receipt: &'a ResponseSurfaceDeliveryReceipt,
 }
 
@@ -39,10 +39,39 @@ impl<'a> ResponseSurfacePolicyInput<'a> {
             provider,
             agent_integration: agent_integration_for_signal(signal),
             route,
-            signal,
+            source: ResponseSurfacePolicySource::Signal(signal),
             delivery_receipt,
         }
     }
+
+    pub fn from_inbound_catalog(
+        provider: &'a ProviderModeCapability,
+        route: &'a RouteConfig,
+        source: ResponseSurfacePolicySourceFacts<'a>,
+        delivery_receipt: &'a ResponseSurfaceDeliveryReceipt,
+    ) -> Self {
+        Self {
+            check: ResponseSurfacePolicyCheck::InboundContinuation,
+            provider,
+            agent_integration: agent_integration_for_source_facts(source),
+            route,
+            source: ResponseSurfacePolicySource::InboundSurface(source),
+            delivery_receipt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseSurfacePolicySource<'a> {
+    Signal(&'a Signal),
+    InboundSurface(ResponseSurfacePolicySourceFacts<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseSurfacePolicySourceFacts<'a> {
+    pub source_id: &'a str,
+    pub source_type: SourceType,
+    pub source_session_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -146,7 +175,7 @@ pub fn evaluate_response_surface_policy(
         );
     };
 
-    if !agent_integration_matches_signal(agent_integration, input.signal) {
+    if !agent_integration_matches_source(agent_integration, input.source) {
         return ResponseSurfacePolicyDecision::Skip(
             ResponseSurfacePolicySkipReason::AgentIntegrationSourceMismatch,
         );
@@ -167,7 +196,7 @@ pub fn evaluate_response_surface_policy(
     };
 
     let Some(source_session_id) =
-        source_session_id_for_binding(input.signal, target.session_binding)
+        source_session_id_for_binding(input.source, target.session_binding)
     else {
         return ResponseSurfacePolicyDecision::Skip(
             ResponseSurfacePolicySkipReason::SignalSessionIdMissing,
@@ -198,25 +227,44 @@ pub fn agent_integration_for_signal(
     agent_integration_for_source(signal.source_id(), source_type)
 }
 
-fn agent_integration_matches_signal(
+pub fn agent_integration_for_source_facts(
+    source: ResponseSurfacePolicySourceFacts<'_>,
+) -> Option<&'static AgentIntegrationDescriptor> {
+    agent_integration_for_source(source.source_id, source.source_type)
+}
+
+fn agent_integration_matches_source(
     agent_integration: &AgentIntegrationDescriptor,
-    signal: &Signal,
+    source: ResponseSurfacePolicySource<'_>,
 ) -> bool {
-    let source = agent_integration.source_capability;
-    signal.source_id() == source.canonical_source_id
-        && signal.source_type() == source.source_type.as_str()
+    let capability = agent_integration.source_capability;
+    match source {
+        ResponseSurfacePolicySource::Signal(signal) => {
+            signal.source_id() == capability.canonical_source_id
+                && signal.source_type() == capability.source_type.as_str()
+        }
+        ResponseSurfacePolicySource::InboundSurface(source) => {
+            source.source_id == capability.canonical_source_id
+                && source.source_type == capability.source_type
+        }
+    }
 }
 
 fn source_session_id_for_binding(
-    signal: &Signal,
+    source: ResponseSurfacePolicySource<'_>,
     binding: ContinuationSessionBinding,
 ) -> Option<String> {
     match binding {
-        ContinuationSessionBinding::SignalConversationSessionId => signal
-            .conversation
-            .as_ref()
-            .and_then(|conversation| present(conversation.session_id.as_deref()))
-            .map(str::to_string),
+        ContinuationSessionBinding::SignalConversationSessionId => match source {
+            ResponseSurfacePolicySource::Signal(signal) => signal
+                .conversation
+                .as_ref()
+                .and_then(|conversation| present(conversation.session_id.as_deref()))
+                .map(str::to_string),
+            ResponseSurfacePolicySource::InboundSurface(source) => {
+                present(source.source_session_id).map(str::to_string)
+            }
+        },
     }
 }
 
@@ -530,7 +578,7 @@ mod tests {
                 provider: self.provider,
                 agent_integration: self.agent_integration.as_ref(),
                 route: &self.route,
-                signal: &self.signal,
+                source: ResponseSurfacePolicySource::Signal(&self.signal),
                 delivery_receipt: &self.delivery_receipt,
             }
         }

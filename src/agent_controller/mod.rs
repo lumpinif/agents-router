@@ -1,0 +1,831 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use anyhow::Context;
+
+use crate::agent_integration_catalog::{
+    AgentControllerKind, AgentIntegrationDescriptor, agent_integration_for_source,
+};
+use crate::config::{RouteConfig, SourceType, ValidatedConfig};
+use crate::provider_catalog::{ProviderModeCapability, provider_config_mode_capability};
+use crate::provider_inbound::ProviderInboundReady;
+use crate::response_surface_ledger::{InboundEventDedupInput, ResponseSurfaceLedger};
+use crate::response_surface_policy::{
+    ResponseSurfaceDeliveryReceipt, ResponseSurfacePolicyDecision, ResponseSurfacePolicyInput,
+    ResponseSurfacePolicySkipReason, ResponseSurfacePolicySourceFacts,
+    evaluate_response_surface_policy,
+};
+
+pub mod codex_app_server;
+
+pub type AgentControllerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
+
+pub trait AgentControllerAdapter: Send + Sync {
+    fn controller_kind(&self) -> AgentControllerKind;
+    fn continue_session<'a>(&'a self, request: AgentControllerRequest)
+    -> AgentControllerFuture<'a>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerRequest {
+    pub controller_kind: AgentControllerKind,
+    pub surface_id: String,
+    pub source_id: String,
+    pub source_type: SourceType,
+    pub source_session_id: String,
+    pub source_turn_id: Option<String>,
+    pub reply_text: String,
+    pub provider_event_id_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerSuccess {
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerError {
+    pub kind: AgentControllerErrorKind,
+    pub controller_kind: AgentControllerKind,
+    pub surface_id: String,
+    pub source_id: String,
+    pub source_type: SourceType,
+    pub source_session_id: String,
+    pub provider_event_id_hash: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentControllerErrorKind {
+    ControllerUnavailable,
+    SessionNotFound,
+    SessionNotContinuable,
+    ControllerRejected,
+    Timeout,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControllerRuntimeDecision {
+    Executed(AgentControllerRuntimeExecution),
+    Failed(AgentControllerError),
+    Skipped(AgentControllerRuntimeSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerRuntimeExecution {
+    pub controller_kind: AgentControllerKind,
+    pub surface_id: String,
+    pub source_session_id: String,
+    pub result: AgentControllerSuccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControllerRuntimeSkipReason {
+    InvalidSurfaceSourceType,
+    CurrentSourceMissing,
+    CurrentSourceTypeMismatch,
+    CurrentProviderMissing,
+    CurrentProviderTypeMismatch,
+    CurrentProviderModeMismatch,
+    NoMatchingRoute,
+    RouteRepliesDisabled,
+    RouteFiltersCannotBeRevalidated,
+    Policy(ResponseSurfacePolicySkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InboundRouteResolution<'a> {
+    Matched {
+        route: &'a RouteConfig,
+        provider: &'static ProviderModeCapability,
+    },
+    Skipped(AgentControllerRuntimeSkipReason),
+}
+
+pub struct AgentControllerRuntime<'a> {
+    adapters: Vec<&'a dyn AgentControllerAdapter>,
+}
+
+impl<'a> AgentControllerRuntime<'a> {
+    pub fn new(adapters: Vec<&'a dyn AgentControllerAdapter>) -> Self {
+        Self { adapters }
+    }
+
+    pub async fn run_inbound_continuation(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+    ) -> anyhow::Result<AgentControllerRuntimeDecision> {
+        self.run_inbound_continuation_inner(config, ledger, ready, None, None)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn run_inbound_continuation_with_test_policy_facts(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> anyhow::Result<AgentControllerRuntimeDecision> {
+        self.run_inbound_continuation_inner(
+            config,
+            ledger,
+            ready,
+            agent_integration_override,
+            provider_capability_override,
+        )
+        .await
+    }
+
+    async fn run_inbound_continuation_inner(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> anyhow::Result<AgentControllerRuntimeDecision> {
+        let source_type = match SourceType::from_signal_value(&ready.surface.source_type) {
+            Some(source_type) => source_type,
+            None => {
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerRuntimeDecision::Skipped(
+                    AgentControllerRuntimeSkipReason::InvalidSurfaceSourceType,
+                ));
+            }
+        };
+
+        let (route, provider) = match resolve_inbound_route(
+            config,
+            &ready,
+            source_type,
+            provider_capability_override,
+        ) {
+            InboundRouteResolution::Matched { route, provider } => (route, provider),
+            InboundRouteResolution::Skipped(reason) => {
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerRuntimeDecision::Skipped(reason));
+            }
+        };
+
+        let receipt = delivery_receipt_from_ready(&ready);
+        let source_facts = ResponseSurfacePolicySourceFacts {
+            source_id: &ready.surface.source_id,
+            source_type,
+            source_session_id: Some(&ready.surface.source_session_id),
+        };
+        let catalog_integration = agent_integration_for_source(source_facts.source_id, source_type);
+        let override_integration = agent_integration_override.as_ref();
+        let policy_input = ResponseSurfacePolicyInput {
+            check: crate::response_surface_policy::ResponseSurfacePolicyCheck::InboundContinuation,
+            provider,
+            agent_integration: override_integration.or(catalog_integration),
+            route,
+            source: crate::response_surface_policy::ResponseSurfacePolicySource::InboundSurface(
+                source_facts,
+            ),
+            delivery_receipt: &receipt,
+        };
+
+        let allow = match evaluate_response_surface_policy(policy_input) {
+            ResponseSurfacePolicyDecision::Allow(allow) => allow,
+            ResponseSurfacePolicyDecision::Skip(reason) => {
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerRuntimeDecision::Skipped(
+                    AgentControllerRuntimeSkipReason::Policy(reason),
+                ));
+            }
+        };
+
+        let request = AgentControllerRequest {
+            controller_kind: allow.controller_kind,
+            surface_id: ready.surface.surface_id.clone(),
+            source_id: ready.surface.source_id.clone(),
+            source_type,
+            source_session_id: allow.source_session_id.clone(),
+            source_turn_id: ready.surface.source_turn_id.clone(),
+            reply_text: ready.reply.reply_text.clone(),
+            provider_event_id_hash: ready.provider_event_id_hash.clone(),
+        };
+
+        let Some(adapter) = self
+            .adapters
+            .iter()
+            .copied()
+            .find(|adapter| adapter.controller_kind() == allow.controller_kind)
+        else {
+            release_inbound_claim(ledger, &ready)?;
+            return Ok(AgentControllerRuntimeDecision::Failed(
+                AgentControllerError::from_request(
+                    &request,
+                    AgentControllerErrorKind::ControllerUnavailable,
+                    "agent controller adapter is not registered",
+                ),
+            ));
+        };
+
+        let result = adapter.continue_session(request.clone()).await;
+        release_inbound_claim(ledger, &ready)?;
+
+        match result {
+            Ok(result) => Ok(AgentControllerRuntimeDecision::Executed(
+                AgentControllerRuntimeExecution {
+                    controller_kind: allow.controller_kind,
+                    surface_id: ready.surface.surface_id,
+                    source_session_id: allow.source_session_id,
+                    result,
+                },
+            )),
+            Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
+        }
+    }
+}
+
+impl AgentControllerError {
+    pub fn from_request(
+        request: &AgentControllerRequest,
+        kind: AgentControllerErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            controller_kind: request.controller_kind,
+            surface_id: request.surface_id.clone(),
+            source_id: request.source_id.clone(),
+            source_type: request.source_type,
+            source_session_id: request.source_session_id.clone(),
+            provider_event_id_hash: request.provider_event_id_hash.clone(),
+            message: message.into(),
+        }
+    }
+}
+
+fn resolve_inbound_route<'a>(
+    config: &'a ValidatedConfig,
+    ready: &ProviderInboundReady,
+    source_type: SourceType,
+    provider_capability_override: Option<&'static ProviderModeCapability>,
+) -> InboundRouteResolution<'a> {
+    let Some(source) = config.source(&ready.surface.source_id) else {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentSourceMissing,
+        );
+    };
+    if source.source_type.as_str() != ready.surface.source_type || source.source_type != source_type
+    {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentSourceTypeMismatch,
+        );
+    }
+
+    let Some(provider) = config.provider(&ready.reply.provider_id) else {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentProviderMissing,
+        );
+    };
+    if provider.provider_type().as_str() != ready.reply.provider_type {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentProviderTypeMismatch,
+        );
+    }
+    let provider_capability =
+        provider_capability_override.unwrap_or_else(|| provider_config_mode_capability(provider));
+    if provider_capability.provider_type.as_str() != ready.reply.provider_type {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentProviderTypeMismatch,
+        );
+    }
+    if provider_capability.mode != ready.reply.provider_mode {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::CurrentProviderModeMismatch,
+        );
+    }
+
+    let mut saw_matching_route = false;
+    let mut saw_enabled_route_with_unverifiable_filters = false;
+
+    for route in &config.routes {
+        if !route
+            .sources
+            .iter()
+            .any(|source| source == &ready.surface.source_id)
+            || !route
+                .providers
+                .iter()
+                .any(|provider| provider == &ready.reply.provider_id)
+        {
+            continue;
+        }
+
+        saw_matching_route = true;
+        if route.response_surface.is_disabled() {
+            continue;
+        }
+        if route_has_unverifiable_inbound_filters(route) {
+            saw_enabled_route_with_unverifiable_filters = true;
+            continue;
+        }
+        return InboundRouteResolution::Matched {
+            route,
+            provider: provider_capability,
+        };
+    }
+
+    if saw_enabled_route_with_unverifiable_filters {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::RouteFiltersCannotBeRevalidated,
+        );
+    }
+    if saw_matching_route {
+        return InboundRouteResolution::Skipped(
+            AgentControllerRuntimeSkipReason::RouteRepliesDisabled,
+        );
+    }
+    InboundRouteResolution::Skipped(AgentControllerRuntimeSkipReason::NoMatchingRoute)
+}
+
+fn route_has_unverifiable_inbound_filters(route: &RouteConfig) -> bool {
+    route.minimum_task_duration_minutes.is_some()
+        || !route.only_forward_from_project_paths.is_empty()
+}
+
+fn delivery_receipt_from_ready(ready: &ProviderInboundReady) -> ResponseSurfaceDeliveryReceipt {
+    ResponseSurfaceDeliveryReceipt {
+        provider_account_id: Some(ready.surface.provider_account_id.clone()),
+        provider_conversation_id: Some(ready.surface.provider_conversation_id.clone()),
+        provider_message_id: Some(ready.surface.provider_message_id.clone()),
+        provider_thread_id: Some(ready.surface.provider_thread_id.clone()),
+    }
+}
+
+fn release_inbound_claim(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+) -> anyhow::Result<()> {
+    ledger
+        .release_inbound_event_claim_at(InboundEventDedupInput {
+            provider_id: ready.reply.provider_id.clone(),
+            provider_type: ready.reply.provider_type.clone(),
+            provider_account_id: ready.reply.provider_account_id.clone(),
+            provider_event_id: ready.reply.provider_event_id.clone(),
+            surface_id: ready.surface.surface_id.clone(),
+        })
+        .context("failed to release inbound event claim")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::*;
+    use crate::agent_integration_catalog::{
+        AgentIntegrationId, ContinuationCapability, agent_integration_descriptor,
+    };
+    use crate::config::{
+        CONFIG_SCHEMA_VERSION, CliConfig, LogConfig, NotificationConfig, ProviderConfig,
+        ProviderConfigDetail, RouteConfig, SlackProviderConfig, SourceConfig, UrlSource,
+    };
+    use crate::provider_catalog::{ProviderMode, provider_mode_capability};
+    use crate::provider_inbound::NormalizedProviderSurfaceReply;
+    use crate::response_surface_ledger::{
+        InboundEventClaimDecision, NewResponseSurface, ResponseSurfaceLookupQuery,
+        ResponseSurfaceLookupResult,
+    };
+
+    #[tokio::test]
+    async fn planned_catalog_integration_does_not_call_controller() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                None,
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert_eq!(
+            decision,
+            AgentControllerRuntimeDecision::Skipped(AgentControllerRuntimeSkipReason::Policy(
+                ResponseSurfacePolicySkipReason::AgentContinuationPlanned
+            ))
+        );
+        assert!(adapter.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn current_webhook_provider_mode_does_not_accept_app_inbound_event() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation(&enabled_config(), &mut ledger, ready.clone())
+            .await
+            .expect("runtime should not fail");
+
+        assert_eq!(
+            decision,
+            AgentControllerRuntimeDecision::Skipped(
+                AgentControllerRuntimeSkipReason::CurrentProviderModeMismatch
+            )
+        );
+        assert!(adapter.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn available_test_integration_calls_fake_adapter_with_raw_reply_text() {
+        let (mut ledger, mut ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+        ready.reply.reply_text = "<@B123> keep this text exactly".to_string();
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerRuntimeDecision::Executed(AgentControllerRuntimeExecution {
+                controller_kind: AgentControllerKind::CodexAppServer,
+                ..
+            })
+        ));
+        let requests = adapter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reply_text, "<@B123> keep this text exactly");
+        assert_eq!(requests[0].source_session_id, "session-1");
+        assert_eq!(
+            requests[0].controller_kind,
+            AgentControllerKind::CodexAppServer
+        );
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn no_matching_current_route_skips_and_releases_claim() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+        let mut config = enabled_config();
+        config.routes[0].providers = vec!["other-provider".to_string()];
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &config,
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert_eq!(
+            decision,
+            AgentControllerRuntimeDecision::Skipped(
+                AgentControllerRuntimeSkipReason::NoMatchingRoute
+            )
+        );
+        assert!(adapter.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn route_replies_disabled_skips_and_releases_claim() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+        let mut config = enabled_config();
+        config.routes[0].response_surface.enabled = false;
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &config,
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert_eq!(
+            decision,
+            AgentControllerRuntimeDecision::Skipped(
+                AgentControllerRuntimeSkipReason::RouteRepliesDisabled
+            )
+        );
+        assert!(adapter.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn route_filters_are_not_defaulted_to_pass_without_signal_facts() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+        let mut config = enabled_config();
+        config.routes[0].only_forward_from_project_paths =
+            vec!["/Users/felix/work/project".to_string()];
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &config,
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert_eq!(
+            decision,
+            AgentControllerRuntimeDecision::Skipped(
+                AgentControllerRuntimeSkipReason::RouteFiltersCannotBeRevalidated
+            )
+        );
+        assert!(adapter.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn controller_error_does_not_mark_event_processed() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_error(AgentControllerErrorKind::ControllerRejected);
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerRuntimeDecision::Failed(AgentControllerError {
+                kind: AgentControllerErrorKind::ControllerRejected,
+                ..
+            })
+        ));
+        assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_placeholder_returns_controller_unavailable() {
+        let adapter = codex_app_server::CodexAppServerController::new();
+        let request = controller_request();
+
+        let result = adapter.continue_session(request.clone()).await;
+
+        assert_eq!(
+            result.expect_err("placeholder should not execute"),
+            AgentControllerError::from_request(
+                &request,
+                AgentControllerErrorKind::ControllerUnavailable,
+                "Codex App Server continuation is not available in this build",
+            )
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
+        error: Option<AgentControllerErrorKind>,
+    }
+
+    impl RecordingAdapter {
+        fn with_error(error: AgentControllerErrorKind) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                error: Some(error),
+            }
+        }
+
+        fn requests(&self) -> Vec<AgentControllerRequest> {
+            self.requests
+                .lock()
+                .expect("requests mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl AgentControllerAdapter for RecordingAdapter {
+        fn controller_kind(&self) -> AgentControllerKind {
+            AgentControllerKind::CodexAppServer
+        }
+
+        fn continue_session<'a>(
+            &'a self,
+            request: AgentControllerRequest,
+        ) -> AgentControllerFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("requests mutex should not be poisoned")
+                    .push(request.clone());
+                if let Some(error) = self.error {
+                    return Err(AgentControllerError::from_request(
+                        &request,
+                        error,
+                        "fake controller error",
+                    ));
+                }
+                Ok(AgentControllerSuccess {
+                    message: Some("accepted".to_string()),
+                })
+            })
+        }
+    }
+
+    fn enabled_config() -> ValidatedConfig {
+        let mut route =
+            RouteConfig::new(vec!["codex_desktop".to_string()], vec!["slack".to_string()]);
+        route.response_surface.enabled = true;
+        ValidatedConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            cli: CliConfig::default(),
+            log: LogConfig::default(),
+            notification: NotificationConfig::default(),
+            sources: vec![SourceConfig {
+                id: "codex_desktop".to_string(),
+                source_type: SourceType::CodexDesktop,
+            }],
+            providers: vec![ProviderConfig {
+                id: "slack".to_string(),
+                detail: ProviderConfigDetail::Slack(SlackProviderConfig {
+                    url: UrlSource::Inline(
+                        "https://hooks.slack.com/services/T000/B000/token".to_string(),
+                    ),
+                }),
+            }],
+            routes: vec![route],
+        }
+    }
+
+    fn available_codex_desktop() -> AgentIntegrationDescriptor {
+        let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let target = descriptor
+            .continuation_capability
+            .target()
+            .expect("Codex Desktop planned continuation target should be cataloged");
+        AgentIntegrationDescriptor {
+            continuation_capability: ContinuationCapability::Available(target),
+            ..descriptor
+        }
+    }
+
+    fn slack_app_capability() -> &'static ProviderModeCapability {
+        provider_mode_capability(ProviderMode::SlackApp)
+    }
+
+    fn ledger_and_ready_with_claim() -> (ResponseSurfaceLedger, ProviderInboundReady) {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        ledger
+            .create_surface_at(new_surface(now), now)
+            .expect("surface should be created");
+        let surface = match ledger
+            .lookup_surface_at(lookup_query(), now + Duration::seconds(1))
+            .expect("surface lookup should succeed")
+        {
+            ResponseSurfaceLookupResult::Hit(surface) => surface,
+            other => panic!("surface should be hit, got {other:?}"),
+        };
+        let ready = ready_for_surface(surface);
+        assert!(matches!(
+            ledger
+                .claim_inbound_event_at(
+                    InboundEventDedupInput {
+                        provider_id: ready.reply.provider_id.clone(),
+                        provider_type: ready.reply.provider_type.clone(),
+                        provider_account_id: ready.reply.provider_account_id.clone(),
+                        provider_event_id: ready.reply.provider_event_id.clone(),
+                        surface_id: ready.surface.surface_id.clone(),
+                    },
+                    now + Duration::seconds(1),
+                    now + Duration::minutes(5),
+                )
+                .expect("claim should be created"),
+            InboundEventClaimDecision::Claimed { .. }
+        ));
+        (ledger, ready)
+    }
+
+    fn assert_claim_can_be_taken_again(
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+    ) {
+        assert!(matches!(
+            ledger
+                .claim_inbound_event_at(
+                    InboundEventDedupInput {
+                        provider_id: ready.reply.provider_id,
+                        provider_type: ready.reply.provider_type,
+                        provider_account_id: ready.reply.provider_account_id,
+                        provider_event_id: ready.reply.provider_event_id,
+                        surface_id: ready.surface.surface_id,
+                    },
+                    test_time() + Duration::seconds(2),
+                    test_time() + Duration::minutes(5),
+                )
+                .expect("released claim should be claimable"),
+            InboundEventClaimDecision::Claimed { .. }
+        ));
+    }
+
+    fn ready_for_surface(
+        surface: crate::response_surface_ledger::ResponseSurfaceLookupRecord,
+    ) -> ProviderInboundReady {
+        ProviderInboundReady {
+            reply: NormalizedProviderSurfaceReply {
+                provider_id: "slack".to_string(),
+                provider_type: "slack".to_string(),
+                provider_mode: ProviderMode::SlackApp,
+                provider_account_id: "T123ABC456".to_string(),
+                provider_conversation_id: "C123ABC456".to_string(),
+                provider_thread_id: "1716200000.000100".to_string(),
+                provider_event_id: "Ev123ABC456".to_string(),
+                provider_reply_message_id: Some("1716200011.000200".to_string()),
+                reply_text: "continue exactly".to_string(),
+            },
+            surface,
+            provider_event_id_hash: "event-hash".to_string(),
+        }
+    }
+
+    fn controller_request() -> AgentControllerRequest {
+        AgentControllerRequest {
+            controller_kind: AgentControllerKind::CodexAppServer,
+            surface_id: "surface-1".to_string(),
+            source_id: "codex_desktop".to_string(),
+            source_type: SourceType::CodexDesktop,
+            source_session_id: "session-1".to_string(),
+            source_turn_id: Some("turn-1".to_string()),
+            reply_text: "continue exactly".to_string(),
+            provider_event_id_hash: "event-hash".to_string(),
+        }
+    }
+
+    fn new_surface(now: chrono::DateTime<Utc>) -> NewResponseSurface {
+        NewResponseSurface {
+            signal_id: "signal-1".to_string(),
+            delivery_id: "delivery-1".to_string(),
+            source_id: "codex_desktop".to_string(),
+            source_type: "codex_desktop".to_string(),
+            source_session_id: "session-1".to_string(),
+            source_turn_id: Some("turn-1".to_string()),
+            provider_id: "slack".to_string(),
+            provider_type: "slack".to_string(),
+            provider_mode: ProviderMode::SlackApp,
+            provider_account_id: "T123ABC456".to_string(),
+            provider_conversation_id: "C123ABC456".to_string(),
+            provider_message_id: "1716200000.000100".to_string(),
+            provider_thread_id: "1716200000.000100".to_string(),
+            expires_at: now + Duration::hours(24),
+        }
+    }
+
+    fn lookup_query() -> ResponseSurfaceLookupQuery {
+        ResponseSurfaceLookupQuery {
+            provider_id: "slack".to_string(),
+            provider_account_id: "T123ABC456".to_string(),
+            provider_conversation_id: "C123ABC456".to_string(),
+            provider_thread_id: "1716200000.000100".to_string(),
+        }
+    }
+
+    fn test_time() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 20, 1, 2, 3)
+            .single()
+            .expect("test time should be valid")
+    }
+}

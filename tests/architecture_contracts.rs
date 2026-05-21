@@ -191,6 +191,33 @@ fn provider_inbound_does_not_depend_on_agent_or_controller_boundaries() {
 }
 
 #[test]
+fn agent_controller_runtime_does_not_define_agent_support_facts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_files(&root.join("src/agent_controller"), &mut files);
+
+    for file in files {
+        let content = production_rust_content(&file);
+        for pattern in [
+            "AgentControllerCapabilityCatalog",
+            "controller_supported",
+            "AgentIntegrationId",
+            "codex_desktop",
+            "claude_code",
+            "gemini_cli",
+            "ProviderType::Slack",
+            "ProviderType::FeishuLark",
+        ] {
+            assert!(
+                !content.contains(pattern),
+                "`{}` contains `{pattern}` in production code; controller runtime must execute policy-selected controller kinds, not define agent/provider support facts",
+                file.strip_prefix(&root).unwrap_or(&file).display()
+            );
+        }
+    }
+}
+
+#[test]
 fn setup_paths_do_not_expose_response_surface_controls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
