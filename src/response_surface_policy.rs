@@ -441,6 +441,19 @@ mod tests {
     }
 
     #[test]
+    fn feishu_lark_app_bot_is_not_surface_ready_until_root_lookup_is_verified() {
+        let mut fixture = PolicyFixture::allowable();
+        fixture.provider = provider_mode_capability(ProviderMode::FeishuLarkAppBot);
+
+        assert_skip(
+            fixture.input(),
+            ResponseSurfacePolicySkipReason::ProviderReceiptFieldUnsupported(
+                DeliveryReceiptField::ProviderThreadId,
+            ),
+        );
+    }
+
+    #[test]
     fn skips_when_no_cataloged_agent_integration_is_supplied() {
         let mut fixture = PolicyFixture::allowable();
         fixture.agent_integration = None;

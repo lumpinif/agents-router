@@ -199,6 +199,18 @@ mod tests {
                 )
             )
         );
+        assert_eq!(
+            evaluate_response_surface_exposure(
+                &available_codex_desktop(),
+                provider_mode_capability(ProviderMode::FeishuLarkAppBot),
+                &route,
+            ),
+            ResponseSurfaceExposureDecision::Ineligible(
+                ResponseSurfaceExposureSkipReason::ProviderReceiptFieldUnsupported(
+                    DeliveryReceiptField::ProviderThreadId
+                )
+            )
+        );
     }
 
     fn route_with_replies_enabled() -> RouteConfig {

@@ -144,7 +144,39 @@ pub struct ProviderSendResult {
     pub signal_id: String,
     pub status: ProviderSendStatus,
     pub provider_message_id: Option<String>,
+    pub delivery_receipt: Option<ProviderDeliveryReceipt>,
     pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDeliveryReceiptStatus {
+    Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDeliveryReceipt {
+    pub status: ProviderDeliveryReceiptStatus,
+    pub provider_account_id: Option<String>,
+    pub provider_conversation_id: Option<String>,
+    pub provider_message_id: Option<String>,
+    pub provider_thread_id: Option<String>,
+}
+
+impl ProviderDeliveryReceipt {
+    pub fn candidate(
+        provider_account_id: Option<String>,
+        provider_conversation_id: Option<String>,
+        provider_message_id: Option<String>,
+        provider_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: ProviderDeliveryReceiptStatus::Candidate,
+            provider_account_id,
+            provider_conversation_id,
+            provider_message_id,
+            provider_thread_id,
+        }
+    }
 }
 
 impl ProviderSendResult {
@@ -155,6 +187,7 @@ impl ProviderSendResult {
             signal_id: signal.id.clone(),
             status: ProviderSendStatus::Sent,
             provider_message_id: None,
+            delivery_receipt: None,
             http_status: None,
         }
     }
@@ -166,6 +199,11 @@ impl ProviderSendResult {
 
     pub fn with_provider_message_id(mut self, provider_message_id: impl Into<String>) -> Self {
         self.provider_message_id = Some(provider_message_id.into());
+        self
+    }
+
+    pub fn with_delivery_receipt(mut self, delivery_receipt: ProviderDeliveryReceipt) -> Self {
+        self.delivery_receipt = Some(delivery_receipt);
         self
     }
 }

@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::config::{FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, UrlSource};
-use crate::delivery::{DeliveryErrorKind, ProviderSendStatus};
+use crate::delivery::{DeliveryErrorKind, ProviderDeliveryReceiptStatus, ProviderSendStatus};
 use crate::signal::{
     SignalAnswer, SignalAnswerKind, SignalConversation, SignalLifecycle, SignalLifecycleStatus,
     SignalLink, SignalWorkspace,
@@ -84,6 +84,171 @@ async fn sends_interactive_card_to_custom_bot_webhook() {
         elements
             .iter()
             .any(|element| element["content"] == "**Ready for review.**")
+    );
+}
+
+#[tokio::test]
+async fn app_bot_sends_message_and_returns_unverified_candidate_receipt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "receive_id": "oc_test_chat",
+            "msg_type": "interactive"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_root_message",
+                "root_id": "om_root_message",
+                "thread_id": "omt_candidate_thread",
+                "chat_id": "oc_test_chat",
+                "sender": {
+                    "id": "cli_test",
+                    "id_type": "app_id",
+                    "sender_type": "app",
+                    "tenant_key": "tenant_test"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send(&test_signal())
+        .await
+        .expect("App Bot send should succeed");
+
+    assert_eq!(result.provider_id, "work_chat");
+    assert_eq!(result.provider_type, "feishu_lark");
+    assert_eq!(result.status, ProviderSendStatus::Sent);
+    assert_eq!(result.http_status, Some(200));
+    assert_eq!(
+        result.provider_message_id.as_deref(),
+        Some("om_root_message")
+    );
+
+    let receipt = result
+        .delivery_receipt
+        .expect("App Bot should return candidate delivery receipt");
+    assert_eq!(receipt.status, ProviderDeliveryReceiptStatus::Candidate);
+    assert_eq!(receipt.provider_account_id.as_deref(), Some("tenant_test"));
+    assert_eq!(
+        receipt.provider_conversation_id.as_deref(),
+        Some("oc_test_chat")
+    );
+    assert_eq!(
+        receipt.provider_message_id.as_deref(),
+        Some("om_root_message")
+    );
+    assert_eq!(
+        receipt.provider_thread_id, None,
+        "root/thread lookup is still unverified and must not create a surface-ready receipt"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let send_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages")
+        .expect("send request should be recorded");
+    let body: serde_json::Value = send_request
+        .body_json()
+        .expect("send request body should be JSON");
+    let content = body["content"]
+        .as_str()
+        .expect("App Bot send content should be a JSON string");
+    let card: serde_json::Value =
+        serde_json::from_str(content).expect("App Bot card content should be JSON");
+    assert_eq!(card["header"]["title"]["content"], "Codex · Test Mac");
+    assert_eq!(card["header"]["template"], "purple");
+}
+
+#[tokio::test]
+async fn app_bot_token_error_does_not_expose_token_or_app_secret() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 99991663,
+            "msg": "invalid app credentials",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send(&test_signal())
+        .await
+        .expect_err("token provider error should fail");
+
+    assert_eq!(err.kind, DeliveryErrorKind::ProviderRejected);
+    assert_eq!(err.provider_code.as_deref(), Some("99991663"));
+    assert!(!err.to_string().contains("test-app-secret"));
+    assert!(!err.to_string().contains("test-tenant-token"));
+}
+
+#[tokio::test]
+async fn app_bot_send_response_tenant_mismatch_fails_without_candidate_receipt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_root_message",
+                "chat_id": "oc_test_chat",
+                "sender": {
+                    "tenant_key": "other_tenant"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send(&test_signal())
+        .await
+        .expect_err("tenant mismatch should fail");
+
+    assert_eq!(err.kind, DeliveryErrorKind::ProviderResponse);
+    assert!(
+        err.to_string()
+            .contains("tenant_key did not match provider config")
     );
 }
 
@@ -601,9 +766,26 @@ fn structured_codex_signal(
 fn test_provider(url: String, secret: Option<String>) -> FeishuLarkProvider {
     FeishuLarkProvider {
         id: "work_chat".to_string(),
-        url,
-        secret,
-        computer_name: "Test Mac".to_string(),
+        runtime: FeishuLarkProviderRuntime::CustomBot(FeishuLarkCustomBotRuntime {
+            url,
+            secret,
+            computer_name: "Test Mac".to_string(),
+        }),
+        client: reqwest::Client::new(),
+    }
+}
+
+fn test_app_bot_provider(api_base_url: String) -> FeishuLarkProvider {
+    FeishuLarkProvider {
+        id: "work_chat".to_string(),
+        runtime: FeishuLarkProviderRuntime::AppBot(FeishuLarkAppBotRuntime {
+            api_base_url,
+            app_id: "cli_test".to_string(),
+            app_secret: "test-app-secret".to_string(),
+            tenant_key: "tenant_test".to_string(),
+            chat_id: "oc_test_chat".to_string(),
+            computer_name: "Test Mac".to_string(),
+        }),
         client: reqwest::Client::new(),
     }
 }

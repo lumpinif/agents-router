@@ -6,10 +6,13 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::config::{ProviderConfig, ProviderConfigDetail, ProviderType};
+use crate::config::{
+    FeishuLarkAppBotProviderConfig, FeishuLarkAppDomain, FeishuLarkCustomBotProviderConfig,
+    ProviderConfig, ProviderConfigDetail, ProviderType,
+};
 use crate::delivery::{
-    DeliveryError, DeliveryErrorContext, DeliveryErrorKind, ProviderSendResult,
-    is_retriable_http_status, provider_request_error,
+    DeliveryError, DeliveryErrorContext, DeliveryErrorKind, ProviderDeliveryReceipt,
+    ProviderSendResult, is_retriable_http_status, provider_request_error,
 };
 use crate::local_machine;
 use crate::local_open_bridge::codex_thread_bridge_url;
@@ -27,10 +30,31 @@ const CODEX_CARD_TEMPLATE: &str = "purple";
 #[derive(Debug)]
 pub struct FeishuLarkProvider {
     id: String,
+    runtime: FeishuLarkProviderRuntime,
+    client: reqwest::Client,
+}
+
+#[derive(Debug)]
+enum FeishuLarkProviderRuntime {
+    CustomBot(FeishuLarkCustomBotRuntime),
+    AppBot(FeishuLarkAppBotRuntime),
+}
+
+#[derive(Debug)]
+struct FeishuLarkCustomBotRuntime {
     url: String,
     secret: Option<String>,
     computer_name: String,
-    client: reqwest::Client,
+}
+
+#[derive(Debug)]
+struct FeishuLarkAppBotRuntime {
+    api_base_url: String,
+    app_id: String,
+    app_secret: String,
+    tenant_key: String,
+    chat_id: String,
+    computer_name: String,
 }
 
 impl FeishuLarkProvider {
@@ -41,42 +65,18 @@ impl FeishuLarkProvider {
                 config.id
             ));
         };
-        let crate::config::FeishuLarkProviderConfig::CustomBot(detail) = detail else {
-            return Err(anyhow!(
-                "feishu_lark provider `{}` uses App Bot mode, which is not wired to the outbound runtime yet",
-                config.id
-            ));
+        let runtime = match detail {
+            crate::config::FeishuLarkProviderConfig::CustomBot(detail) => {
+                FeishuLarkProviderRuntime::CustomBot(runtime_custom_bot(&config.id, detail)?)
+            }
+            crate::config::FeishuLarkProviderConfig::AppBot(detail) => {
+                FeishuLarkProviderRuntime::AppBot(runtime_app_bot(&config.id, detail)?)
+            }
         };
-
-        let url = detail.url.resolve_runtime_value(
-            &config.id,
-            ProviderType::FeishuLark.as_str(),
-            "url_env",
-        )?;
-        let url = validate_feishu_lark_webhook_url(&url).with_context(|| {
-            format!(
-                "feishu_lark provider `{}` webhook URL is invalid",
-                config.id
-            )
-        })?;
-        let secret = detail
-            .secret
-            .as_ref()
-            .map(|secret| {
-                secret.resolve_runtime_value(
-                    &config.id,
-                    ProviderType::FeishuLark.as_str(),
-                    "secret_env",
-                )
-            })
-            .transpose()?;
-        let computer_name = local_machine::computer_name()?;
 
         Ok(Self {
             id: config.id.clone(),
-            url,
-            secret,
-            computer_name,
+            runtime,
             client: provider_http_client()?,
         })
     }
@@ -93,91 +93,410 @@ impl Provider for FeishuLarkProvider {
 
     fn send<'a>(&'a self, signal: &'a Signal) -> ProviderFuture<'a> {
         Box::pin(async move {
-            let provider_type = ProviderType::FeishuLark.as_str();
-            let request = FeishuLarkInteractiveRequest::from_signal(
-                signal,
-                self.secret.as_deref(),
-                &self.computer_name,
-            );
-            let response = self
-                .client
-                .post(&self.url)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|error| {
-                    let is_timeout = error.is_timeout();
-                    provider_request_error(
-                        signal,
-                        &self.id,
-                        provider_type,
-                        "feishu_lark",
-                        is_timeout,
-                        error.without_url(),
-                    )
-                })?;
+            match &self.runtime {
+                FeishuLarkProviderRuntime::CustomBot(runtime) => {
+                    self.send_custom_bot(signal, runtime).await
+                }
+                FeishuLarkProviderRuntime::AppBot(runtime) => {
+                    self.send_app_bot(signal, runtime).await
+                }
+            }
+        })
+    }
+}
 
-            let status = response.status();
-            let status_code = status.as_u16();
-            if !status.is_success() {
-                return Err(DeliveryError::new(
-                    DeliveryErrorKind::ProviderRejected,
+impl FeishuLarkProvider {
+    async fn send_custom_bot(
+        &self,
+        signal: &Signal,
+        runtime: &FeishuLarkCustomBotRuntime,
+    ) -> Result<ProviderSendResult, DeliveryError> {
+        let provider_type = ProviderType::FeishuLark.as_str();
+        let request = FeishuLarkInteractiveRequest::from_signal(
+            signal,
+            runtime.secret.as_deref(),
+            &runtime.computer_name,
+        );
+        let response = self
+            .client
+            .post(&runtime.url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                let is_timeout = error.is_timeout();
+                provider_request_error(
+                    signal,
+                    &self.id,
+                    provider_type,
+                    "feishu_lark",
+                    is_timeout,
+                    error.without_url(),
+                )
+            })?;
+
+        let status = response.status();
+        let status_code = status.as_u16();
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned HTTP status {}",
+                    self.id, status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!("feishu_lark provider `{}` failed to read response", self.id),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+        let provider_response: FeishuLarkResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                DeliveryError::new(
+                    DeliveryErrorKind::ProviderResponse,
                     DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                     format!(
-                        "feishu_lark provider `{}` returned HTTP status {}",
-                        self.id, status
+                        "feishu_lark provider `{}` returned invalid response JSON",
+                        self.id
                     ),
                 )
                 .with_http_status(status_code)
-                .with_retriable(is_retriable_http_status(status_code)));
-            }
-
-            let response_body = response.text().await.map_err(|error| {
-                DeliveryError::new(
-                    DeliveryErrorKind::Network,
-                    DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
-                    format!("feishu_lark provider `{}` failed to read response", self.id),
-                )
-                .with_http_status(status_code)
-                .with_retriable(true)
-                .with_source(error.without_url())
+                .with_source(error)
             })?;
-            let provider_response: FeishuLarkResponse = serde_json::from_str(&response_body)
+
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned code {}: {}",
+                    self.id,
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+
+        Ok(ProviderSendResult::sent(&self.id, provider_type, signal).with_http_status(status_code))
+    }
+
+    async fn send_app_bot(
+        &self,
+        signal: &Signal,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<ProviderSendResult, DeliveryError> {
+        let provider_type = ProviderType::FeishuLark.as_str();
+        let token = self.fetch_tenant_access_token(signal, runtime).await?;
+        let content =
+            serde_json::to_string(&FeishuLarkCard::from_signal(signal, &runtime.computer_name))
                 .map_err(|error| {
                     DeliveryError::new(
+                        DeliveryErrorKind::Internal,
+                        DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                        format!(
+                            "feishu_lark provider `{}` failed to serialize App Bot message content",
+                            self.id
+                        ),
+                    )
+                    .with_source(error)
+                })?;
+        let request = FeishuLarkAppBotSendMessageRequest {
+            receive_id: &runtime.chat_id,
+            msg_type: "interactive",
+            content,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/open-apis/im/v1/messages", runtime.api_base_url))
+            .query(&[("receive_id_type", "chat_id")])
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                let is_timeout = error.is_timeout();
+                provider_request_error(
+                    signal,
+                    &self.id,
+                    provider_type,
+                    "feishu_lark",
+                    is_timeout,
+                    error.without_url(),
+                )
+            })?;
+
+        let status = response.status();
+        let status_code = status.as_u16();
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` failed to read App Bot send response",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned HTTP status {} while sending App Bot message",
+                    self.id, status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkAppBotSendMessageResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                DeliveryError::new(
+                    DeliveryErrorKind::ProviderResponse,
+                    DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                    format!(
+                        "feishu_lark provider `{}` returned invalid App Bot send response JSON",
+                        self.id
+                    ),
+                )
+                .with_http_status(status_code)
+                .with_source(error)
+            })?;
+
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned code {} while sending App Bot message: {}",
+                    self.id,
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+
+        let data = provider_response.data.ok_or_else(|| {
+            DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` App Bot send response did not include message data",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+        })?;
+        let receipt = app_bot_candidate_receipt(signal, &self.id, provider_type, runtime, data)
+            .map_err(|error| error.with_http_status(status_code))?;
+        let provider_message_id = receipt.provider_message_id.clone();
+        let mut result = ProviderSendResult::sent(&self.id, provider_type, signal)
+            .with_http_status(status_code)
+            .with_delivery_receipt(receipt);
+        if let Some(provider_message_id) = provider_message_id {
+            result = result.with_provider_message_id(provider_message_id);
+        }
+
+        Ok(result)
+    }
+
+    async fn fetch_tenant_access_token(
+        &self,
+        signal: &Signal,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<String, DeliveryError> {
+        let provider_type = ProviderType::FeishuLark.as_str();
+        let request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                let is_timeout = error.is_timeout();
+                provider_request_error(
+                    signal,
+                    &self.id,
+                    provider_type,
+                    "feishu_lark",
+                    is_timeout,
+                    error.without_url(),
+                )
+            })?;
+
+        let status = response.status();
+        let status_code = status.as_u16();
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` failed to read tenant access token response",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned HTTP status {} while fetching tenant access token",
+                    self.id, status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse = match serde_json::from_str(
+            &response_body,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(DeliveryError::new(
                         DeliveryErrorKind::ProviderResponse,
                         DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                         format!(
-                            "feishu_lark provider `{}` returned invalid response JSON",
+                            "feishu_lark provider `{}` returned invalid tenant access token response JSON",
                             self.id
                         ),
                     )
                     .with_http_status(status_code)
-                    .with_source(error)
-                })?;
-
-            if provider_response.code != 0 {
-                let provider_code = provider_response.code.to_string();
-                return Err(DeliveryError::new(
-                    DeliveryErrorKind::ProviderRejected,
-                    DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
-                    format!(
-                        "feishu_lark provider `{}` returned code {}: {}",
-                        self.id,
-                        provider_response.code,
-                        provider_response
-                            .msg
-                            .unwrap_or_else(|| "unknown error".to_string())
-                    ),
-                )
-                .with_http_status(status_code)
-                .with_provider_code(provider_code));
+                    .with_source(error));
             }
+        };
 
-            Ok(ProviderSendResult::sent(&self.id, provider_type, signal)
-                .with_http_status(status_code))
-        })
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned code {} while fetching tenant access token: {}",
+                    self.id,
+                    provider_response.code,
+                    provider_response.msg.unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+
+        let Some(token) = present_owned(provider_response.tenant_access_token) else {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` tenant access token response did not include a token",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code));
+        };
+        if provider_response.expire.unwrap_or_default() <= 0 {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` tenant access token response had an invalid expiry",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code));
+        }
+
+        Ok(token)
     }
+}
+
+fn runtime_custom_bot(
+    provider_id: &str,
+    detail: &FeishuLarkCustomBotProviderConfig,
+) -> anyhow::Result<FeishuLarkCustomBotRuntime> {
+    let url = detail.url.resolve_runtime_value(
+        provider_id,
+        ProviderType::FeishuLark.as_str(),
+        "url_env",
+    )?;
+    let url = validate_feishu_lark_webhook_url(&url)
+        .with_context(|| format!("feishu_lark provider `{provider_id}` webhook URL is invalid"))?;
+    let secret = detail
+        .secret
+        .as_ref()
+        .map(|secret| {
+            secret.resolve_runtime_value(
+                provider_id,
+                ProviderType::FeishuLark.as_str(),
+                "secret_env",
+            )
+        })
+        .transpose()?;
+    let computer_name = local_machine::computer_name()?;
+
+    Ok(FeishuLarkCustomBotRuntime {
+        url,
+        secret,
+        computer_name,
+    })
+}
+
+fn runtime_app_bot(
+    provider_id: &str,
+    detail: &FeishuLarkAppBotProviderConfig,
+) -> anyhow::Result<FeishuLarkAppBotRuntime> {
+    let app_secret = detail.app_secret.resolve_runtime_value(
+        provider_id,
+        ProviderType::FeishuLark.as_str(),
+        "app_secret_env",
+    )?;
+    let computer_name = local_machine::computer_name()?;
+
+    Ok(FeishuLarkAppBotRuntime {
+        api_base_url: app_bot_api_base_url(detail.domain).to_string(),
+        app_id: detail.app_id.clone(),
+        app_secret,
+        tenant_key: detail.tenant_key.clone(),
+        chat_id: detail.chat_id.clone(),
+        computer_name,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +619,159 @@ struct FeishuLarkCardAction {
 struct FeishuLarkResponse {
     code: i64,
     msg: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkTenantAccessTokenRequest<'a> {
+    app_id: &'a str,
+    app_secret: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkTenantAccessTokenResponse {
+    code: i64,
+    msg: Option<String>,
+    tenant_access_token: Option<String>,
+    expire: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkAppBotSendMessageRequest<'a> {
+    receive_id: &'a str,
+    msg_type: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkAppBotSendMessageResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuLarkAppBotMessageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkAppBotMessageData {
+    message_id: Option<String>,
+    chat_id: Option<String>,
+    sender: Option<FeishuLarkAppBotMessageSender>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkAppBotMessageSender {
+    tenant_key: Option<String>,
+}
+
+fn app_bot_candidate_receipt(
+    signal: &Signal,
+    provider_id: &str,
+    provider_type: &str,
+    runtime: &FeishuLarkAppBotRuntime,
+    data: FeishuLarkAppBotMessageData,
+) -> Result<ProviderDeliveryReceipt, DeliveryError> {
+    let message_id = required_app_bot_response_field(
+        signal,
+        provider_id,
+        provider_type,
+        "message_id",
+        data.message_id,
+    )?;
+    let chat_id = required_app_bot_response_field(
+        signal,
+        provider_id,
+        provider_type,
+        "chat_id",
+        data.chat_id,
+    )?;
+    if chat_id != runtime.chat_id {
+        return Err(app_bot_response_error(
+            signal,
+            provider_id,
+            provider_type,
+            "App Bot send response chat_id did not match provider config",
+        ));
+    }
+
+    let sender = data.sender.ok_or_else(|| {
+        app_bot_response_error(
+            signal,
+            provider_id,
+            provider_type,
+            "App Bot send response did not include sender",
+        )
+    })?;
+    let tenant_key = required_app_bot_response_field(
+        signal,
+        provider_id,
+        provider_type,
+        "sender.tenant_key",
+        sender.tenant_key,
+    )?;
+    if tenant_key != runtime.tenant_key {
+        return Err(app_bot_response_error(
+            signal,
+            provider_id,
+            provider_type,
+            "App Bot send response tenant_key did not match provider config",
+        ));
+    }
+
+    Ok(ProviderDeliveryReceipt::candidate(
+        Some(tenant_key),
+        Some(chat_id),
+        Some(message_id),
+        None,
+    ))
+}
+
+fn required_app_bot_response_field(
+    signal: &Signal,
+    provider_id: &str,
+    provider_type: &str,
+    field: &'static str,
+    value: Option<String>,
+) -> Result<String, DeliveryError> {
+    present_owned(value).ok_or_else(|| {
+        app_bot_response_error(
+            signal,
+            provider_id,
+            provider_type,
+            format!("App Bot send response did not include {field}"),
+        )
+    })
+}
+
+fn app_bot_response_error(
+    signal: &Signal,
+    provider_id: &str,
+    provider_type: &str,
+    message: impl Into<String>,
+) -> DeliveryError {
+    DeliveryError::new(
+        DeliveryErrorKind::ProviderResponse,
+        DeliveryErrorContext::provider_send(signal, provider_id, provider_type),
+        format!(
+            "feishu_lark provider `{provider_id}` returned invalid App Bot send response: {}",
+            message.into()
+        ),
+    )
+}
+
+fn app_bot_api_base_url(domain: FeishuLarkAppDomain) -> &'static str {
+    match domain {
+        FeishuLarkAppDomain::Feishu => "https://open.feishu.cn",
+        FeishuLarkAppDomain::Lark => "https://open.larksuite.com",
+    }
+}
+
+fn present_owned(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn sign_request(timestamp: &str, secret: &str) -> String {
