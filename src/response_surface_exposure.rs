@@ -205,11 +205,7 @@ mod tests {
                 provider_mode_capability(ProviderMode::FeishuLarkAppBot),
                 &route,
             ),
-            ResponseSurfaceExposureDecision::Ineligible(
-                ResponseSurfaceExposureSkipReason::ProviderReceiptFieldUnsupported(
-                    DeliveryReceiptField::ProviderThreadId
-                )
-            )
+            ResponseSurfaceExposureDecision::Eligible
         );
     }
 

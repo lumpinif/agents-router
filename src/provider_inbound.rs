@@ -177,7 +177,7 @@ pub fn normalize_feishu_lark_long_connection_surface_reply(
         ));
     }
 
-    let event_id = required_owned("feishu_lark header.event_id", header.event_id.as_deref())?;
+    required_owned("feishu_lark header.event_id", header.event_id.as_deref())?;
     let tenant_key = required_owned(
         "feishu_lark header.tenant_key",
         header.tenant_key.as_deref(),
@@ -233,7 +233,7 @@ pub fn normalize_feishu_lark_long_connection_surface_reply(
             provider_account_id: tenant_key,
             provider_conversation_id: chat_id,
             provider_thread_id: root_id,
-            provider_event_id: event_id,
+            provider_event_id: reply_message_id.clone(),
             provider_reply_message_id: Some(reply_message_id),
             reply_text,
         },
@@ -591,11 +591,27 @@ mod tests {
                 provider_account_id: "2ca1d211f64f6438".to_string(),
                 provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
                 provider_thread_id: "om_root_message_id".to_string(),
-                provider_event_id: "5e3702a84e847582be8db7fb73283c02".to_string(),
+                provider_event_id: "om_reply_message_id".to_string(),
                 provider_reply_message_id: Some("om_reply_message_id".to_string()),
                 reply_text: "@_user_1 continue with README".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn feishu_lark_uses_reply_message_id_not_header_event_id_for_dedup() {
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_feishu_lark_long_connection_surface_reply(
+                "lark-app",
+                include_bytes!("../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"),
+            )
+            .expect("Feishu/Lark event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        assert_eq!(reply.provider_event_id, "om_reply_message_id");
+        assert_ne!(reply.provider_event_id, "5e3702a84e847582be8db7fb73283c02");
     }
 
     #[test]

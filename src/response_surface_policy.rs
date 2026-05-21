@@ -441,16 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn feishu_lark_app_bot_is_not_surface_ready_until_root_lookup_is_verified() {
+    fn feishu_lark_app_bot_allows_surface_when_root_lookup_receipt_is_complete() {
         let mut fixture = PolicyFixture::allowable();
         fixture.provider = provider_mode_capability(ProviderMode::FeishuLarkAppBot);
 
-        assert_skip(
-            fixture.input(),
-            ResponseSurfacePolicySkipReason::ProviderReceiptFieldUnsupported(
-                DeliveryReceiptField::ProviderThreadId,
-            ),
-        );
+        assert!(matches!(
+            evaluate_response_surface_policy(fixture.input()),
+            ResponseSurfacePolicyDecision::Allow(_)
+        ));
     }
 
     #[test]

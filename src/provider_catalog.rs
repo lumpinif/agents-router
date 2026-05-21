@@ -163,11 +163,6 @@ pub const RESPONSE_SURFACE_REPLY_SURFACES: &[ProviderReplySurface] = &[
     ProviderReplySurface::MessageReply,
 ];
 const NO_DELIVERY_RECEIPT_FIELDS: &[DeliveryReceiptField] = &[];
-const FEISHU_LARK_CANDIDATE_DELIVERY_RECEIPT_FIELDS: &[DeliveryReceiptField] = &[
-    DeliveryReceiptField::ProviderAccountId,
-    DeliveryReceiptField::ProviderConversationId,
-    DeliveryReceiptField::ProviderMessageId,
-];
 pub const RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS: &[DeliveryReceiptField] = &[
     DeliveryReceiptField::ProviderAccountId,
     DeliveryReceiptField::ProviderConversationId,
@@ -207,10 +202,6 @@ const RESPONSE_SURFACE_DELIVERY_RECEIPT_CAPABILITY: DeliveryReceiptCapability =
     DeliveryReceiptCapability {
         fields: RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS,
     };
-const FEISHU_LARK_CANDIDATE_DELIVERY_RECEIPT_CAPABILITY: DeliveryReceiptCapability =
-    DeliveryReceiptCapability {
-        fields: FEISHU_LARK_CANDIDATE_DELIVERY_RECEIPT_FIELDS,
-    };
 
 const NTFY_PROVIDER_MODES: &[ProviderModeCapability] = &[ProviderModeCapability {
     provider_type: ProviderType::Ntfy,
@@ -241,7 +232,7 @@ const FEISHU_LARK_PROVIDER_MODES: &[ProviderModeCapability] = &[
         mode: ProviderMode::FeishuLarkAppBot,
         display_name: "Feishu/Lark app bot",
         inbound_reply: FEISHU_LARK_LONG_CONNECTION_INBOUND_REPLY,
-        delivery_receipt: FEISHU_LARK_CANDIDATE_DELIVERY_RECEIPT_CAPABILITY,
+        delivery_receipt: RESPONSE_SURFACE_DELIVERY_RECEIPT_CAPABILITY,
     },
 ];
 
@@ -804,10 +795,10 @@ mod tests {
         );
         assert_eq!(
             feishu_lark_app.delivery_receipt.fields,
-            FEISHU_LARK_CANDIDATE_DELIVERY_RECEIPT_FIELDS
+            RESPONSE_SURFACE_DELIVERY_RECEIPT_FIELDS
         );
         assert!(
-            !feishu_lark_app
+            feishu_lark_app
                 .delivery_receipt
                 .has_field(DeliveryReceiptField::ProviderThreadId)
         );

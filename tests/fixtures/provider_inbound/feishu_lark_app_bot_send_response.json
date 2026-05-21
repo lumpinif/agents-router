@@ -1,0 +1,16 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "message_id": "om_root_message_id",
+    "msg_type": "interactive",
+    "create_time": "1615380573411",
+    "chat_id": "oc_5ce6d572455d361153b7xx51da133945",
+    "sender": {
+      "id": "cli_9f5343c580712544",
+      "id_type": "app_id",
+      "sender_type": "app",
+      "tenant_key": "2ca1d211f64f6438"
+    }
+  }
+}

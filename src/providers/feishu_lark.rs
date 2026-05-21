@@ -313,7 +313,7 @@ impl FeishuLarkProvider {
             )
             .with_http_status(status_code)
         })?;
-        let receipt = app_bot_candidate_receipt(signal, &self.id, provider_type, runtime, data)
+        let receipt = app_bot_surface_ready_receipt(signal, &self.id, provider_type, runtime, data)
             .map_err(|error| error.with_http_status(status_code))?;
         let provider_message_id = receipt.provider_message_id.clone();
         let mut result = ProviderSendResult::sent(&self.id, provider_type, signal)
@@ -661,7 +661,7 @@ struct FeishuLarkAppBotMessageSender {
     tenant_key: Option<String>,
 }
 
-fn app_bot_candidate_receipt(
+fn app_bot_surface_ready_receipt(
     signal: &Signal,
     provider_id: &str,
     provider_type: &str,
@@ -715,11 +715,11 @@ fn app_bot_candidate_receipt(
         ));
     }
 
-    Ok(ProviderDeliveryReceipt::candidate(
+    Ok(ProviderDeliveryReceipt::surface_ready(
         Some(tenant_key),
         Some(chat_id),
+        Some(message_id.clone()),
         Some(message_id),
-        None,
     ))
 }
 

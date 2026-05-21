@@ -151,6 +151,7 @@ pub struct ProviderSendResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderDeliveryReceiptStatus {
     Candidate,
+    SurfaceReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +172,21 @@ impl ProviderDeliveryReceipt {
     ) -> Self {
         Self {
             status: ProviderDeliveryReceiptStatus::Candidate,
+            provider_account_id,
+            provider_conversation_id,
+            provider_message_id,
+            provider_thread_id,
+        }
+    }
+
+    pub fn surface_ready(
+        provider_account_id: Option<String>,
+        provider_conversation_id: Option<String>,
+        provider_message_id: Option<String>,
+        provider_thread_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: ProviderDeliveryReceiptStatus::SurfaceReady,
             provider_account_id,
             provider_conversation_id,
             provider_message_id,

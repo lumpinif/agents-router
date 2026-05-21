@@ -8,6 +8,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::config::{FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, UrlSource};
 use crate::delivery::{DeliveryErrorKind, ProviderDeliveryReceiptStatus, ProviderSendStatus};
+use crate::provider_inbound::{
+    ProviderInboundNormalizeResult, normalize_feishu_lark_long_connection_surface_reply,
+};
 use crate::signal::{
     SignalAnswer, SignalAnswerKind, SignalConversation, SignalLifecycle, SignalLifecycleStatus,
     SignalLink, SignalWorkspace,
@@ -88,8 +91,12 @@ async fn sends_interactive_card_to_custom_bot_webhook() {
 }
 
 #[tokio::test]
-async fn app_bot_sends_message_and_returns_unverified_candidate_receipt() {
+async fn app_bot_sends_message_and_returns_surface_ready_root_lookup_receipt() {
     let server = MockServer::start().await;
+    let send_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/provider_inbound/feishu_lark_app_bot_send_response.json"
+    ))
+    .expect("send response fixture should be valid JSON");
     Mock::given(method("POST"))
         .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
         .and(body_partial_json(json!({
@@ -109,25 +116,10 @@ async fn app_bot_sends_message_and_returns_unverified_candidate_receipt() {
         .and(query_param("receive_id_type", "chat_id"))
         .and(header("authorization", "Bearer test-tenant-token"))
         .and(body_partial_json(json!({
-            "receive_id": "oc_test_chat",
+            "receive_id": "oc_5ce6d572455d361153b7xx51da133945",
             "msg_type": "interactive"
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "message_id": "om_root_message",
-                "root_id": "om_root_message",
-                "thread_id": "omt_candidate_thread",
-                "chat_id": "oc_test_chat",
-                "sender": {
-                    "id": "cli_test",
-                    "id_type": "app_id",
-                    "sender_type": "app",
-                    "tenant_key": "tenant_test"
-                }
-            }
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(send_response))
         .mount(&server)
         .await;
 
@@ -143,25 +135,29 @@ async fn app_bot_sends_message_and_returns_unverified_candidate_receipt() {
     assert_eq!(result.http_status, Some(200));
     assert_eq!(
         result.provider_message_id.as_deref(),
-        Some("om_root_message")
+        Some("om_root_message_id")
     );
 
     let receipt = result
         .delivery_receipt
-        .expect("App Bot should return candidate delivery receipt");
-    assert_eq!(receipt.status, ProviderDeliveryReceiptStatus::Candidate);
-    assert_eq!(receipt.provider_account_id.as_deref(), Some("tenant_test"));
+        .expect("App Bot should return a delivery receipt");
+    assert_eq!(receipt.status, ProviderDeliveryReceiptStatus::SurfaceReady);
+    assert_eq!(
+        receipt.provider_account_id.as_deref(),
+        Some("2ca1d211f64f6438")
+    );
     assert_eq!(
         receipt.provider_conversation_id.as_deref(),
-        Some("oc_test_chat")
+        Some("oc_5ce6d572455d361153b7xx51da133945")
     );
     assert_eq!(
         receipt.provider_message_id.as_deref(),
-        Some("om_root_message")
+        Some("om_root_message_id")
     );
     assert_eq!(
-        receipt.provider_thread_id, None,
-        "root/thread lookup is still unverified and must not create a surface-ready receipt"
+        receipt.provider_thread_id.as_deref(),
+        Some("om_root_message_id"),
+        "Feishu/Lark reply events use root_id as the surface lookup key"
     );
 
     let requests = server
@@ -182,6 +178,77 @@ async fn app_bot_sends_message_and_returns_unverified_candidate_receipt() {
         serde_json::from_str(content).expect("App Bot card content should be JSON");
     assert_eq!(card["header"]["title"]["content"], "Codex · Test Mac");
     assert_eq!(card["header"]["template"], "purple");
+}
+
+#[tokio::test]
+async fn app_bot_outbound_message_id_matches_inbound_reply_root_lookup_key() {
+    let server = MockServer::start().await;
+    let send_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/provider_inbound/feishu_lark_app_bot_send_response.json"
+    ))
+    .expect("send response fixture should be valid JSON");
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(send_response))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let outbound = provider
+        .send(&test_signal())
+        .await
+        .expect("App Bot send should succeed");
+    let outbound_receipt = outbound
+        .delivery_receipt
+        .expect("App Bot should return a delivery receipt");
+    let ProviderInboundNormalizeResult::SurfaceReply(inbound_reply) =
+        normalize_feishu_lark_long_connection_surface_reply(
+            "work_chat",
+            include_bytes!(
+                "../../../tests/fixtures/provider_inbound/feishu_lark_app_bot_reply_to_sent_message.json"
+            ),
+        )
+        .expect("reply event should normalize")
+    else {
+        panic!("reply event should be a surface reply");
+    };
+
+    assert_eq!(
+        outbound_receipt.status,
+        ProviderDeliveryReceiptStatus::SurfaceReady
+    );
+    assert_eq!(
+        outbound_receipt.provider_message_id,
+        outbound_receipt.provider_thread_id
+    );
+    assert_eq!(
+        inbound_reply.provider_thread_id,
+        outbound_receipt
+            .provider_thread_id
+            .expect("surface-ready receipt has provider_thread_id")
+    );
+    assert_eq!(
+        inbound_reply.provider_conversation_id,
+        outbound_receipt
+            .provider_conversation_id
+            .expect("surface-ready receipt has provider_conversation_id")
+    );
+    assert_eq!(
+        inbound_reply.provider_account_id,
+        outbound_receipt
+            .provider_account_id
+            .expect("surface-ready receipt has provider_account_id")
+    );
 }
 
 #[tokio::test]
@@ -211,7 +278,7 @@ async fn app_bot_token_error_does_not_expose_token_or_app_secret() {
 }
 
 #[tokio::test]
-async fn app_bot_send_response_tenant_mismatch_fails_without_candidate_receipt() {
+async fn app_bot_send_response_tenant_mismatch_fails_without_delivery_receipt() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
@@ -230,7 +297,7 @@ async fn app_bot_send_response_tenant_mismatch_fails_without_candidate_receipt()
             "msg": "success",
             "data": {
                 "message_id": "om_root_message",
-                "chat_id": "oc_test_chat",
+                "chat_id": "oc_5ce6d572455d361153b7xx51da133945",
                 "sender": {
                     "tenant_key": "other_tenant"
                 }
@@ -782,8 +849,8 @@ fn test_app_bot_provider(api_base_url: String) -> FeishuLarkProvider {
             api_base_url,
             app_id: "cli_test".to_string(),
             app_secret: "test-app-secret".to_string(),
-            tenant_key: "tenant_test".to_string(),
-            chat_id: "oc_test_chat".to_string(),
+            tenant_key: "2ca1d211f64f6438".to_string(),
+            chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
             computer_name: "Test Mac".to_string(),
         }),
         client: reqwest::Client::new(),
