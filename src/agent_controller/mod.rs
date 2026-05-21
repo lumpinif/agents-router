@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 
 use crate::agent_integration_catalog::{
     AgentControllerKind, AgentIntegrationDescriptor, agent_integration_for_source,
@@ -9,7 +10,9 @@ use crate::agent_integration_catalog::{
 use crate::config::{RouteConfig, SourceType, ValidatedConfig};
 use crate::provider_catalog::{ProviderModeCapability, provider_config_mode_capability};
 use crate::provider_inbound::ProviderInboundReady;
-use crate::response_surface_ledger::{InboundEventDedupInput, ResponseSurfaceLedger};
+use crate::response_surface_ledger::{
+    InboundEventDedupInput, ProcessedInboundEventDecision, ResponseSurfaceLedger,
+};
 use crate::response_surface_policy::{
     ResponseSurfaceDeliveryReceipt, ResponseSurfacePolicyDecision, ResponseSurfacePolicyInput,
     ResponseSurfacePolicySkipReason, ResponseSurfacePolicySourceFacts,
@@ -21,10 +24,27 @@ pub mod codex_app_server;
 pub type AgentControllerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
 
+pub type ProviderThreadReplyFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ProviderThreadReplySuccess, ProviderThreadReplyError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 pub trait AgentControllerAdapter: Send + Sync {
     fn controller_kind(&self) -> AgentControllerKind;
     fn continue_session<'a>(&'a self, request: AgentControllerRequest)
     -> AgentControllerFuture<'a>;
+}
+
+pub trait ProviderThreadReplyAdapter: Send + Sync {
+    fn provider_id(&self) -> &str;
+    fn provider_type(&self) -> &str;
+    fn send_thread_reply<'a>(
+        &'a self,
+        request: ProviderThreadReplyRequest,
+    ) -> ProviderThreadReplyFuture<'a>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +62,32 @@ pub struct AgentControllerRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentControllerSuccess {
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderThreadReplyRequest {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+    pub surface_id: String,
+    pub provider_event_id_hash: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderThreadReplySuccess {
+    pub provider_reply_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderThreadReplyError {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub surface_id: String,
+    pub provider_event_id_hash: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +120,32 @@ pub enum AgentControllerRuntimeDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControllerClosedLoopDecision {
+    Completed(AgentControllerClosedLoopCompletion),
+    ProviderThreadReplyFailed(AgentControllerProviderThreadReplyFailure),
+    Skipped(AgentControllerRuntimeSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerClosedLoopCompletion {
+    pub outcome: AgentControllerClosedLoopOutcome,
+    pub provider_reply_message_id: Option<String>,
+    pub processed: ProcessedInboundEventDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControllerProviderThreadReplyFailure {
+    pub outcome: AgentControllerClosedLoopOutcome,
+    pub error: ProviderThreadReplyError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControllerClosedLoopOutcome {
+    ControllerSucceeded(AgentControllerRuntimeExecution),
+    ControllerFailed(AgentControllerError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentControllerRuntimeExecution {
     pub controller_kind: AgentControllerKind,
     pub surface_id: String,
@@ -101,6 +173,15 @@ enum InboundRouteResolution<'a> {
         route: &'a RouteConfig,
         provider: &'static ProviderModeCapability,
     },
+    Skipped(AgentControllerRuntimeSkipReason),
+}
+
+enum PreparedInboundContinuation<'a> {
+    Ready {
+        request: AgentControllerRequest,
+        adapter: &'a dyn AgentControllerAdapter,
+    },
+    Failed(AgentControllerError),
     Skipped(AgentControllerRuntimeSkipReason),
 }
 
@@ -150,30 +231,174 @@ impl<'a> AgentControllerRuntime<'a> {
         agent_integration_override: Option<AgentIntegrationDescriptor>,
         provider_capability_override: Option<&'static ProviderModeCapability>,
     ) -> anyhow::Result<AgentControllerRuntimeDecision> {
-        let source_type = match SourceType::from_signal_value(&ready.surface.source_type) {
-            Some(source_type) => source_type,
-            None => {
-                release_inbound_claim(ledger, &ready)?;
-                return Ok(AgentControllerRuntimeDecision::Skipped(
-                    AgentControllerRuntimeSkipReason::InvalidSurfaceSourceType,
-                ));
-            }
-        };
-
-        let (route, provider) = match resolve_inbound_route(
+        let prepared = self.prepare_inbound_continuation(
             config,
             &ready,
-            source_type,
+            agent_integration_override,
             provider_capability_override,
-        ) {
-            InboundRouteResolution::Matched { route, provider } => (route, provider),
-            InboundRouteResolution::Skipped(reason) => {
+        );
+
+        let (request, adapter) = match prepared {
+            PreparedInboundContinuation::Ready { request, adapter } => (request, adapter),
+            PreparedInboundContinuation::Failed(error) => {
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerRuntimeDecision::Failed(error));
+            }
+            PreparedInboundContinuation::Skipped(reason) => {
                 release_inbound_claim(ledger, &ready)?;
                 return Ok(AgentControllerRuntimeDecision::Skipped(reason));
             }
         };
 
-        let receipt = delivery_receipt_from_ready(&ready);
+        let result = adapter.continue_session(request.clone()).await;
+        release_inbound_claim(ledger, &ready)?;
+
+        match result {
+            Ok(result) => Ok(AgentControllerRuntimeDecision::Executed(
+                AgentControllerRuntimeExecution {
+                    controller_kind: request.controller_kind,
+                    surface_id: ready.surface.surface_id,
+                    source_session_id: request.source_session_id,
+                    result,
+                },
+            )),
+            Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
+        }
+    }
+
+    pub async fn run_inbound_continuation_closed_loop(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        provider_reply: &dyn ProviderThreadReplyAdapter,
+        now: DateTime<Utc>,
+        processed_expires_at: DateTime<Utc>,
+    ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        self.run_inbound_continuation_closed_loop_inner(
+            config,
+            ledger,
+            ready,
+            provider_reply,
+            now,
+            processed_expires_at,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn run_inbound_continuation_closed_loop_with_test_policy_facts(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        provider_reply: &dyn ProviderThreadReplyAdapter,
+        now: DateTime<Utc>,
+        processed_expires_at: DateTime<Utc>,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        self.run_inbound_continuation_closed_loop_inner(
+            config,
+            ledger,
+            ready,
+            provider_reply,
+            now,
+            processed_expires_at,
+            agent_integration_override,
+            provider_capability_override,
+        )
+        .await
+    }
+
+    async fn run_inbound_continuation_closed_loop_inner(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        provider_reply: &dyn ProviderThreadReplyAdapter,
+        now: DateTime<Utc>,
+        processed_expires_at: DateTime<Utc>,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        let prepared = self.prepare_inbound_continuation(
+            config,
+            &ready,
+            agent_integration_override,
+            provider_capability_override,
+        );
+
+        let (request, adapter) = match prepared {
+            PreparedInboundContinuation::Ready { request, adapter } => (request, adapter),
+            PreparedInboundContinuation::Failed(error) => {
+                let outcome = AgentControllerClosedLoopOutcome::ControllerFailed(error);
+                return send_ack_and_record_processed(
+                    ledger,
+                    &ready,
+                    provider_reply,
+                    outcome,
+                    now,
+                    processed_expires_at,
+                )
+                .await;
+            }
+            PreparedInboundContinuation::Skipped(reason) => {
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerClosedLoopDecision::Skipped(reason));
+            }
+        };
+
+        let outcome = match adapter.continue_session(request.clone()).await {
+            Ok(result) => AgentControllerClosedLoopOutcome::ControllerSucceeded(
+                AgentControllerRuntimeExecution {
+                    controller_kind: request.controller_kind,
+                    surface_id: ready.surface.surface_id.clone(),
+                    source_session_id: request.source_session_id.clone(),
+                    result,
+                },
+            ),
+            Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
+        };
+
+        send_ack_and_record_processed(
+            ledger,
+            &ready,
+            provider_reply,
+            outcome,
+            now,
+            processed_expires_at,
+        )
+        .await
+    }
+
+    fn prepare_inbound_continuation(
+        &'a self,
+        config: &ValidatedConfig,
+        ready: &ProviderInboundReady,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> PreparedInboundContinuation<'a> {
+        let source_type = match SourceType::from_signal_value(&ready.surface.source_type) {
+            Some(source_type) => source_type,
+            None => {
+                return PreparedInboundContinuation::Skipped(
+                    AgentControllerRuntimeSkipReason::InvalidSurfaceSourceType,
+                );
+            }
+        };
+
+        let (route, provider) =
+            match resolve_inbound_route(config, ready, source_type, provider_capability_override) {
+                InboundRouteResolution::Matched { route, provider } => (route, provider),
+                InboundRouteResolution::Skipped(reason) => {
+                    return PreparedInboundContinuation::Skipped(reason);
+                }
+            };
+
+        let receipt = delivery_receipt_from_ready(ready);
         let source_facts = ResponseSurfacePolicySourceFacts {
             source_id: &ready.surface.source_id,
             source_type,
@@ -195,10 +420,9 @@ impl<'a> AgentControllerRuntime<'a> {
         let allow = match evaluate_response_surface_policy(policy_input) {
             ResponseSurfacePolicyDecision::Allow(allow) => allow,
             ResponseSurfacePolicyDecision::Skip(reason) => {
-                release_inbound_claim(ledger, &ready)?;
-                return Ok(AgentControllerRuntimeDecision::Skipped(
+                return PreparedInboundContinuation::Skipped(
                     AgentControllerRuntimeSkipReason::Policy(reason),
-                ));
+                );
             }
         };
 
@@ -219,30 +443,14 @@ impl<'a> AgentControllerRuntime<'a> {
             .copied()
             .find(|adapter| adapter.controller_kind() == allow.controller_kind)
         else {
-            release_inbound_claim(ledger, &ready)?;
-            return Ok(AgentControllerRuntimeDecision::Failed(
-                AgentControllerError::from_request(
-                    &request,
-                    AgentControllerErrorKind::ControllerUnavailable,
-                    "agent controller adapter is not registered",
-                ),
+            return PreparedInboundContinuation::Failed(AgentControllerError::from_request(
+                &request,
+                AgentControllerErrorKind::ControllerUnavailable,
+                "agent controller adapter is not registered",
             ));
         };
 
-        let result = adapter.continue_session(request.clone()).await;
-        release_inbound_claim(ledger, &ready)?;
-
-        match result {
-            Ok(result) => Ok(AgentControllerRuntimeDecision::Executed(
-                AgentControllerRuntimeExecution {
-                    controller_kind: allow.controller_kind,
-                    surface_id: ready.surface.surface_id,
-                    source_session_id: allow.source_session_id,
-                    result,
-                },
-            )),
-            Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
-        }
+        PreparedInboundContinuation::Ready { request, adapter }
     }
 }
 
@@ -261,6 +469,112 @@ impl AgentControllerError {
             source_session_id: request.source_session_id.clone(),
             provider_event_id_hash: request.provider_event_id_hash.clone(),
             message: message.into(),
+        }
+    }
+}
+
+impl ProviderThreadReplyError {
+    pub fn from_ready(ready: &ProviderInboundReady, message: impl Into<String>) -> Self {
+        Self {
+            provider_id: ready.reply.provider_id.clone(),
+            provider_type: ready.reply.provider_type.clone(),
+            surface_id: ready.surface.surface_id.clone(),
+            provider_event_id_hash: ready.provider_event_id_hash.clone(),
+            message: message.into(),
+        }
+    }
+}
+
+async fn send_ack_and_record_processed(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    outcome: AgentControllerClosedLoopOutcome,
+    now: DateTime<Utc>,
+    processed_expires_at: DateTime<Utc>,
+) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+    if provider_reply.provider_id() != ready.reply.provider_id
+        || provider_reply.provider_type() != ready.reply.provider_type
+    {
+        return Ok(
+            AgentControllerClosedLoopDecision::ProviderThreadReplyFailed(
+                AgentControllerProviderThreadReplyFailure {
+                    outcome,
+                    error: ProviderThreadReplyError::from_ready(
+                        ready,
+                        "provider thread reply adapter does not match inbound provider",
+                    ),
+                },
+            ),
+        );
+    }
+
+    let request = provider_thread_reply_request(ready, acknowledgement_text(&outcome));
+    let provider_reply_result = provider_reply.send_thread_reply(request).await;
+    let provider_reply_success = match provider_reply_result {
+        Ok(success) => success,
+        Err(error) => {
+            return Ok(
+                AgentControllerClosedLoopDecision::ProviderThreadReplyFailed(
+                    AgentControllerProviderThreadReplyFailure { outcome, error },
+                ),
+            );
+        }
+    };
+
+    let processed = ledger
+        .record_processed_inbound_event_at(inbound_event_input(ready), now, processed_expires_at)
+        .context("failed to record processed inbound event")?;
+
+    Ok(AgentControllerClosedLoopDecision::Completed(
+        AgentControllerClosedLoopCompletion {
+            outcome,
+            provider_reply_message_id: provider_reply_success.provider_reply_message_id,
+            processed,
+        },
+    ))
+}
+
+fn provider_thread_reply_request(
+    ready: &ProviderInboundReady,
+    text: impl Into<String>,
+) -> ProviderThreadReplyRequest {
+    ProviderThreadReplyRequest {
+        provider_id: ready.reply.provider_id.clone(),
+        provider_type: ready.reply.provider_type.clone(),
+        provider_account_id: ready.reply.provider_account_id.clone(),
+        provider_conversation_id: ready.reply.provider_conversation_id.clone(),
+        provider_thread_id: ready.reply.provider_thread_id.clone(),
+        surface_id: ready.surface.surface_id.clone(),
+        provider_event_id_hash: ready.provider_event_id_hash.clone(),
+        text: text.into(),
+    }
+}
+
+fn acknowledgement_text(outcome: &AgentControllerClosedLoopOutcome) -> &'static str {
+    match outcome {
+        AgentControllerClosedLoopOutcome::ControllerSucceeded(_) => {
+            "Forwarded to the original agent session."
+        }
+        AgentControllerClosedLoopOutcome::ControllerFailed(error) => {
+            controller_failure_acknowledgement_text(error.kind)
+        }
+    }
+}
+
+fn controller_failure_acknowledgement_text(kind: AgentControllerErrorKind) -> &'static str {
+    match kind {
+        AgentControllerErrorKind::ControllerUnavailable => {
+            "Replies are not available for this agent session right now."
+        }
+        AgentControllerErrorKind::SessionNotFound => "The original agent session was not found.",
+        AgentControllerErrorKind::SessionNotContinuable => {
+            "The original agent session cannot continue from this reply."
+        }
+        AgentControllerErrorKind::ControllerRejected
+        | AgentControllerErrorKind::Timeout
+        | AgentControllerErrorKind::Internal => {
+            "Could not forward this reply to the original agent session."
         }
     }
 }
@@ -368,15 +682,19 @@ fn release_inbound_claim(
     ready: &ProviderInboundReady,
 ) -> anyhow::Result<()> {
     ledger
-        .release_inbound_event_claim_at(InboundEventDedupInput {
-            provider_id: ready.reply.provider_id.clone(),
-            provider_type: ready.reply.provider_type.clone(),
-            provider_account_id: ready.reply.provider_account_id.clone(),
-            provider_event_id: ready.reply.provider_event_id.clone(),
-            surface_id: ready.surface.surface_id.clone(),
-        })
+        .release_inbound_event_claim_at(inbound_event_input(ready))
         .context("failed to release inbound event claim")?;
     Ok(())
+}
+
+fn inbound_event_input(ready: &ProviderInboundReady) -> InboundEventDedupInput {
+    InboundEventDedupInput {
+        provider_id: ready.reply.provider_id.clone(),
+        provider_type: ready.reply.provider_type.clone(),
+        provider_account_id: ready.reply.provider_account_id.clone(),
+        provider_event_id: ready.reply.provider_event_id.clone(),
+        surface_id: ready.surface.surface_id.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -600,6 +918,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_loop_sends_ack_not_controller_message_before_processed() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_success_message("agent final result");
+        let provider_reply = RecordingProviderThreadReplyAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                test_time() + Duration::hours(1),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerSucceeded(_),
+                ..
+            })
+        ));
+        let provider_requests = provider_reply.requests();
+        assert_eq!(provider_requests.len(), 1);
+        assert_eq!(
+            provider_requests[0].text,
+            "Forwarded to the original agent session."
+        );
+        assert_ne!(provider_requests[0].text, "agent final result");
+        assert_event_is_duplicate_processed(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn closed_loop_provider_ack_failure_does_not_mark_processed_or_release_claim() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::default();
+        let provider_reply = RecordingProviderThreadReplyAdapter::with_error("ack failed");
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                test_time() + Duration::hours(1),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::ProviderThreadReplyFailed(
+                AgentControllerProviderThreadReplyFailure {
+                    outcome: AgentControllerClosedLoopOutcome::ControllerSucceeded(_),
+                    ..
+                }
+            )
+        ));
+        assert_eq!(adapter.requests().len(), 1);
+        assert_eq!(provider_reply.requests().len(), 1);
+        assert_event_is_still_processing(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn closed_loop_controller_error_can_complete_after_failure_ack() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_error(AgentControllerErrorKind::SessionNotFound);
+        let provider_reply = RecordingProviderThreadReplyAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                test_time() + Duration::hours(1),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
+                    kind: AgentControllerErrorKind::SessionNotFound,
+                    ..
+                }),
+                ..
+            })
+        ));
+        let provider_requests = provider_reply.requests();
+        assert_eq!(provider_requests.len(), 1);
+        assert_eq!(
+            provider_requests[0].text,
+            "The original agent session was not found."
+        );
+        assert_event_is_duplicate_processed(&mut ledger, ready);
+    }
+
+    #[tokio::test]
     async fn codex_app_server_placeholder_returns_controller_unavailable() {
         let adapter = codex_app_server::CodexAppServerController::new();
         let request = controller_request();
@@ -620,6 +1051,7 @@ mod tests {
     struct RecordingAdapter {
         requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
         error: Option<AgentControllerErrorKind>,
+        success_message: Option<String>,
     }
 
     impl RecordingAdapter {
@@ -627,6 +1059,15 @@ mod tests {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 error: Some(error),
+                success_message: None,
+            }
+        }
+
+        fn with_success_message(message: &str) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+                success_message: Some(message.to_string()),
             }
         }
 
@@ -660,7 +1101,67 @@ mod tests {
                     ));
                 }
                 Ok(AgentControllerSuccess {
-                    message: Some("accepted".to_string()),
+                    message: Some(
+                        self.success_message
+                            .clone()
+                            .unwrap_or_else(|| "accepted".to_string()),
+                    ),
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProviderThreadReplyAdapter {
+        requests: Arc<Mutex<Vec<ProviderThreadReplyRequest>>>,
+        error: Option<String>,
+    }
+
+    impl RecordingProviderThreadReplyAdapter {
+        fn with_error(message: &str) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                error: Some(message.to_string()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProviderThreadReplyRequest> {
+            self.requests
+                .lock()
+                .expect("requests mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl ProviderThreadReplyAdapter for RecordingProviderThreadReplyAdapter {
+        fn provider_id(&self) -> &str {
+            "slack"
+        }
+
+        fn provider_type(&self) -> &str {
+            "slack"
+        }
+
+        fn send_thread_reply<'a>(
+            &'a self,
+            request: ProviderThreadReplyRequest,
+        ) -> ProviderThreadReplyFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("requests mutex should not be poisoned")
+                    .push(request.clone());
+                if let Some(error) = &self.error {
+                    return Err(ProviderThreadReplyError {
+                        provider_id: request.provider_id,
+                        provider_type: request.provider_type,
+                        surface_id: request.surface_id,
+                        provider_event_id_hash: request.provider_event_id_hash,
+                        message: error.clone(),
+                    });
+                }
+                Ok(ProviderThreadReplySuccess {
+                    provider_reply_message_id: Some("ack-message-1".to_string()),
                 })
             })
         }
@@ -759,6 +1260,38 @@ mod tests {
                 )
                 .expect("released claim should be claimable"),
             InboundEventClaimDecision::Claimed { .. }
+        ));
+    }
+
+    fn assert_event_is_duplicate_processed(
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+    ) {
+        assert!(matches!(
+            ledger
+                .claim_inbound_event_at(
+                    inbound_event_input(&ready),
+                    test_time() + Duration::seconds(3),
+                    test_time() + Duration::minutes(5),
+                )
+                .expect("processed event should be duplicate"),
+            InboundEventClaimDecision::DuplicateProcessed { .. }
+        ));
+    }
+
+    fn assert_event_is_still_processing(
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+    ) {
+        assert!(matches!(
+            ledger
+                .claim_inbound_event_at(
+                    inbound_event_input(&ready),
+                    test_time() + Duration::seconds(3),
+                    test_time() + Duration::minutes(5),
+                )
+                .expect("incomplete event should still be processing"),
+            InboundEventClaimDecision::AlreadyProcessing { .. }
         ));
     }
 
