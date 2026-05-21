@@ -1069,6 +1069,251 @@ fn rejects_feishu_lark_with_both_secret_sources() {
 }
 
 #[test]
+fn parses_explicit_feishu_lark_app_bot_config_without_reading_env() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_lark_app"]
+"#;
+
+    let config = ValidatedConfig::from_toml_str(raw).expect("explicit App Bot config should parse");
+    let provider = config
+        .provider("work_lark_app")
+        .expect("validated provider should exist");
+
+    assert!(matches!(
+        &provider.detail,
+        ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(
+            FeishuLarkAppBotProviderConfig {
+                domain: FeishuLarkAppDomain::Lark,
+                app_id,
+                app_secret: SecretSource::Env(app_secret_env),
+                tenant_key,
+                chat_id,
+            }
+        )) if app_id == "cli_9f5343c580712544"
+            && app_secret_env == "AGENTS_ROUTER_LARK_APP_SECRET"
+            && tenant_key == "2ca1d211f64f6438"
+            && chat_id == "oc_5ce6d572455d361153b7xx51da133945"
+    ));
+}
+
+#[test]
+fn feishu_lark_app_bot_mode_must_be_explicit() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_lark_app"]
+"#;
+
+    let err = ValidatedConfig::from_toml_str(raw)
+        .expect_err("App Bot fields without explicit mode should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::MissingFeishuLarkAppBotMode { provider_id }
+            if provider_id == "work_lark_app"
+    ));
+}
+
+#[test]
+fn feishu_lark_app_bot_rejects_custom_bot_webhook_fields() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+url = "https://open.larksuite.com/open-apis/bot/v2/hook/test"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_lark_app"]
+"#;
+
+    let err = ValidatedConfig::from_toml_str(raw)
+        .expect_err("App Bot must not accept Custom Bot webhook fields");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidFeishuLarkAppBotWebhookFields { provider_id }
+            if provider_id == "work_lark_app"
+    ));
+}
+
+#[test]
+fn feishu_lark_custom_bot_rejects_app_bot_fields() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_chat"
+type = "feishu_lark"
+mode = "custom_bot"
+url = "https://open.larksuite.com/open-apis/bot/v2/hook/test"
+app_id = "cli_9f5343c580712544"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_chat"]
+"#;
+
+    let err =
+        ValidatedConfig::from_toml_str(raw).expect_err("Custom Bot must not accept App Bot fields");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidFeishuLarkCustomBotAppFields { provider_id }
+            if provider_id == "work_chat"
+    ));
+}
+
+#[test]
+fn rejects_unknown_feishu_lark_mode() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_chat"
+type = "feishu_lark"
+mode = "socket_mode"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_chat"]
+"#;
+
+    let err =
+        ValidatedConfig::from_toml_str(raw).expect_err("unknown Feishu/Lark mode should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidFeishuLarkMode { provider_id, mode }
+            if provider_id == "work_chat" && mode == "socket_mode"
+    ));
+}
+
+#[test]
+fn rejects_invalid_feishu_lark_app_bot_domain() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "global"
+app_id = "cli_9f5343c580712544"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_lark_app"]
+"#;
+
+    let err = ValidatedConfig::from_toml_str(raw)
+        .expect_err("unsupported Feishu/Lark App Bot domain should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidFeishuLarkAppBotDomain {
+            provider_id,
+            domain
+        } if provider_id == "work_lark_app" && domain == "global"
+    ));
+}
+
+#[test]
+fn rejects_feishu_lark_app_bot_with_both_secret_sources() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_cli"
+type = "codex_cli"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret = "inline-secret"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+
+[[routes]]
+sources = ["codex_cli"]
+providers = ["work_lark_app"]
+"#;
+
+    let err = ValidatedConfig::from_toml_str(raw)
+        .expect_err("ambiguous App Bot app secret source should fail");
+
+    assert!(matches!(
+        err,
+        ConfigError::InvalidFeishuLarkAppSecretSource { provider_id }
+            if provider_id == "work_lark_app"
+    ));
+}
+
+#[test]
 fn rejects_pushover_without_app_token_source() {
     let raw = r#"
 schema_version = 1

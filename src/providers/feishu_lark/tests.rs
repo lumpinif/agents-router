@@ -6,7 +6,7 @@ use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::config::{FeishuLarkProviderConfig, UrlSource};
+use crate::config::{FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, UrlSource};
 use crate::delivery::{DeliveryErrorKind, ProviderSendStatus};
 use crate::signal::{
     SignalAnswer, SignalAnswerKind, SignalConversation, SignalLifecycle, SignalLifecycleStatus,
@@ -21,10 +21,12 @@ fn rejects_invalid_webhook_url_from_env() {
     );
     let config = ProviderConfig {
         id: "work_chat".to_string(),
-        detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig {
-            url: UrlSource::Env("AGENTS_ROUTER_TEST_FEISHU_LARK_WEBHOOK_URL".to_string()),
-            secret: None,
-        }),
+        detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::CustomBot(
+            FeishuLarkCustomBotProviderConfig {
+                url: UrlSource::Env("AGENTS_ROUTER_TEST_FEISHU_LARK_WEBHOOK_URL".to_string()),
+                secret: None,
+            },
+        )),
     };
 
     let err = FeishuLarkProvider::from_config(&config)

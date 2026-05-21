@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ProviderConfig, ProviderConfigDetail, ProviderType};
+use crate::config::{FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail, ProviderType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderDescriptor {
@@ -536,7 +536,10 @@ pub fn provider_config_mode(provider: &ProviderConfig) -> ProviderMode {
     match &provider.detail {
         ProviderConfigDetail::Ntfy(_) => ProviderMode::NtfyTopic,
         ProviderConfigDetail::Webhook(_) => ProviderMode::Webhook,
-        ProviderConfigDetail::FeishuLark(_) => ProviderMode::FeishuLarkCustomBot,
+        ProviderConfigDetail::FeishuLark(detail) => match detail {
+            FeishuLarkProviderConfig::CustomBot(_) => ProviderMode::FeishuLarkCustomBot,
+            FeishuLarkProviderConfig::AppBot(_) => ProviderMode::FeishuLarkAppBot,
+        },
         ProviderConfigDetail::Pushover(_) => ProviderMode::PushoverMessagesApi,
         ProviderConfigDetail::Slack(_) => ProviderMode::SlackIncomingWebhook,
         ProviderConfigDetail::Discord(_) => ProviderMode::DiscordWebhook,
@@ -584,8 +587,9 @@ pub fn provider_local_preflight_message_limit(
 mod tests {
     use super::*;
     use crate::config::{
-        FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail, SlackProviderConfig,
-        UrlSource, WebhookProviderConfig,
+        FeishuLarkAppBotProviderConfig, FeishuLarkAppDomain, FeishuLarkCustomBotProviderConfig,
+        FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail, SecretSource,
+        SlackProviderConfig, UrlSource, WebhookProviderConfig,
     };
 
     #[test]
@@ -805,12 +809,14 @@ mod tests {
         };
         let feishu_lark = ProviderConfig {
             id: "feishu_lark".to_string(),
-            detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig {
-                url: UrlSource::Inline(
-                    "https://open.feishu.cn/open-apis/bot/v2/hook/test".to_string(),
-                ),
-                secret: None,
-            }),
+            detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::CustomBot(
+                FeishuLarkCustomBotProviderConfig {
+                    url: UrlSource::Inline(
+                        "https://open.feishu.cn/open-apis/bot/v2/hook/test".to_string(),
+                    ),
+                    secret: None,
+                },
+            )),
         };
         let webhook = ProviderConfig {
             id: "webhook".to_string(),
@@ -835,6 +841,33 @@ mod tests {
                 InboundReplyMode::None
             );
         }
+    }
+
+    #[test]
+    fn explicit_feishu_lark_app_bot_config_maps_to_app_bot_mode() {
+        let provider = ProviderConfig {
+            id: "lark_app".to_string(),
+            detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(
+                FeishuLarkAppBotProviderConfig {
+                    domain: FeishuLarkAppDomain::Lark,
+                    app_id: "cli_9f5343c580712544".to_string(),
+                    app_secret: SecretSource::Env("AGENTS_ROUTER_LARK_APP_SECRET".to_string()),
+                    tenant_key: "2ca1d211f64f6438".to_string(),
+                    chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                },
+            )),
+        };
+
+        assert_eq!(
+            provider_config_mode(&provider),
+            ProviderMode::FeishuLarkAppBot
+        );
+        assert_eq!(
+            provider_config_mode_capability(&provider)
+                .inbound_reply
+                .mode,
+            InboundReplyMode::LocalConnection
+        );
     }
 
     #[test]

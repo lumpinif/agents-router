@@ -222,7 +222,11 @@ pub struct RawProviderConfig {
     #[serde(rename = "type")]
     pub provider_type: ProviderType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,6 +239,14 @@ pub struct RawProviderConfig {
     pub secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_secret_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,9 +364,39 @@ pub struct WebhookProviderConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeishuLarkProviderConfig {
+pub enum FeishuLarkProviderConfig {
+    CustomBot(FeishuLarkCustomBotProviderConfig),
+    AppBot(FeishuLarkAppBotProviderConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuLarkCustomBotProviderConfig {
     pub url: UrlSource,
     pub secret: Option<SecretSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuLarkAppBotProviderConfig {
+    pub domain: FeishuLarkAppDomain,
+    pub app_id: String,
+    pub app_secret: SecretSource,
+    pub tenant_key: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeishuLarkAppDomain {
+    Feishu,
+    Lark,
+}
+
+impl FeishuLarkAppDomain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Lark => "lark",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +660,24 @@ pub enum ConfigError {
         "feishu_lark provider `{provider_id}` must set at most one of `secret` or `secret_env`"
     )]
     InvalidFeishuLarkSecretSource { provider_id: String },
+    #[error("feishu_lark provider `{provider_id}` has unsupported mode `{mode}`")]
+    InvalidFeishuLarkMode { provider_id: String, mode: String },
+    #[error(
+        "feishu_lark provider `{provider_id}` must set `mode = \"app_bot\"` before using App Bot fields"
+    )]
+    MissingFeishuLarkAppBotMode { provider_id: String },
+    #[error("feishu_lark App Bot provider `{provider_id}` must not set Custom Bot webhook fields")]
+    InvalidFeishuLarkAppBotWebhookFields { provider_id: String },
+    #[error(
+        "feishu_lark Custom Bot provider `{provider_id}` must not set App Bot credential or tenant fields"
+    )]
+    InvalidFeishuLarkCustomBotAppFields { provider_id: String },
+    #[error("feishu_lark App Bot provider `{provider_id}` has unsupported domain `{domain}`")]
+    InvalidFeishuLarkAppBotDomain { provider_id: String, domain: String },
+    #[error(
+        "feishu_lark App Bot provider `{provider_id}` must set exactly one of `app_secret` or `app_secret_env`"
+    )]
+    InvalidFeishuLarkAppSecretSource { provider_id: String },
     #[error(
         "pushover provider `{provider_id}` must set exactly one of `app_token` or `app_token_env`"
     )]
@@ -919,13 +979,19 @@ impl RawProviderConfig {
         Self {
             id: id.into(),
             provider_type,
+            mode: None,
             base_url: None,
+            domain: None,
             server: None,
             topic: None,
             url: None,
             url_env: None,
             secret: None,
             secret_env: None,
+            app_id: None,
+            app_secret: None,
+            app_secret_env: None,
+            tenant_key: None,
             app_token: None,
             app_token_env: None,
             user_key: None,
@@ -973,23 +1039,7 @@ impl RawProviderConfig {
                 )?,
             }),
             ProviderType::FeishuLark => {
-                ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig {
-                    url: self.required_url_source(
-                        ConfigError::InvalidFeishuLarkUrlSource {
-                            provider_id: self.id.clone(),
-                        },
-                        validate_feishu_lark_webhook_url,
-                    )?,
-                    secret: self.optional_exact_secret_source(
-                        "secret",
-                        self.secret.as_deref(),
-                        "secret_env",
-                        self.secret_env.as_deref(),
-                        ConfigError::InvalidFeishuLarkSecretSource {
-                            provider_id: self.id.clone(),
-                        },
-                    )?,
-                })
+                ProviderConfigDetail::FeishuLark(self.to_validated_feishu_lark_provider_config()?)
             }
             ProviderType::Pushover => ProviderConfigDetail::Pushover(PushoverProviderConfig {
                 app_token: self.required_exact_secret_source(
@@ -1154,6 +1204,130 @@ impl RawProviderConfig {
         })
     }
 
+    fn to_validated_feishu_lark_provider_config(
+        &self,
+    ) -> Result<FeishuLarkProviderConfig, ConfigError> {
+        match self.feishu_lark_provider_mode()? {
+            FeishuLarkRawProviderMode::CustomBot => {
+                self.reject_feishu_lark_app_bot_fields()?;
+                Ok(FeishuLarkProviderConfig::CustomBot(
+                    FeishuLarkCustomBotProviderConfig {
+                        url: self.required_url_source(
+                            ConfigError::InvalidFeishuLarkUrlSource {
+                                provider_id: self.id.clone(),
+                            },
+                            validate_feishu_lark_webhook_url,
+                        )?,
+                        secret: self.optional_exact_secret_source(
+                            "secret",
+                            self.secret.as_deref(),
+                            "secret_env",
+                            self.secret_env.as_deref(),
+                            ConfigError::InvalidFeishuLarkSecretSource {
+                                provider_id: self.id.clone(),
+                            },
+                        )?,
+                    },
+                ))
+            }
+            FeishuLarkRawProviderMode::AppBot => {
+                self.reject_feishu_lark_custom_bot_fields()?;
+                Ok(FeishuLarkProviderConfig::AppBot(
+                    FeishuLarkAppBotProviderConfig {
+                        domain: self.feishu_lark_app_bot_domain()?,
+                        app_id: self.required_exact_string("app_id", self.app_id.as_deref())?,
+                        app_secret: self.required_exact_secret_source(
+                            "app_secret",
+                            self.app_secret.as_deref(),
+                            "app_secret_env",
+                            self.app_secret_env.as_deref(),
+                            ConfigError::InvalidFeishuLarkAppSecretSource {
+                                provider_id: self.id.clone(),
+                            },
+                        )?,
+                        tenant_key: self
+                            .required_exact_string("tenant_key", self.tenant_key.as_deref())?,
+                        chat_id: self.required_exact_string("chat_id", self.chat_id.as_deref())?,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn feishu_lark_provider_mode(&self) -> Result<FeishuLarkRawProviderMode, ConfigError> {
+        let Some(mode) = present_trimmed_owned(self.mode.as_deref()) else {
+            if self.has_feishu_lark_app_bot_fields() {
+                return Err(ConfigError::MissingFeishuLarkAppBotMode {
+                    provider_id: self.id.clone(),
+                });
+            }
+            return Ok(FeishuLarkRawProviderMode::CustomBot);
+        };
+
+        match mode.as_str() {
+            "custom_bot" => Ok(FeishuLarkRawProviderMode::CustomBot),
+            "app_bot" => Ok(FeishuLarkRawProviderMode::AppBot),
+            _ => Err(ConfigError::InvalidFeishuLarkMode {
+                provider_id: self.id.clone(),
+                mode,
+            }),
+        }
+    }
+
+    fn feishu_lark_app_bot_domain(&self) -> Result<FeishuLarkAppDomain, ConfigError> {
+        let domain = self.required_exact_string("domain", self.domain.as_deref())?;
+        match domain.as_str() {
+            "feishu" => Ok(FeishuLarkAppDomain::Feishu),
+            "lark" => Ok(FeishuLarkAppDomain::Lark),
+            _ => Err(ConfigError::InvalidFeishuLarkAppBotDomain {
+                provider_id: self.id.clone(),
+                domain,
+            }),
+        }
+    }
+
+    fn reject_feishu_lark_app_bot_fields(&self) -> Result<(), ConfigError> {
+        if self.has_feishu_lark_app_bot_fields() {
+            return Err(ConfigError::InvalidFeishuLarkCustomBotAppFields {
+                provider_id: self.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_feishu_lark_custom_bot_fields(&self) -> Result<(), ConfigError> {
+        if self.has_feishu_lark_custom_bot_fields() {
+            return Err(ConfigError::InvalidFeishuLarkAppBotWebhookFields {
+                provider_id: self.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn has_feishu_lark_app_bot_fields(&self) -> bool {
+        [
+            self.domain.as_deref(),
+            self.app_id.as_deref(),
+            self.app_secret.as_deref(),
+            self.app_secret_env.as_deref(),
+            self.tenant_key.as_deref(),
+            self.chat_id.as_deref(),
+        ]
+        .into_iter()
+        .any(is_present)
+    }
+
+    fn has_feishu_lark_custom_bot_fields(&self) -> bool {
+        [
+            self.url.as_deref(),
+            self.url_env.as_deref(),
+            self.secret.as_deref(),
+            self.secret_env.as_deref(),
+        ]
+        .into_iter()
+        .any(is_present)
+    }
+
     fn required_exact_string(
         &self,
         field: &'static str,
@@ -1250,6 +1424,12 @@ impl RawProviderConfig {
             (Some(_), Some(_)) => Err(source_error),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeishuLarkRawProviderMode {
+    CustomBot,
+    AppBot,
 }
 
 fn is_present(value: Option<&str>) -> bool {

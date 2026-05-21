@@ -41,6 +41,12 @@ impl FeishuLarkProvider {
                 config.id
             ));
         };
+        let crate::config::FeishuLarkProviderConfig::CustomBot(detail) = detail else {
+            return Err(anyhow!(
+                "feishu_lark provider `{}` uses App Bot mode, which is not wired to the outbound runtime yet",
+                config.id
+            ));
+        };
 
         let url = detail.url.resolve_runtime_value(
             &config.id,
