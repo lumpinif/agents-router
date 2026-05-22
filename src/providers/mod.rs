@@ -3,6 +3,7 @@ pub(crate) mod contract_test;
 pub mod discord;
 pub mod email_smtp;
 pub mod feishu_lark;
+pub(crate) mod feishu_lark_long_connection;
 mod formatting;
 mod http;
 pub mod microsoft_teams;
