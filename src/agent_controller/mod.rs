@@ -284,7 +284,6 @@ impl<'a> AgentControllerRuntime<'a> {
         ready: ProviderInboundReady,
         provider_reply: &dyn ProviderThreadReplyAdapter,
         now: DateTime<Utc>,
-        processed_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
         self.run_inbound_continuation_closed_loop_inner(
             config,
@@ -292,7 +291,6 @@ impl<'a> AgentControllerRuntime<'a> {
             ready,
             provider_reply,
             now,
-            processed_expires_at,
             None,
             None,
         )
@@ -307,7 +305,6 @@ impl<'a> AgentControllerRuntime<'a> {
         ready: ProviderInboundReady,
         provider_reply: &dyn ProviderThreadReplyAdapter,
         now: DateTime<Utc>,
-        processed_expires_at: DateTime<Utc>,
         agent_integration_override: Option<AgentIntegrationDescriptor>,
         provider_capability_override: Option<&'static ProviderModeCapability>,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
@@ -317,7 +314,6 @@ impl<'a> AgentControllerRuntime<'a> {
             ready,
             provider_reply,
             now,
-            processed_expires_at,
             agent_integration_override,
             provider_capability_override,
         )
@@ -331,7 +327,6 @@ impl<'a> AgentControllerRuntime<'a> {
         ready: ProviderInboundReady,
         provider_reply: &dyn ProviderThreadReplyAdapter,
         now: DateTime<Utc>,
-        processed_expires_at: DateTime<Utc>,
         agent_integration_override: Option<AgentIntegrationDescriptor>,
         provider_capability_override: Option<&'static ProviderModeCapability>,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
@@ -352,7 +347,6 @@ impl<'a> AgentControllerRuntime<'a> {
                     provider_reply,
                     outcome,
                     now,
-                    processed_expires_at,
                 )
                 .await;
             }
@@ -370,15 +364,7 @@ impl<'a> AgentControllerRuntime<'a> {
             Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
         };
 
-        send_result_reply_and_record_processed(
-            ledger,
-            &ready,
-            provider_reply,
-            outcome,
-            now,
-            processed_expires_at,
-        )
-        .await
+        send_result_reply_and_record_processed(ledger, &ready, provider_reply, outcome, now).await
     }
 
     fn prepare_inbound_continuation(
@@ -519,7 +505,6 @@ async fn send_result_reply_and_record_processed(
     provider_reply: &dyn ProviderThreadReplyAdapter,
     outcome: AgentControllerClosedLoopOutcome,
     now: DateTime<Utc>,
-    processed_expires_at: DateTime<Utc>,
 ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
     if provider_reply.provider_id() != ready.reply.provider_id
         || provider_reply.provider_type() != ready.reply.provider_type
@@ -550,8 +535,10 @@ async fn send_result_reply_and_record_processed(
         }
     };
 
+    // agents-router does not set an agent execution hard timeout. The event is
+    // processed only after the controller outcome is replied back to the thread.
     let processed = ledger
-        .record_processed_inbound_event_at(inbound_event_input(ready), now, processed_expires_at)
+        .record_processed_inbound_event_at(inbound_event_input(ready), now)
         .context("failed to record processed inbound event")?;
 
     Ok(AgentControllerClosedLoopDecision::Completed(
@@ -959,7 +946,6 @@ mod tests {
                 ready.clone(),
                 &provider_reply,
                 test_time() + Duration::seconds(2),
-                test_time() + Duration::hours(1),
                 Some(available_codex_desktop()),
                 Some(slack_app_capability()),
             )
@@ -993,7 +979,6 @@ mod tests {
                 ready.clone(),
                 &provider_reply,
                 test_time() + Duration::seconds(2),
-                test_time() + Duration::hours(1),
                 Some(available_codex_desktop()),
                 Some(slack_app_capability()),
             )
@@ -1028,7 +1013,6 @@ mod tests {
                 ready.clone(),
                 &provider_reply,
                 test_time() + Duration::seconds(2),
-                test_time() + Duration::hours(1),
                 Some(available_codex_desktop()),
                 Some(slack_app_capability()),
             )
@@ -1068,7 +1052,6 @@ mod tests {
                 ready.clone(),
                 &provider_reply,
                 test_time() + Duration::seconds(2),
-                test_time() + Duration::hours(1),
                 Some(available_codex_desktop()),
                 Some(slack_app_capability()),
             )
@@ -1322,7 +1305,6 @@ mod tests {
                         surface_id: ready.surface.surface_id.clone(),
                     },
                     now + Duration::seconds(1),
-                    now + Duration::minutes(5),
                 )
                 .expect("claim should be created"),
             InboundEventClaimDecision::Claimed { .. }
@@ -1345,7 +1327,6 @@ mod tests {
                         surface_id: ready.surface.surface_id,
                     },
                     test_time() + Duration::seconds(2),
-                    test_time() + Duration::minutes(5),
                 )
                 .expect("released claim should be claimable"),
             InboundEventClaimDecision::Claimed { .. }
@@ -1361,7 +1342,6 @@ mod tests {
                 .claim_inbound_event_at(
                     inbound_event_input(&ready),
                     test_time() + Duration::seconds(3),
-                    test_time() + Duration::minutes(5),
                 )
                 .expect("processed event should be duplicate"),
             InboundEventClaimDecision::DuplicateProcessed { .. }
@@ -1377,7 +1357,6 @@ mod tests {
                 .claim_inbound_event_at(
                     inbound_event_input(&ready),
                     test_time() + Duration::seconds(3),
-                    test_time() + Duration::minutes(5),
                 )
                 .expect("incomplete event should still be processing"),
             InboundEventClaimDecision::AlreadyProcessing { .. }
@@ -1417,7 +1396,7 @@ mod tests {
         }
     }
 
-    fn new_surface(now: chrono::DateTime<Utc>) -> NewResponseSurface {
+    fn new_surface(_now: chrono::DateTime<Utc>) -> NewResponseSurface {
         NewResponseSurface {
             signal_id: "signal-1".to_string(),
             delivery_id: "delivery-1".to_string(),
@@ -1432,7 +1411,6 @@ mod tests {
             provider_conversation_id: "C123ABC456".to_string(),
             provider_message_id: "1716200000.000100".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
-            expires_at: now + Duration::hours(24),
         }
     }
 

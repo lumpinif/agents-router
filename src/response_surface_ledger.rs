@@ -44,7 +44,6 @@ pub struct ResponseSurfaceRecord {
     pub provider_thread_id: String,
     pub status: ResponseSurfaceStatus,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +51,8 @@ pub struct ResponseSurfaceRecord {
 pub enum ResponseSurfaceStatus {
     Open,
     Closed,
+    // Legacy state from the earlier time-window model. It is treated as open
+    // for lookup because response surfaces no longer expire by time.
     Expired,
 }
 
@@ -70,7 +71,6 @@ pub struct NewResponseSurface {
     pub provider_conversation_id: String,
     pub provider_message_id: String,
     pub provider_thread_id: String,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +86,6 @@ pub enum ResponseSurfaceLookupResult {
     Hit(ResponseSurfaceLookupRecord),
     Miss,
     Closed { surface_id: String },
-    Expired { surface_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +105,6 @@ pub struct ResponseSurfaceLookupRecord {
     pub provider_message_id: String,
     pub provider_thread_id: String,
     pub status: ResponseSurfaceStatus,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +150,6 @@ struct InboundEventDedupRecord {
     surface_id: String,
     status: InboundEventDedupStatus,
     received_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,14 +194,15 @@ impl ResponseSurfaceLedger {
         input: NewResponseSurface,
         now: DateTime<Utc>,
     ) -> anyhow::Result<ResponseSurfaceRecord> {
-        input.validate(now)?;
-        self.expire_due_surfaces_at(now)?;
+        input.validate()?;
 
+        // Response surfaces have no time window. An open surface stays
+        // lookupable until it is explicitly closed.
         if let Some(existing) = self
             .state
             .surfaces
             .iter()
-            .find(|record| open_surface_has_same_provider_thread(record, &input))
+            .find(|record| active_surface_has_same_provider_thread(record, &input))
         {
             if surface_create_is_idempotent(existing, &input) {
                 return Ok(existing.clone());
@@ -235,7 +233,6 @@ impl ResponseSurfaceLedger {
             provider_thread_id: input.provider_thread_id,
             status: ResponseSurfaceStatus::Open,
             created_at: now,
-            expires_at: input.expires_at,
         };
 
         self.state.surfaces.push(record.clone());
@@ -246,10 +243,9 @@ impl ResponseSurfaceLedger {
     pub fn lookup_surface_at(
         &mut self,
         query: ResponseSurfaceLookupQuery,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> anyhow::Result<ResponseSurfaceLookupResult> {
         query.validate()?;
-        self.expire_due_surfaces_at(now)?;
 
         let Some(record) = self
             .state
@@ -262,13 +258,10 @@ impl ResponseSurfaceLedger {
         };
 
         Ok(match record.status {
-            ResponseSurfaceStatus::Open => {
+            ResponseSurfaceStatus::Open | ResponseSurfaceStatus::Expired => {
                 ResponseSurfaceLookupResult::Hit(ResponseSurfaceLookupRecord::from_surface(record))
             }
             ResponseSurfaceStatus::Closed => ResponseSurfaceLookupResult::Closed {
-                surface_id: record.surface_id.clone(),
-            },
-            ResponseSurfaceStatus::Expired => ResponseSurfaceLookupResult::Expired {
                 surface_id: record.surface_id.clone(),
             },
         })
@@ -294,33 +287,12 @@ impl ResponseSurfaceLedger {
         Ok(changed)
     }
 
-    pub fn expire_due_surfaces_at(&mut self, now: DateTime<Utc>) -> anyhow::Result<usize> {
-        let mut expired = 0;
-        for record in &mut self.state.surfaces {
-            if record.status == ResponseSurfaceStatus::Open && record.expires_at <= now {
-                record.status = ResponseSurfaceStatus::Expired;
-                expired += 1;
-            }
-        }
-        let pruned = self.prune_expired_inbound_events(now);
-        if expired > 0 || pruned > 0 {
-            self.save()?;
-        }
-        Ok(expired)
-    }
-
     pub fn claim_inbound_event_at(
         &mut self,
         input: InboundEventDedupInput,
         now: DateTime<Utc>,
-        claim_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<InboundEventClaimDecision> {
         input.validate()?;
-        ensure!(
-            claim_expires_at > now,
-            "inbound event claim expires_at must be after received_at"
-        );
-        let pruned = self.prune_expired_inbound_events(now);
 
         let provider_event_id_hash = provider_event_id_hash(
             &input.provider_type,
@@ -349,13 +321,11 @@ impl ResponseSurfaceLedger {
                 }
             };
 
-            if pruned > 0 {
-                self.save()?;
-            }
-
             return Ok(decision);
         }
 
+        // A claim means the local machine has accepted the event and is still
+        // processing it. It is not an agent execution timeout.
         self.state.inbound_events.push(InboundEventDedupRecord {
             provider_id: input.provider_id,
             provider_type: input.provider_type,
@@ -363,7 +333,6 @@ impl ResponseSurfaceLedger {
             surface_id: input.surface_id,
             status: InboundEventDedupStatus::Processing,
             received_at: now,
-            expires_at: claim_expires_at,
         });
         self.save()?;
 
@@ -376,14 +345,8 @@ impl ResponseSurfaceLedger {
         &mut self,
         input: InboundEventDedupInput,
         now: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
     ) -> anyhow::Result<ProcessedInboundEventDecision> {
         input.validate()?;
-        ensure!(
-            expires_at > now,
-            "processed inbound event expires_at must be after received_at"
-        );
-        let pruned = self.prune_expired_inbound_events(now);
 
         let provider_event_id_hash = provider_event_id_hash(
             &input.provider_type,
@@ -408,15 +371,10 @@ impl ResponseSurfaceLedger {
                     surface_id: existing.surface_id.clone(),
                 };
 
-                if pruned > 0 {
-                    self.save()?;
-                }
-
                 return Ok(decision);
             }
 
             existing.status = InboundEventDedupStatus::Processed;
-            existing.expires_at = expires_at;
             self.save()?;
 
             return Ok(ProcessedInboundEventDecision::Recorded {
@@ -424,6 +382,8 @@ impl ResponseSurfaceLedger {
             });
         }
 
+        // Processed events are retained indefinitely so the same provider event
+        // cannot execute again after a local timeout window.
         self.state.inbound_events.push(InboundEventDedupRecord {
             provider_id: input.provider_id,
             provider_type: input.provider_type,
@@ -431,7 +391,6 @@ impl ResponseSurfaceLedger {
             surface_id: input.surface_id,
             status: InboundEventDedupStatus::Processed,
             received_at: now,
-            expires_at,
         });
         self.save()?;
 
@@ -467,14 +426,6 @@ impl ResponseSurfaceLedger {
         Ok(true)
     }
 
-    fn prune_expired_inbound_events(&mut self, now: DateTime<Utc>) -> usize {
-        let before = self.state.inbound_events.len();
-        self.state
-            .inbound_events
-            .retain(|record| record.expires_at > now);
-        before - self.state.inbound_events.len()
-    }
-
     fn save(&self) -> anyhow::Result<()> {
         let Some(state_path) = &self.state_path else {
             return Ok(());
@@ -484,7 +435,7 @@ impl ResponseSurfaceLedger {
 }
 
 impl NewResponseSurface {
-    fn validate(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
+    fn validate(&self) -> anyhow::Result<()> {
         ensure_present("signal_id", &self.signal_id)?;
         ensure_present("delivery_id", &self.delivery_id)?;
         ensure_present("source_id", &self.source_id)?;
@@ -496,10 +447,6 @@ impl NewResponseSurface {
         ensure_present("provider_conversation_id", &self.provider_conversation_id)?;
         ensure_present("provider_message_id", &self.provider_message_id)?;
         ensure_present("provider_thread_id", &self.provider_thread_id)?;
-        ensure!(
-            self.expires_at > now,
-            "response surface expires_at must be after created_at"
-        );
         Ok(())
     }
 }
@@ -543,7 +490,6 @@ impl ResponseSurfaceLookupRecord {
             provider_message_id: record.provider_message_id.clone(),
             provider_thread_id: record.provider_thread_id.clone(),
             status: record.status,
-            expires_at: record.expires_at,
         }
     }
 }
@@ -558,11 +504,11 @@ fn surface_matches_query(
         && record.provider_thread_id == query.provider_thread_id
 }
 
-fn open_surface_has_same_provider_thread(
+fn active_surface_has_same_provider_thread(
     record: &ResponseSurfaceRecord,
     input: &NewResponseSurface,
 ) -> bool {
-    record.status == ResponseSurfaceStatus::Open
+    record.status != ResponseSurfaceStatus::Closed
         && record.provider_id == input.provider_id
         && record.provider_account_id == input.provider_account_id
         && record.provider_conversation_id == input.provider_conversation_id
@@ -714,7 +660,6 @@ mod tests {
                 provider_message_id: "1716200000.000100".to_string(),
                 provider_thread_id: "1716200000.000100".to_string(),
                 status: ResponseSurfaceStatus::Open,
-                expires_at: now + Duration::hours(24),
             })
         );
     }
@@ -801,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_surface_does_not_return_hit() {
+    fn old_surface_still_returns_hit_long_after_creation() {
         let mut ledger = ResponseSurfaceLedger::in_memory();
         let now = test_time();
         let surface = ledger
@@ -809,15 +754,34 @@ mod tests {
             .expect("surface should be created");
 
         let lookup = ledger
-            .lookup_surface_at(test_lookup_query(), now + Duration::hours(25))
+            .lookup_surface_at(test_lookup_query(), now + Duration::weeks(8))
             .expect("lookup should succeed");
 
-        assert_eq!(
+        assert!(matches!(
             lookup,
-            ResponseSurfaceLookupResult::Expired {
-                surface_id: surface.surface_id
-            }
-        );
+            ResponseSurfaceLookupResult::Hit(record) if record.surface_id == surface.surface_id
+        ));
+    }
+
+    #[test]
+    fn legacy_expired_surface_status_still_returns_hit() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        let surface = ledger
+            .create_surface_at(test_surface(now), now)
+            .expect("surface should be created");
+        ledger.state.surfaces[0].status = ResponseSurfaceStatus::Expired;
+
+        let lookup = ledger
+            .lookup_surface_at(test_lookup_query(), now + Duration::weeks(8))
+            .expect("legacy expired lookup should succeed");
+
+        assert!(matches!(
+            lookup,
+            ResponseSurfaceLookupResult::Hit(record)
+                if record.surface_id == surface.surface_id
+                    && record.status == ResponseSurfaceStatus::Expired
+        ));
     }
 
     #[test]
@@ -846,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_recovers_unexpired_surface() {
+    fn restart_recovers_surface_without_time_window() {
         let dir = tempdir().expect("temp dir should be created");
         let path = dir.path().join("response-surface-ledger.json");
         let now = test_time();
@@ -860,7 +824,7 @@ mod tests {
 
         let mut reloaded = ResponseSurfaceLedger::load(path).expect("ledger should reload");
         let lookup = reloaded
-            .lookup_surface_at(test_lookup_query(), now + Duration::minutes(1))
+            .lookup_surface_at(test_lookup_query(), now + Duration::weeks(8))
             .expect("lookup should succeed after reload");
 
         assert!(matches!(
@@ -876,14 +840,10 @@ mod tests {
         let input = test_inbound_event(now);
 
         let claim = ledger
-            .claim_inbound_event_at(input.clone(), now, now + Duration::minutes(5))
+            .claim_inbound_event_at(input.clone(), now)
             .expect("first event should be claimed");
         let retry_while_processing = ledger
-            .claim_inbound_event_at(
-                input.clone(),
-                now + Duration::seconds(1),
-                now + Duration::minutes(5),
-            )
+            .claim_inbound_event_at(input.clone(), now + Duration::seconds(1))
             .expect("in-flight event should be recognized");
 
         let InboundEventClaimDecision::Claimed {
@@ -906,11 +866,7 @@ mod tests {
         );
 
         let retry_after_release = ledger
-            .claim_inbound_event_at(
-                input.clone(),
-                now + Duration::seconds(2),
-                now + Duration::minutes(5),
-            )
+            .claim_inbound_event_at(input.clone(), now + Duration::seconds(2))
             .expect("released claim should be claimable again");
         assert_eq!(
             retry_after_release,
@@ -920,11 +876,7 @@ mod tests {
         );
 
         let processed = ledger
-            .record_processed_inbound_event_at(
-                input.clone(),
-                now + Duration::seconds(3),
-                now + Duration::hours(24),
-            )
+            .record_processed_inbound_event_at(input.clone(), now + Duration::seconds(3))
             .expect("processed event should record");
         assert_eq!(
             processed,
@@ -934,11 +886,7 @@ mod tests {
         );
 
         let duplicate_after_processing = ledger
-            .claim_inbound_event_at(
-                input,
-                now + Duration::seconds(4),
-                now + Duration::minutes(5),
-            )
+            .claim_inbound_event_at(input, now + Duration::weeks(8))
             .expect("processed event should be duplicate");
         assert_eq!(
             duplicate_after_processing,
@@ -950,24 +898,23 @@ mod tests {
     }
 
     #[test]
-    fn inbound_event_processing_claim_expires_without_becoming_duplicate() {
+    fn inbound_event_processing_claim_does_not_expire_automatically() {
         let mut ledger = ResponseSurfaceLedger::in_memory();
         let now = test_time();
         let input = test_inbound_event(now);
 
         let first = ledger
-            .claim_inbound_event_at(input.clone(), now, now + Duration::minutes(1))
+            .claim_inbound_event_at(input.clone(), now)
             .expect("event should be claimed");
         let second = ledger
-            .claim_inbound_event_at(
-                input,
-                now + Duration::minutes(2),
-                now + Duration::minutes(3),
-            )
-            .expect("expired claim should not be a permanent duplicate");
+            .claim_inbound_event_at(input, now + Duration::weeks(8))
+            .expect("processing claim should remain active until release or processed");
 
         assert!(matches!(first, InboundEventClaimDecision::Claimed { .. }));
-        assert!(matches!(second, InboundEventClaimDecision::Claimed { .. }));
+        assert!(matches!(
+            second,
+            InboundEventClaimDecision::AlreadyProcessing { .. }
+        ));
         assert_eq!(ledger.state.inbound_events.len(), 1);
     }
 
@@ -979,18 +926,10 @@ mod tests {
         other_account_event.provider_account_id = "T999".to_string();
 
         let first = ledger
-            .record_processed_inbound_event_at(
-                test_inbound_event(now),
-                now,
-                now + Duration::hours(24),
-            )
+            .record_processed_inbound_event_at(test_inbound_event(now), now)
             .expect("first account event should record");
         let second = ledger
-            .record_processed_inbound_event_at(
-                other_account_event,
-                now + Duration::seconds(1),
-                now + Duration::hours(24),
-            )
+            .record_processed_inbound_event_at(other_account_event, now + Duration::seconds(1))
             .expect("other account event should record");
 
         assert!(matches!(
@@ -1016,11 +955,7 @@ mod tests {
             .create_surface_at(test_surface(now), now)
             .expect("surface should be created");
         ledger
-            .record_processed_inbound_event_at(
-                test_inbound_event(now),
-                now,
-                now + Duration::hours(24),
-            )
+            .record_processed_inbound_event_at(test_inbound_event(now), now)
             .expect("event should record");
 
         let raw = serde_json::to_string_pretty(&ledger.state).expect("state should serialize");
@@ -1031,6 +966,7 @@ mod tests {
             "prompt",
             "answer",
             "reply_text",
+            "expires_at",
             "raw_inbound_payload",
             "provider_message_body",
             "rendered_payload",
@@ -1047,7 +983,7 @@ mod tests {
         }
     }
 
-    fn test_surface(now: DateTime<Utc>) -> NewResponseSurface {
+    fn test_surface(_now: DateTime<Utc>) -> NewResponseSurface {
         NewResponseSurface {
             signal_id: "signal-1".to_string(),
             delivery_id: "delivery-1".to_string(),
@@ -1062,7 +998,6 @@ mod tests {
             provider_conversation_id: "C123".to_string(),
             provider_message_id: "1716200000.000100".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
-            expires_at: now + Duration::hours(24),
         }
     }
 

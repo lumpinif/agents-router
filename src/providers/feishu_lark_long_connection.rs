@@ -81,7 +81,6 @@ impl FeishuLarkLongConnectionConfig {
 pub(crate) struct FeishuLarkLongConnectionEvent<'a> {
     pub raw_event: &'a [u8],
     pub received_at: DateTime<Utc>,
-    pub claim_expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,9 +138,10 @@ impl FeishuLarkLongConnectionRuntime {
             provider_mode_capability(ProviderMode::FeishuLarkAppBot),
             reply,
             event.received_at,
-            event.claim_expires_at,
         )?;
 
+        // Platform ack only means the local machine has safely skipped or
+        // claimed the event. Agent execution can run longer and finishes later.
         Ok(match decision {
             ProviderInboundDecision::Ready(ready) => {
                 FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready)
@@ -204,10 +204,7 @@ mod tests {
         let mut ledger = ledger_with_lark_surface(now);
 
         let decision = runtime
-            .handle_event_before_platform_ack(
-                &mut ledger,
-                event_at(now + Duration::seconds(1), now + Duration::minutes(5)),
-            )
+            .handle_event_before_platform_ack(&mut ledger, event_at(now + Duration::seconds(1)))
             .expect("event handling should succeed");
 
         assert_eq!(decision.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
@@ -220,10 +217,7 @@ mod tests {
         assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
 
         let duplicate = runtime
-            .handle_event_before_platform_ack(
-                &mut ledger,
-                event_at(now + Duration::seconds(2), now + Duration::minutes(5)),
-            )
+            .handle_event_before_platform_ack(&mut ledger, event_at(now + Duration::seconds(2)))
             .expect("duplicate event handling should succeed");
         assert_eq!(duplicate.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
         assert!(matches!(
@@ -242,10 +236,7 @@ mod tests {
         let mut ledger = ResponseSurfaceLedger::in_memory();
 
         let decision = runtime
-            .handle_event_before_platform_ack(
-                &mut ledger,
-                event_at(now + Duration::seconds(1), now + Duration::minutes(5)),
-            )
+            .handle_event_before_platform_ack(&mut ledger, event_at(now + Duration::seconds(1)))
             .expect("lookup miss should not fail");
 
         assert_eq!(decision.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
@@ -258,10 +249,7 @@ mod tests {
             .create_surface_at(lark_surface(now), now + Duration::seconds(2))
             .expect("surface should be creatable after lookup miss");
         let later = runtime
-            .handle_event_before_platform_ack(
-                &mut ledger,
-                event_at(now + Duration::seconds(3), now + Duration::minutes(5)),
-            )
+            .handle_event_before_platform_ack(&mut ledger, event_at(now + Duration::seconds(3)))
             .expect("event should still be claimable after surface appears");
         assert!(matches!(
             later,
@@ -299,7 +287,6 @@ mod tests {
                         }
                     }"#,
                     received_at: now + Duration::seconds(1),
-                    claim_expires_at: now + Duration::minutes(5),
                 },
             )
             .expect("rootless mention should parse as skip");
@@ -334,7 +321,7 @@ mod tests {
         ledger
     }
 
-    fn lark_surface(now: DateTime<Utc>) -> NewResponseSurface {
+    fn lark_surface(_now: DateTime<Utc>) -> NewResponseSurface {
         NewResponseSurface {
             signal_id: "signal-1".to_string(),
             delivery_id: "delivery-1".to_string(),
@@ -349,20 +336,15 @@ mod tests {
             provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
             provider_message_id: "om_root_message_id".to_string(),
             provider_thread_id: "om_root_message_id".to_string(),
-            expires_at: now + Duration::hours(24),
         }
     }
 
-    fn event_at(
-        received_at: DateTime<Utc>,
-        claim_expires_at: DateTime<Utc>,
-    ) -> FeishuLarkLongConnectionEvent<'static> {
+    fn event_at(received_at: DateTime<Utc>) -> FeishuLarkLongConnectionEvent<'static> {
         FeishuLarkLongConnectionEvent {
             raw_event: include_bytes!(
                 "../../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"
             ),
             received_at,
-            claim_expires_at,
         }
     }
 

@@ -62,7 +62,6 @@ pub enum ProviderInboundSkipReason {
     EmptyReplyText,
     SurfaceLookupMiss,
     SurfaceClosed { surface_id: String },
-    SurfaceExpired { surface_id: String },
     DuplicateEvent { surface_id: String },
     EventAlreadyProcessing { surface_id: String },
 }
@@ -245,7 +244,6 @@ pub fn lookup_and_claim_provider_surface_reply(
     provider: &ProviderModeCapability,
     reply: NormalizedProviderSurfaceReply,
     now: DateTime<Utc>,
-    claim_expires_at: DateTime<Utc>,
 ) -> anyhow::Result<ProviderInboundDecision> {
     ensure!(
         provider.mode == reply.provider_mode,
@@ -288,11 +286,6 @@ pub fn lookup_and_claim_provider_surface_reply(
                 ProviderInboundSkipReason::SurfaceClosed { surface_id },
             ));
         }
-        ResponseSurfaceLookupResult::Expired { surface_id } => {
-            return Ok(ProviderInboundDecision::Skip(
-                ProviderInboundSkipReason::SurfaceExpired { surface_id },
-            ));
-        }
     };
 
     let claim = ledger.claim_inbound_event_at(
@@ -304,7 +297,6 @@ pub fn lookup_and_claim_provider_surface_reply(
             surface_id: surface.surface_id.clone(),
         },
         now,
-        claim_expires_at,
     )?;
 
     match claim {
@@ -665,7 +657,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply,
             now + Duration::seconds(1),
-            now + Duration::minutes(5),
         )
         .expect("lookup should succeed");
 
@@ -702,7 +693,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply.clone(),
             now,
-            now + Duration::minutes(5),
         )
         .expect("lookup should not fail");
 
@@ -724,7 +714,6 @@ mod tests {
                     surface_id: surface.surface_id,
                 },
                 now + Duration::seconds(2),
-                now + Duration::minutes(5),
             )
             .expect("event should not have been claimed on miss");
 
@@ -752,7 +741,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply.clone(),
             now + Duration::seconds(1),
-            now + Duration::minutes(5),
         )
         .expect("first lookup should succeed");
         let second = lookup_and_claim_provider_surface_reply(
@@ -760,7 +748,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply,
             now + Duration::seconds(2),
-            now + Duration::minutes(5),
         )
         .expect("duplicate lookup should succeed");
 
@@ -814,7 +801,6 @@ mod tests {
                         surface_id,
                     },
                     now + Duration::seconds(1),
-                    now + Duration::hours(24),
                 )
                 .expect("processed event should record"),
             ProcessedInboundEventDecision::Recorded { .. }
@@ -825,7 +811,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply,
             now + Duration::seconds(2),
-            now + Duration::minutes(5),
         )
         .expect("duplicate lookup should succeed");
 
@@ -857,7 +842,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackIncomingWebhook),
             reply,
             now,
-            now + Duration::minutes(5),
         )
         .expect("unsupported provider should skip");
 
@@ -902,7 +886,6 @@ mod tests {
             provider_mode_capability(ProviderMode::SlackApp),
             reply,
             now + Duration::seconds(1),
-            now + Duration::minutes(5),
         )
         .expect("closed surface should skip");
 
@@ -922,7 +905,7 @@ mod tests {
         ledger
     }
 
-    fn slack_surface(now: DateTime<Utc>) -> NewResponseSurface {
+    fn slack_surface(_now: DateTime<Utc>) -> NewResponseSurface {
         NewResponseSurface {
             signal_id: "signal-1".to_string(),
             delivery_id: "delivery-1".to_string(),
@@ -937,7 +920,6 @@ mod tests {
             provider_conversation_id: "C123ABC456".to_string(),
             provider_message_id: "1716200000.000100".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
-            expires_at: now + Duration::hours(24),
         }
     }
 

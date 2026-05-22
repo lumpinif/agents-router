@@ -18,7 +18,6 @@ pub struct ResponseSurfaceDeliveryFacts {
     pub delivery_id: String,
     pub provider_id: String,
     pub receipt: ResponseSurfaceDeliveryReceipt,
-    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +116,6 @@ fn create_response_surface_after_delivery_inner(
                 .receipt
                 .provider_thread_id
                 .expect("policy allow requires provider_thread_id receipt"),
-            expires_at: delivery.expires_at,
         },
         now,
     )?;
@@ -264,7 +262,6 @@ mod tests {
             delivery_id: "delivery-1".to_string(),
             provider_id: "slack".to_string(),
             receipt,
-            expires_at: test_time() + Duration::hours(24),
         }
     }
 
