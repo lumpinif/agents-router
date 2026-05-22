@@ -61,7 +61,22 @@ pub struct AgentControllerRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentControllerSuccess {
-    pub message: Option<String>,
+    result_text: String,
+}
+
+impl AgentControllerSuccess {
+    pub fn from_result_text(result_text: impl Into<String>) -> Option<Self> {
+        let result_text = result_text.into();
+        if result_text.trim().is_empty() {
+            return None;
+        }
+
+        Some(Self { result_text })
+    }
+
+    pub fn result_text(&self) -> &str {
+        &self.result_text
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,14 +269,10 @@ impl<'a> AgentControllerRuntime<'a> {
         release_inbound_claim(ledger, &ready)?;
 
         match result {
-            Ok(result) => Ok(AgentControllerRuntimeDecision::Executed(
-                AgentControllerRuntimeExecution {
-                    controller_kind: request.controller_kind,
-                    surface_id: ready.surface.surface_id,
-                    source_session_id: request.source_session_id,
-                    result,
-                },
-            )),
+            Ok(result) => match controller_execution_from_success(&request, &ready, result) {
+                Ok(execution) => Ok(AgentControllerRuntimeDecision::Executed(execution)),
+                Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
+            },
             Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
         }
     }
@@ -335,7 +346,7 @@ impl<'a> AgentControllerRuntime<'a> {
             PreparedInboundContinuation::Ready { request, adapter } => (request, adapter),
             PreparedInboundContinuation::Failed(error) => {
                 let outcome = AgentControllerClosedLoopOutcome::ControllerFailed(error);
-                return send_ack_and_record_processed(
+                return send_result_reply_and_record_processed(
                     ledger,
                     &ready,
                     provider_reply,
@@ -352,18 +363,14 @@ impl<'a> AgentControllerRuntime<'a> {
         };
 
         let outcome = match adapter.continue_session(request.clone()).await {
-            Ok(result) => AgentControllerClosedLoopOutcome::ControllerSucceeded(
-                AgentControllerRuntimeExecution {
-                    controller_kind: request.controller_kind,
-                    surface_id: ready.surface.surface_id.clone(),
-                    source_session_id: request.source_session_id.clone(),
-                    result,
-                },
-            ),
+            Ok(result) => match controller_execution_from_success(&request, &ready, result) {
+                Ok(execution) => AgentControllerClosedLoopOutcome::ControllerSucceeded(execution),
+                Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
+            },
             Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
         };
 
-        send_ack_and_record_processed(
+        send_result_reply_and_record_processed(
             ledger,
             &ready,
             provider_reply,
@@ -485,7 +492,28 @@ impl ProviderThreadReplyError {
     }
 }
 
-async fn send_ack_and_record_processed(
+fn controller_execution_from_success(
+    request: &AgentControllerRequest,
+    ready: &ProviderInboundReady,
+    result: AgentControllerSuccess,
+) -> Result<AgentControllerRuntimeExecution, AgentControllerError> {
+    if result.result_text().trim().is_empty() {
+        return Err(AgentControllerError::from_request(
+            request,
+            AgentControllerErrorKind::Internal,
+            "agent controller completed without result text",
+        ));
+    }
+
+    Ok(AgentControllerRuntimeExecution {
+        controller_kind: request.controller_kind,
+        surface_id: ready.surface.surface_id.clone(),
+        source_session_id: request.source_session_id.clone(),
+        result,
+    })
+}
+
+async fn send_result_reply_and_record_processed(
     ledger: &mut ResponseSurfaceLedger,
     ready: &ProviderInboundReady,
     provider_reply: &dyn ProviderThreadReplyAdapter,
@@ -509,7 +537,7 @@ async fn send_ack_and_record_processed(
         );
     }
 
-    let request = provider_thread_reply_request(ready, acknowledgement_text(&outcome));
+    let request = provider_thread_reply_request(ready, provider_thread_result_text(&outcome));
     let provider_reply_result = provider_reply.send_thread_reply(request).await;
     let provider_reply_success = match provider_reply_result {
         Ok(success) => success,
@@ -551,18 +579,18 @@ fn provider_thread_reply_request(
     }
 }
 
-fn acknowledgement_text(outcome: &AgentControllerClosedLoopOutcome) -> &'static str {
+fn provider_thread_result_text(outcome: &AgentControllerClosedLoopOutcome) -> &str {
     match outcome {
-        AgentControllerClosedLoopOutcome::ControllerSucceeded(_) => {
-            "Forwarded to the original agent session."
+        AgentControllerClosedLoopOutcome::ControllerSucceeded(execution) => {
+            execution.result.result_text()
         }
         AgentControllerClosedLoopOutcome::ControllerFailed(error) => {
-            controller_failure_acknowledgement_text(error.kind)
+            controller_failure_notice_text(error.kind)
         }
     }
 }
 
-fn controller_failure_acknowledgement_text(kind: AgentControllerErrorKind) -> &'static str {
+fn controller_failure_notice_text(kind: AgentControllerErrorKind) -> &'static str {
     match kind {
         AgentControllerErrorKind::ControllerUnavailable => {
             "Replies are not available for this agent session right now."
@@ -918,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_loop_sends_ack_not_controller_message_before_processed() {
+    async fn closed_loop_sends_agent_result_text_before_processed() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::with_success_message("agent final result");
         let provider_reply = RecordingProviderThreadReplyAdapter::default();
@@ -947,19 +975,15 @@ mod tests {
         ));
         let provider_requests = provider_reply.requests();
         assert_eq!(provider_requests.len(), 1);
-        assert_eq!(
-            provider_requests[0].text,
-            "Forwarded to the original agent session."
-        );
-        assert_ne!(provider_requests[0].text, "agent final result");
+        assert_eq!(provider_requests[0].text, "agent final result");
         assert_event_is_duplicate_processed(&mut ledger, ready);
     }
 
     #[tokio::test]
-    async fn closed_loop_provider_ack_failure_does_not_mark_processed_or_release_claim() {
+    async fn closed_loop_provider_result_reply_failure_does_not_mark_processed_or_release_claim() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::default();
-        let provider_reply = RecordingProviderThreadReplyAdapter::with_error("ack failed");
+        let provider_reply = RecordingProviderThreadReplyAdapter::with_error("result reply failed");
         let runtime = AgentControllerRuntime::new(vec![&adapter]);
 
         let decision = runtime
@@ -991,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_loop_controller_error_can_complete_after_failure_ack() {
+    async fn closed_loop_controller_error_can_complete_after_failure_notice() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::with_error(AgentControllerErrorKind::SessionNotFound);
         let provider_reply = RecordingProviderThreadReplyAdapter::default();
@@ -1026,6 +1050,46 @@ mod tests {
         assert_eq!(
             provider_requests[0].text,
             "The original agent session was not found."
+        );
+        assert_event_is_duplicate_processed(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn closed_loop_controller_success_without_result_text_is_treated_as_failure() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = EmptyResultAdapter::default();
+        let provider_reply = RecordingProviderThreadReplyAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                test_time() + Duration::hours(1),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
+                    kind: AgentControllerErrorKind::Internal,
+                    ..
+                }),
+                ..
+            })
+        ));
+        let provider_requests = provider_reply.requests();
+        assert_eq!(provider_requests.len(), 1);
+        assert_eq!(
+            provider_requests[0].text,
+            "Could not forward this reply to the original agent session."
         );
         assert_event_is_duplicate_processed(&mut ledger, ready);
     }
@@ -1100,12 +1164,37 @@ mod tests {
                         "fake controller error",
                     ));
                 }
+                let result_text = self
+                    .success_message
+                    .clone()
+                    .unwrap_or_else(|| "accepted".to_string());
+                Ok(AgentControllerSuccess::from_result_text(result_text)
+                    .expect("test controller success should include result text"))
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct EmptyResultAdapter {
+        requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
+    }
+
+    impl AgentControllerAdapter for EmptyResultAdapter {
+        fn controller_kind(&self) -> AgentControllerKind {
+            AgentControllerKind::CodexAppServer
+        }
+
+        fn continue_session<'a>(
+            &'a self,
+            request: AgentControllerRequest,
+        ) -> AgentControllerFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("requests mutex should not be poisoned")
+                    .push(request);
                 Ok(AgentControllerSuccess {
-                    message: Some(
-                        self.success_message
-                            .clone()
-                            .unwrap_or_else(|| "accepted".to_string()),
-                    ),
+                    result_text: String::new(),
                 })
             })
         }
@@ -1161,7 +1250,7 @@ mod tests {
                     });
                 }
                 Ok(ProviderThreadReplySuccess {
-                    provider_reply_message_id: Some("ack-message-1".to_string()),
+                    provider_reply_message_id: Some("result-reply-message-1".to_string()),
                 })
             })
         }

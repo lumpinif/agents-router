@@ -6,6 +6,7 @@ use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::agent_controller::{ProviderThreadReplyAdapter, ProviderThreadReplyRequest};
 use crate::config::{FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, UrlSource};
 use crate::delivery::{DeliveryErrorKind, ProviderDeliveryReceiptStatus, ProviderSendStatus};
 use crate::provider_inbound::{
@@ -249,6 +250,167 @@ async fn app_bot_outbound_message_id_matches_inbound_reply_root_lookup_key() {
             .provider_account_id
             .expect("surface-ready receipt has provider_account_id")
     );
+}
+
+#[tokio::test]
+async fn app_bot_sends_agent_result_text_to_same_root_thread() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "text",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_result_reply_message_id",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "text"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send_thread_reply(thread_reply_request("agent final result\nwith exact text"))
+        .await
+        .expect("thread reply should succeed");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_result_reply_message_id")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let reply_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply")
+        .expect("reply request should be recorded");
+    let body: serde_json::Value = reply_request
+        .body_json()
+        .expect("reply body should be JSON");
+    assert_eq!(body["reply_in_thread"], true);
+    assert_eq!(body["msg_type"], "text");
+    assert_eq!(
+        body["uuid"].as_str().expect("uuid should be present").len(),
+        50
+    );
+    let content: serde_json::Value = serde_json::from_str(
+        body["content"]
+            .as_str()
+            .expect("reply content should be a JSON string"),
+    )
+    .expect("reply content should be JSON text message content");
+    assert_eq!(content["text"], "agent final result\nwith exact text");
+    assert!(
+        !content["text"]
+            .as_str()
+            .expect("text should be present")
+            .contains("agents-router")
+    );
+}
+
+#[tokio::test]
+async fn app_bot_thread_reply_root_mismatch_fails_without_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_result_reply_message_id",
+                "root_id": "om_other_root_message_id"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("root mismatch should fail");
+
+    assert!(
+        err.message
+            .contains("root_id did not match the response surface thread")
+    );
+}
+
+#[tokio::test]
+async fn custom_bot_thread_reply_is_not_supported() {
+    let provider = test_provider(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test".to_string(),
+        None,
+    );
+
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("custom bot should not support thread replies");
+
+    assert!(
+        err.message
+            .contains("custom bot mode does not support thread replies")
+    );
+}
+
+#[tokio::test]
+async fn app_bot_thread_reply_token_error_does_not_expose_token_or_app_secret() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 99991663,
+            "msg": "invalid app credentials",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("token provider error should fail");
+
+    assert!(err.message.contains("99991663"));
+    assert!(!err.message.contains("test-app-secret"));
+    assert!(!err.message.contains("test-tenant-token"));
 }
 
 #[tokio::test]
@@ -854,6 +1016,20 @@ fn test_app_bot_provider(api_base_url: String) -> FeishuLarkProvider {
             computer_name: "Test Mac".to_string(),
         }),
         client: reqwest::Client::new(),
+    }
+}
+
+fn thread_reply_request(text: &str) -> ProviderThreadReplyRequest {
+    ProviderThreadReplyRequest {
+        provider_id: "work_chat".to_string(),
+        provider_type: "feishu_lark".to_string(),
+        provider_account_id: "2ca1d211f64f6438".to_string(),
+        provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+        provider_thread_id: "om_root_message_id".to_string(),
+        surface_id: "surface-1".to_string(),
+        provider_event_id_hash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            .to_string(),
+        text: text.to_string(),
     }
 }
 

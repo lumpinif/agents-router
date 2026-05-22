@@ -6,6 +6,10 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::agent_controller::{
+    ProviderThreadReplyAdapter, ProviderThreadReplyError, ProviderThreadReplyFuture,
+    ProviderThreadReplyRequest, ProviderThreadReplySuccess,
+};
 use crate::config::{
     FeishuLarkAppBotProviderConfig, FeishuLarkAppDomain, FeishuLarkCustomBotProviderConfig,
     ProviderConfig, ProviderConfigDetail, ProviderType,
@@ -99,6 +103,33 @@ impl Provider for FeishuLarkProvider {
                 }
                 FeishuLarkProviderRuntime::AppBot(runtime) => {
                     self.send_app_bot(signal, runtime).await
+                }
+            }
+        })
+    }
+}
+
+impl ProviderThreadReplyAdapter for FeishuLarkProvider {
+    fn provider_id(&self) -> &str {
+        &self.id
+    }
+
+    fn provider_type(&self) -> &str {
+        ProviderType::FeishuLark.as_str()
+    }
+
+    fn send_thread_reply<'a>(
+        &'a self,
+        request: ProviderThreadReplyRequest,
+    ) -> ProviderThreadReplyFuture<'a> {
+        Box::pin(async move {
+            match &self.runtime {
+                FeishuLarkProviderRuntime::CustomBot(_) => Err(thread_reply_error(
+                    &request,
+                    "Feishu/Lark custom bot mode does not support thread replies",
+                )),
+                FeishuLarkProviderRuntime::AppBot(runtime) => {
+                    self.send_app_bot_thread_reply(request, runtime).await
                 }
             }
         })
@@ -445,6 +476,193 @@ impl FeishuLarkProvider {
 
         Ok(token)
     }
+
+    async fn send_app_bot_thread_reply(
+        &self,
+        request: ProviderThreadReplyRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<ProviderThreadReplySuccess, ProviderThreadReplyError> {
+        validate_app_bot_thread_reply_request(&request, &self.id, runtime)?;
+
+        let token = self
+            .fetch_tenant_access_token_for_thread_reply(&request, runtime)
+            .await?;
+        let content = serde_json::to_string(&FeishuLarkTextMessageContent {
+            text: request.text.as_str(),
+        })
+        .map_err(|error| {
+            thread_reply_error(&request, format!("failed to serialize text reply: {error}"))
+        })?;
+        let body = FeishuLarkAppBotReplyMessageRequest {
+            content,
+            msg_type: "text",
+            reply_in_thread: true,
+            uuid: thread_reply_uuid(&request.provider_event_id_hash),
+        };
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{}/reply",
+                runtime.api_base_url, request.provider_thread_id
+            ))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                thread_reply_error(
+                    &request,
+                    format!(
+                        "failed to send Feishu/Lark App Bot thread reply: {}",
+                        error.without_url()
+                    ),
+                )
+            })?;
+
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            thread_reply_error(
+                &request,
+                format!(
+                    "failed to read Feishu/Lark App Bot thread reply response: {}",
+                    error.without_url()
+                ),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark App Bot thread reply returned HTTP status {}",
+                    status
+                ),
+            ));
+        }
+
+        let provider_response: FeishuLarkAppBotReplyMessageResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                thread_reply_error(
+                    &request,
+                    format!("Feishu/Lark App Bot thread reply returned invalid JSON: {error}"),
+                )
+            })?;
+        if provider_response.code != 0 {
+            return Err(thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark App Bot thread reply returned code {}: {}",
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+        }
+
+        let data = provider_response.data.ok_or_else(|| {
+            thread_reply_error(
+                &request,
+                "Feishu/Lark App Bot thread reply did not include message data",
+            )
+        })?;
+        let provider_reply_message_id =
+            required_thread_reply_response_field(&request, "message_id", data.message_id)?;
+        let root_id = required_thread_reply_response_field(&request, "root_id", data.root_id)?;
+        if root_id != request.provider_thread_id {
+            return Err(thread_reply_error(
+                &request,
+                "Feishu/Lark App Bot thread reply root_id did not match the response surface thread",
+            ));
+        }
+
+        Ok(ProviderThreadReplySuccess {
+            provider_reply_message_id: Some(provider_reply_message_id),
+        })
+    }
+
+    async fn fetch_tenant_access_token_for_thread_reply(
+        &self,
+        request: &ProviderThreadReplyRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<String, ProviderThreadReplyError> {
+        let token_request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&token_request)
+            .send()
+            .await
+            .map_err(|error| {
+                thread_reply_error(
+                    request,
+                    format!(
+                        "failed to fetch tenant access token: {}",
+                        error.without_url()
+                    ),
+                )
+            })?;
+
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            thread_reply_error(
+                request,
+                format!(
+                    "failed to read tenant access token response: {}",
+                    error.without_url()
+                ),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(thread_reply_error(
+                request,
+                format!(
+                    "tenant access token request returned HTTP status {}",
+                    status
+                ),
+            ));
+        }
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                thread_reply_error(
+                    request,
+                    format!("tenant access token response was invalid JSON: {error}"),
+                )
+            })?;
+        if provider_response.code != 0 {
+            return Err(thread_reply_error(
+                request,
+                format!(
+                    "tenant access token request returned code {}: {}",
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+        }
+        let Some(token) = present_owned(provider_response.tenant_access_token) else {
+            return Err(thread_reply_error(
+                request,
+                "tenant access token response did not include a token",
+            ));
+        };
+        if provider_response.expire.unwrap_or_default() <= 0 {
+            return Err(thread_reply_error(
+                request,
+                "tenant access token response had an invalid expiry",
+            ));
+        }
+
+        Ok(token)
+    }
 }
 
 fn runtime_custom_bot(
@@ -642,6 +860,19 @@ struct FeishuLarkAppBotSendMessageRequest<'a> {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct FeishuLarkAppBotReplyMessageRequest {
+    content: String,
+    msg_type: &'static str,
+    reply_in_thread: bool,
+    uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkTextMessageContent<'a> {
+    text: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 struct FeishuLarkAppBotSendMessageResponse {
     code: i64,
@@ -650,10 +881,23 @@ struct FeishuLarkAppBotSendMessageResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct FeishuLarkAppBotReplyMessageResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuLarkAppBotReplyMessageData>,
+}
+
+#[derive(Debug, Deserialize)]
 struct FeishuLarkAppBotMessageData {
     message_id: Option<String>,
     chat_id: Option<String>,
     sender: Option<FeishuLarkAppBotMessageSender>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkAppBotReplyMessageData {
+    message_id: Option<String>,
+    root_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +998,89 @@ fn app_bot_response_error(
             message.into()
         ),
     )
+}
+
+fn validate_app_bot_thread_reply_request(
+    request: &ProviderThreadReplyRequest,
+    provider_id: &str,
+    runtime: &FeishuLarkAppBotRuntime,
+) -> Result<(), ProviderThreadReplyError> {
+    if request.provider_id != provider_id {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request provider_id did not match adapter",
+        ));
+    }
+    if request.provider_type != ProviderType::FeishuLark.as_str() {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request provider_type did not match adapter",
+        ));
+    }
+    if request.provider_account_id != runtime.tenant_key {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request tenant did not match App Bot config",
+        ));
+    }
+    if request.provider_conversation_id != runtime.chat_id {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request chat did not match App Bot config",
+        ));
+    }
+    if present(Some(request.provider_thread_id.as_str())).is_none() {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request did not include provider_thread_id",
+        ));
+    }
+    if present(Some(request.text.as_str())).is_none() {
+        return Err(thread_reply_error(
+            request,
+            "provider thread reply request did not include result text",
+        ));
+    }
+
+    Ok(())
+}
+
+fn required_thread_reply_response_field(
+    request: &ProviderThreadReplyRequest,
+    field: &'static str,
+    value: Option<String>,
+) -> Result<String, ProviderThreadReplyError> {
+    present_owned(value).ok_or_else(|| {
+        thread_reply_error(
+            request,
+            format!("Feishu/Lark App Bot thread reply response did not include {field}"),
+        )
+    })
+}
+
+fn thread_reply_error(
+    request: &ProviderThreadReplyRequest,
+    message: impl Into<String>,
+) -> ProviderThreadReplyError {
+    ProviderThreadReplyError {
+        provider_id: request.provider_id.clone(),
+        provider_type: request.provider_type.clone(),
+        surface_id: request.surface_id.clone(),
+        provider_event_id_hash: request.provider_event_id_hash.clone(),
+        message: message.into(),
+    }
+}
+
+fn thread_reply_uuid(provider_event_id_hash: &str) -> String {
+    let prefix = "ar_";
+    let max_hash_len = 50 - prefix.len();
+    let hash_prefix = provider_event_id_hash
+        .char_indices()
+        .nth(max_hash_len)
+        .map_or(provider_event_id_hash, |(index, _)| {
+            &provider_event_id_hash[..index]
+        });
+    format!("{prefix}{hash_prefix}")
 }
 
 fn app_bot_api_base_url(domain: FeishuLarkAppDomain) -> &'static str {
