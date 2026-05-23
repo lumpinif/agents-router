@@ -1199,20 +1199,13 @@ mod tests {
         assert_event_is_still_processing(&mut ledger, ready);
     }
 
-    #[tokio::test]
-    async fn codex_app_server_placeholder_returns_controller_unavailable() {
+    #[test]
+    fn codex_app_server_adapter_reports_controller_kind() {
         let adapter = codex_app_server::CodexAppServerController::new();
-        let request = controller_request();
-
-        let result = adapter.continue_session(request.clone()).await;
 
         assert_eq!(
-            result.expect_err("placeholder should not execute"),
-            AgentControllerError::failed_before_submit(
-                &request,
-                AgentControllerErrorKind::ControllerUnavailable,
-                "Codex App Server continuation is not available in this build",
-            )
+            adapter.controller_kind(),
+            AgentControllerKind::CodexAppServer
         );
     }
 
@@ -1531,19 +1524,6 @@ mod tests {
                 reply_text: "continue exactly".to_string(),
             },
             surface,
-            provider_event_id_hash: "event-hash".to_string(),
-        }
-    }
-
-    fn controller_request() -> AgentControllerRequest {
-        AgentControllerRequest {
-            controller_kind: AgentControllerKind::CodexAppServer,
-            surface_id: "surface-1".to_string(),
-            source_id: "codex_desktop".to_string(),
-            source_type: SourceType::CodexDesktop,
-            source_session_id: "session-1".to_string(),
-            source_turn_id: Some("turn-1".to_string()),
-            reply_text: "continue exactly".to_string(),
             provider_event_id_hash: "event-hash".to_string(),
         }
     }
