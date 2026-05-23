@@ -288,11 +288,14 @@ pub fn lookup_and_claim_provider_surface_reply(
         }
     };
 
+    // Dedup is based only on provider identity plus the provider's stable
+    // event id. Reply text is user content and must not decide duplicates.
     let claim = ledger.claim_inbound_event_at(
         InboundEventDedupInput {
             provider_id: reply.provider_id.clone(),
             provider_type: reply.provider_type.clone(),
             provider_account_id: reply.provider_account_id.clone(),
+            provider_conversation_id: reply.provider_conversation_id.clone(),
             provider_event_id: reply.provider_event_id.clone(),
             surface_id: surface.surface_id.clone(),
         },
@@ -710,6 +713,7 @@ mod tests {
                     provider_id: reply.provider_id,
                     provider_type: reply.provider_type,
                     provider_account_id: reply.provider_account_id,
+                    provider_conversation_id: reply.provider_conversation_id,
                     provider_event_id: reply.provider_event_id,
                     surface_id: surface.surface_id,
                 },
@@ -759,6 +763,44 @@ mod tests {
     }
 
     #[test]
+    fn different_provider_event_id_with_same_text_creates_separate_ready_work_items() {
+        let now = test_time();
+        let mut ledger = ledger_with_slack_surface(now);
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+        let mut second_reply = reply.clone();
+        second_reply.provider_event_id = "Ev456DIFFERENT".to_string();
+        second_reply.reply_text = reply.reply_text.clone();
+
+        let first = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            reply,
+            now + Duration::seconds(1),
+        )
+        .expect("first lookup should succeed");
+        let second = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            second_reply,
+            now + Duration::seconds(2),
+        )
+        .expect("second lookup should succeed");
+
+        assert!(matches!(first, ProviderInboundDecision::Ready(_)));
+        assert!(matches!(second, ProviderInboundDecision::Ready(_)));
+    }
+
+    #[test]
     fn processed_inbound_event_is_skipped_as_duplicate() {
         let now = test_time();
         let mut ledger = ledger_with_slack_surface(now);
@@ -797,6 +839,7 @@ mod tests {
                         provider_id: reply.provider_id.clone(),
                         provider_type: reply.provider_type.clone(),
                         provider_account_id: reply.provider_account_id.clone(),
+                        provider_conversation_id: reply.provider_conversation_id.clone(),
                         provider_event_id: reply.provider_event_id.clone(),
                         surface_id,
                     },

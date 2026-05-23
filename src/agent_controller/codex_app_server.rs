@@ -23,7 +23,7 @@ impl AgentControllerAdapter for CodexAppServerController {
         request: AgentControllerRequest,
     ) -> AgentControllerFuture<'a> {
         Box::pin(async move {
-            Err(AgentControllerError::from_request(
+            Err(AgentControllerError::failed_before_submit(
                 &request,
                 AgentControllerErrorKind::ControllerUnavailable,
                 "Codex App Server continuation is not available in this build",

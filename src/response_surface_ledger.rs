@@ -112,6 +112,7 @@ pub struct InboundEventDedupInput {
     pub provider_id: String,
     pub provider_type: String,
     pub provider_account_id: String,
+    pub provider_conversation_id: String,
     pub provider_event_id: String,
     pub surface_id: String,
 }
@@ -298,6 +299,7 @@ impl ResponseSurfaceLedger {
             &input.provider_type,
             &input.provider_id,
             &input.provider_account_id,
+            &input.provider_conversation_id,
             &input.provider_event_id,
         );
 
@@ -352,6 +354,7 @@ impl ResponseSurfaceLedger {
             &input.provider_type,
             &input.provider_id,
             &input.provider_account_id,
+            &input.provider_conversation_id,
             &input.provider_event_id,
         );
 
@@ -383,7 +386,7 @@ impl ResponseSurfaceLedger {
         }
 
         // Processed events are retained indefinitely so the same provider event
-        // cannot execute again after a local timeout window.
+        // cannot execute again after a later platform retry or local restart.
         self.state.inbound_events.push(InboundEventDedupRecord {
             provider_id: input.provider_id,
             provider_type: input.provider_type,
@@ -408,6 +411,7 @@ impl ResponseSurfaceLedger {
             &input.provider_type,
             &input.provider_id,
             &input.provider_account_id,
+            &input.provider_conversation_id,
             &input.provider_event_id,
         );
 
@@ -466,6 +470,7 @@ impl InboundEventDedupInput {
         ensure_present("provider_id", &self.provider_id)?;
         ensure_present("provider_type", &self.provider_type)?;
         ensure_present("provider_account_id", &self.provider_account_id)?;
+        ensure_present("provider_conversation_id", &self.provider_conversation_id)?;
         ensure_present("provider_event_id", &self.provider_event_id)?;
         ensure_present("surface_id", &self.surface_id)?;
         Ok(())
@@ -545,13 +550,18 @@ fn provider_event_id_hash(
     provider_type: &str,
     provider_id: &str,
     provider_account_id: &str,
+    provider_conversation_id: &str,
     provider_event_id: &str,
 ) -> String {
     let mut hasher = Sha256::new();
+    // The event id must come from the provider's stable event identity. The
+    // conversation scope prevents providers with per-conversation ids from
+    // deduping unrelated replies together.
     for value in [
         provider_type,
         provider_id,
         provider_account_id,
+        provider_conversation_id,
         provider_event_id,
     ] {
         hasher.update(value.as_bytes());
@@ -948,6 +958,36 @@ mod tests {
     }
 
     #[test]
+    fn inbound_event_dedup_hash_is_scoped_by_provider_conversation() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        let mut other_conversation_event = test_inbound_event(now);
+        other_conversation_event.provider_conversation_id = "C999".to_string();
+        other_conversation_event.surface_id = "surface-2".to_string();
+
+        let first = ledger
+            .claim_inbound_event_at(test_inbound_event(now), now)
+            .expect("first conversation event should claim");
+        let second = ledger
+            .claim_inbound_event_at(other_conversation_event, now + Duration::seconds(1))
+            .expect("other conversation event should claim separately");
+
+        let InboundEventClaimDecision::Claimed {
+            provider_event_id_hash: first_hash,
+        } = first
+        else {
+            panic!("first event should be claimed");
+        };
+        let InboundEventClaimDecision::Claimed {
+            provider_event_id_hash: second_hash,
+        } = second
+        else {
+            panic!("second conversation event should be claimed");
+        };
+        assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
     fn ledger_schema_does_not_store_content_or_product_support_facts() {
         let mut ledger = ResponseSurfaceLedger::in_memory();
         let now = test_time();
@@ -1015,6 +1055,7 @@ mod tests {
             provider_id: "slack-work".to_string(),
             provider_type: "slack".to_string(),
             provider_account_id: "T123".to_string(),
+            provider_conversation_id: "C123".to_string(),
             provider_event_id: "Ev123".to_string(),
             surface_id: "surface-1".to_string(),
         }

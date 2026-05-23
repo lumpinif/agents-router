@@ -108,6 +108,7 @@ pub struct ProviderThreadReplyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentControllerError {
     pub kind: AgentControllerErrorKind,
+    pub submit_boundary: AgentControllerFailureSubmitBoundary,
     pub controller_kind: AgentControllerKind,
     pub surface_id: String,
     pub source_id: String,
@@ -115,6 +116,12 @@ pub struct AgentControllerError {
     pub source_session_id: String,
     pub provider_event_id_hash: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentControllerFailureSubmitBoundary {
+    FailedBeforeSubmit,
+    FailedAfterPossibleSubmit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +144,7 @@ pub enum AgentControllerRuntimeDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentControllerClosedLoopDecision {
     Completed(AgentControllerClosedLoopCompletion),
+    ControllerFailed(AgentControllerError),
     ProviderThreadReplyFailed(AgentControllerProviderThreadReplyFailure),
     Skipped(AgentControllerRuntimeSkipReason),
 }
@@ -266,14 +274,18 @@ impl<'a> AgentControllerRuntime<'a> {
         };
 
         let result = adapter.continue_session(request.clone()).await;
-        release_inbound_claim(ledger, &ready)?;
 
         match result {
+            // Once the controller has accepted work, the claim stays processing
+            // until the closed loop records provider result reply success.
             Ok(result) => match controller_execution_from_success(&request, &ready, result) {
                 Ok(execution) => Ok(AgentControllerRuntimeDecision::Executed(execution)),
                 Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
             },
-            Err(error) => Ok(AgentControllerRuntimeDecision::Failed(error)),
+            Err(error) => {
+                release_claim_if_controller_failed_before_submit(ledger, &ready, &error)?;
+                Ok(AgentControllerRuntimeDecision::Failed(error))
+            }
         }
     }
 
@@ -340,15 +352,8 @@ impl<'a> AgentControllerRuntime<'a> {
         let (request, adapter) = match prepared {
             PreparedInboundContinuation::Ready { request, adapter } => (request, adapter),
             PreparedInboundContinuation::Failed(error) => {
-                let outcome = AgentControllerClosedLoopOutcome::ControllerFailed(error);
-                return send_result_reply_and_record_processed(
-                    ledger,
-                    &ready,
-                    provider_reply,
-                    outcome,
-                    now,
-                )
-                .await;
+                release_inbound_claim(ledger, &ready)?;
+                return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
             }
             PreparedInboundContinuation::Skipped(reason) => {
                 release_inbound_claim(ledger, &ready)?;
@@ -359,9 +364,15 @@ impl<'a> AgentControllerRuntime<'a> {
         let outcome = match adapter.continue_session(request.clone()).await {
             Ok(result) => match controller_execution_from_success(&request, &ready, result) {
                 Ok(execution) => AgentControllerClosedLoopOutcome::ControllerSucceeded(execution),
-                Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
+                Err(error) => {
+                    release_claim_if_controller_failed_before_submit(ledger, &ready, &error)?;
+                    return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
+                }
             },
-            Err(error) => AgentControllerClosedLoopOutcome::ControllerFailed(error),
+            Err(error) => {
+                release_claim_if_controller_failed_before_submit(ledger, &ready, &error)?;
+                return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
+            }
         };
 
         send_result_reply_and_record_processed(ledger, &ready, provider_reply, outcome, now).await
@@ -436,11 +447,13 @@ impl<'a> AgentControllerRuntime<'a> {
             .copied()
             .find(|adapter| adapter.controller_kind() == allow.controller_kind)
         else {
-            return PreparedInboundContinuation::Failed(AgentControllerError::from_request(
-                &request,
-                AgentControllerErrorKind::ControllerUnavailable,
-                "agent controller adapter is not registered",
-            ));
+            return PreparedInboundContinuation::Failed(
+                AgentControllerError::failed_before_submit(
+                    &request,
+                    AgentControllerErrorKind::ControllerUnavailable,
+                    "agent controller adapter is not registered",
+                ),
+            );
         };
 
         PreparedInboundContinuation::Ready { request, adapter }
@@ -448,13 +461,41 @@ impl<'a> AgentControllerRuntime<'a> {
 }
 
 impl AgentControllerError {
-    pub fn from_request(
+    pub fn failed_before_submit(
         request: &AgentControllerRequest,
         kind: AgentControllerErrorKind,
         message: impl Into<String>,
     ) -> Self {
+        Self::from_request(
+            request,
+            kind,
+            AgentControllerFailureSubmitBoundary::FailedBeforeSubmit,
+            message,
+        )
+    }
+
+    pub fn failed_after_possible_submit(
+        request: &AgentControllerRequest,
+        kind: AgentControllerErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::from_request(
+            request,
+            kind,
+            AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+            message,
+        )
+    }
+
+    fn from_request(
+        request: &AgentControllerRequest,
+        kind: AgentControllerErrorKind,
+        submit_boundary: AgentControllerFailureSubmitBoundary,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
+            submit_boundary,
             controller_kind: request.controller_kind,
             surface_id: request.surface_id.clone(),
             source_id: request.source_id.clone(),
@@ -484,7 +525,7 @@ fn controller_execution_from_success(
     result: AgentControllerSuccess,
 ) -> Result<AgentControllerRuntimeExecution, AgentControllerError> {
     if result.result_text().trim().is_empty() {
-        return Err(AgentControllerError::from_request(
+        return Err(AgentControllerError::failed_after_possible_submit(
             request,
             AgentControllerErrorKind::Internal,
             "agent controller completed without result text",
@@ -702,11 +743,23 @@ fn release_inbound_claim(
     Ok(())
 }
 
+fn release_claim_if_controller_failed_before_submit(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+    error: &AgentControllerError,
+) -> anyhow::Result<()> {
+    if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit {
+        release_inbound_claim(ledger, ready)?;
+    }
+    Ok(())
+}
+
 fn inbound_event_input(ready: &ProviderInboundReady) -> InboundEventDedupInput {
     InboundEventDedupInput {
         provider_id: ready.reply.provider_id.clone(),
         provider_type: ready.reply.provider_type.clone(),
         provider_account_id: ready.reply.provider_account_id.clone(),
+        provider_conversation_id: ready.reply.provider_conversation_id.clone(),
         provider_event_id: ready.reply.provider_event_id.clone(),
         surface_id: ready.surface.surface_id.clone(),
     }
@@ -727,7 +780,10 @@ mod tests {
         ProviderConfigDetail, RouteConfig, SlackProviderConfig, SourceConfig, UrlSource,
     };
     use crate::provider_catalog::{ProviderMode, provider_mode_capability};
-    use crate::provider_inbound::NormalizedProviderSurfaceReply;
+    use crate::provider_inbound::{
+        NormalizedProviderSurfaceReply, ProviderInboundDecision,
+        lookup_and_claim_provider_surface_reply,
+    };
     use crate::response_surface_ledger::{
         InboundEventClaimDecision, NewResponseSurface, ResponseSurfaceLookupQuery,
         ResponseSurfaceLookupResult,
@@ -814,7 +870,7 @@ mod tests {
             requests[0].controller_kind,
             AgentControllerKind::CodexAppServer
         );
-        assert_claim_can_be_taken_again(&mut ledger, ready);
+        assert_event_is_still_processing(&mut ledger, ready);
     }
 
     #[tokio::test]
@@ -906,9 +962,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_error_does_not_mark_event_processed() {
+    async fn controller_failed_before_submit_releases_claim() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
-        let adapter = RecordingAdapter::with_error(AgentControllerErrorKind::ControllerRejected);
+        let adapter = RecordingAdapter::with_error_before_submit(
+            AgentControllerErrorKind::ControllerRejected,
+        );
         let runtime = AgentControllerRuntime::new(vec![&adapter]);
 
         let decision = runtime
@@ -930,6 +988,83 @@ mod tests {
             })
         ));
         assert_claim_can_be_taken_again(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn controller_failed_after_possible_submit_keeps_processing() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_error_after_possible_submit(
+            AgentControllerErrorKind::ControllerRejected,
+        );
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("runtime should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerRuntimeDecision::Failed(AgentControllerError {
+                kind: AgentControllerErrorKind::ControllerRejected,
+                submit_boundary: AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                ..
+            })
+        ));
+        assert_event_is_still_processing(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn duplicate_provider_event_does_not_call_controller_twice_after_possible_submit() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_error_after_possible_submit(
+            AgentControllerErrorKind::ControllerRejected,
+        );
+        let provider_reply = RecordingProviderThreadReplyAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::ControllerFailed(AgentControllerError {
+                submit_boundary: AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                ..
+            })
+        ));
+        let duplicate = lookup_and_claim_provider_surface_reply(
+            &mut ledger,
+            slack_app_capability(),
+            ready.reply.clone(),
+            test_time() + Duration::seconds(3),
+        )
+        .expect("duplicate lookup should not fail");
+
+        assert!(matches!(
+            duplicate,
+            ProviderInboundDecision::Skip(
+                crate::provider_inbound::ProviderInboundSkipReason::EventAlreadyProcessing { .. }
+            )
+        ));
+        assert_eq!(adapter.requests().len(), 1);
+        assert!(provider_reply.requests().is_empty());
     }
 
     #[tokio::test]
@@ -1000,9 +1135,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_loop_controller_error_can_complete_after_failure_notice() {
+    async fn closed_loop_controller_failed_before_submit_releases_claim() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
-        let adapter = RecordingAdapter::with_error(AgentControllerErrorKind::SessionNotFound);
+        let adapter =
+            RecordingAdapter::with_error_before_submit(AgentControllerErrorKind::SessionNotFound);
         let provider_reply = RecordingProviderThreadReplyAdapter::default();
         let runtime = AgentControllerRuntime::new(vec![&adapter]);
 
@@ -1021,21 +1157,14 @@ mod tests {
 
         assert!(matches!(
             decision,
-            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
-                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
-                    kind: AgentControllerErrorKind::SessionNotFound,
-                    ..
-                }),
+            AgentControllerClosedLoopDecision::ControllerFailed(AgentControllerError {
+                kind: AgentControllerErrorKind::SessionNotFound,
+                submit_boundary: AgentControllerFailureSubmitBoundary::FailedBeforeSubmit,
                 ..
             })
         ));
-        let provider_requests = provider_reply.requests();
-        assert_eq!(provider_requests.len(), 1);
-        assert_eq!(
-            provider_requests[0].text,
-            "The original agent session was not found."
-        );
-        assert_event_is_duplicate_processed(&mut ledger, ready);
+        assert!(provider_reply.requests().is_empty());
+        assert_claim_can_be_taken_again(&mut ledger, ready);
     }
 
     #[tokio::test]
@@ -1060,21 +1189,14 @@ mod tests {
 
         assert!(matches!(
             decision,
-            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
-                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
-                    kind: AgentControllerErrorKind::Internal,
-                    ..
-                }),
+            AgentControllerClosedLoopDecision::ControllerFailed(AgentControllerError {
+                kind: AgentControllerErrorKind::Internal,
+                submit_boundary: AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
                 ..
             })
         ));
-        let provider_requests = provider_reply.requests();
-        assert_eq!(provider_requests.len(), 1);
-        assert_eq!(
-            provider_requests[0].text,
-            "Could not forward this reply to the original agent session."
-        );
-        assert_event_is_duplicate_processed(&mut ledger, ready);
+        assert!(provider_reply.requests().is_empty());
+        assert_event_is_still_processing(&mut ledger, ready);
     }
 
     #[tokio::test]
@@ -1086,7 +1208,7 @@ mod tests {
 
         assert_eq!(
             result.expect_err("placeholder should not execute"),
-            AgentControllerError::from_request(
+            AgentControllerError::failed_before_submit(
                 &request,
                 AgentControllerErrorKind::ControllerUnavailable,
                 "Codex App Server continuation is not available in this build",
@@ -1097,15 +1219,32 @@ mod tests {
     #[derive(Default)]
     struct RecordingAdapter {
         requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
-        error: Option<AgentControllerErrorKind>,
+        error: Option<(
+            AgentControllerErrorKind,
+            AgentControllerFailureSubmitBoundary,
+        )>,
         success_message: Option<String>,
     }
 
     impl RecordingAdapter {
-        fn with_error(error: AgentControllerErrorKind) -> Self {
+        fn with_error_before_submit(error: AgentControllerErrorKind) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                error: Some(error),
+                error: Some((
+                    error,
+                    AgentControllerFailureSubmitBoundary::FailedBeforeSubmit,
+                )),
+                success_message: None,
+            }
+        }
+
+        fn with_error_after_possible_submit(error: AgentControllerErrorKind) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                error: Some((
+                    error,
+                    AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                )),
                 success_message: None,
             }
         }
@@ -1140,12 +1279,23 @@ mod tests {
                     .lock()
                     .expect("requests mutex should not be poisoned")
                     .push(request.clone());
-                if let Some(error) = self.error {
-                    return Err(AgentControllerError::from_request(
-                        &request,
-                        error,
-                        "fake controller error",
-                    ));
+                if let Some((error, submit_boundary)) = self.error {
+                    return Err(match submit_boundary {
+                        AgentControllerFailureSubmitBoundary::FailedBeforeSubmit => {
+                            AgentControllerError::failed_before_submit(
+                                &request,
+                                error,
+                                "fake controller error",
+                            )
+                        }
+                        AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit => {
+                            AgentControllerError::failed_after_possible_submit(
+                                &request,
+                                error,
+                                "fake controller error",
+                            )
+                        }
+                    });
                 }
                 let result_text = self
                     .success_message
@@ -1301,6 +1451,7 @@ mod tests {
                         provider_id: ready.reply.provider_id.clone(),
                         provider_type: ready.reply.provider_type.clone(),
                         provider_account_id: ready.reply.provider_account_id.clone(),
+                        provider_conversation_id: ready.reply.provider_conversation_id.clone(),
                         provider_event_id: ready.reply.provider_event_id.clone(),
                         surface_id: ready.surface.surface_id.clone(),
                     },
@@ -1323,6 +1474,7 @@ mod tests {
                         provider_id: ready.reply.provider_id,
                         provider_type: ready.reply.provider_type,
                         provider_account_id: ready.reply.provider_account_id,
+                        provider_conversation_id: ready.reply.provider_conversation_id,
                         provider_event_id: ready.reply.provider_event_id,
                         surface_id: ready.surface.surface_id,
                     },
