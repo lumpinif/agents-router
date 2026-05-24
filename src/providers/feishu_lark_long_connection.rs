@@ -1,10 +1,19 @@
 // Hidden Phase 2 contract; live service wiring stays closed until exposure gates open.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
+use prost::Message as ProstMessage;
+use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::agent_controller::{
     AgentControllerClosedLoopDecision, AgentControllerRuntime, ProviderThreadReplyAdapter,
@@ -24,6 +33,20 @@ use crate::provider_inbound::{
     normalize_feishu_lark_long_connection_surface_reply,
 };
 use crate::response_surface_ledger::ResponseSurfaceLedger;
+
+const LARK_LONG_CONNECTION_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
+const HEADER_TYPE: &str = "type";
+const HEADER_MESSAGE_ID: &str = "message_id";
+const HEADER_SUM: &str = "sum";
+const HEADER_SEQ: &str = "seq";
+const HEADER_BIZ_RT: &str = "biz_rt";
+const MESSAGE_TYPE_EVENT: &str = "event";
+const FRAME_METHOD_CONTROL: i32 = 0;
+const FRAME_METHOD_DATA: i32 = 1;
+const PLATFORM_ACK_CODE_OK: u16 = 200;
+
+type FeishuLarkTransportFuture<'a, T> =
+    Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
 #[derive(Clone)]
 pub(crate) struct FeishuLarkLongConnectionConfig {
@@ -90,6 +113,34 @@ pub(crate) struct FeishuLarkLongConnectionEvent<'a> {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkLongConnectionEndpoint {
+    pub url: String,
+    pub client_config: Option<FeishuLarkLongConnectionClientConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FeishuLarkLongConnectionClientConfig {
+    pub reconnect_count: Option<i64>,
+    pub reconnect_interval: Option<i64>,
+    pub reconnect_nonce: Option<i64>,
+    pub ping_interval: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FeishuLarkLongConnectionTransportMessage {
+    Binary(Vec<u8>),
+    Text(String),
+    Closed,
+}
+
+pub(crate) trait FeishuLarkLongConnectionTransport {
+    fn receive<'a>(
+        &'a mut self,
+    ) -> FeishuLarkTransportFuture<'a, FeishuLarkLongConnectionTransportMessage>;
+    fn send_binary<'a>(&'a mut self, data: Vec<u8>) -> FeishuLarkTransportFuture<'a, ()>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeishuLarkPlatformAck {
     Acknowledge,
@@ -121,6 +172,67 @@ impl FeishuLarkLongConnectionRuntime {
 
     pub fn connection_config(&self) -> &FeishuLarkLongConnectionConfig {
         &self.config
+    }
+
+    pub async fn discover_official_endpoint_hidden(
+        &self,
+    ) -> anyhow::Result<FeishuLarkLongConnectionEndpoint> {
+        let endpoint_url = format!(
+            "{}{}",
+            long_connection_api_base_url(self.config.domain),
+            LARK_LONG_CONNECTION_ENDPOINT_PATH
+        );
+        let response = reqwest::Client::new()
+            .post(endpoint_url)
+            .header("locale", "en")
+            .json(&FeishuLarkLongConnectionEndpointRequest {
+                app_id: &self.config.app_id,
+                app_secret: self.config.app_secret(),
+            })
+            .send()
+            .await
+            .context("failed to request Feishu/Lark long connection endpoint")?;
+
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .context("failed to read Feishu/Lark long connection endpoint response")?;
+        ensure!(
+            status.is_success(),
+            "Feishu/Lark long connection endpoint returned HTTP status {}",
+            status
+        );
+
+        let endpoint_response: FeishuLarkLongConnectionEndpointResponse =
+            serde_json::from_str(&response_body)
+                .context("Feishu/Lark long connection endpoint returned invalid JSON")?;
+        ensure!(
+            endpoint_response.code == 0,
+            "Feishu/Lark long connection endpoint returned code {}: {}",
+            endpoint_response.code,
+            endpoint_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+
+        let data = endpoint_response
+            .data
+            .context("Feishu/Lark long connection endpoint response did not include data")?;
+        let url = present_owned(data.url)
+            .context("Feishu/Lark long connection endpoint response did not include URL")?;
+
+        Ok(FeishuLarkLongConnectionEndpoint {
+            url,
+            client_config: data.client_config.map(Into::into),
+        })
+    }
+
+    pub async fn connect_official_transport_hidden(
+        &self,
+    ) -> anyhow::Result<FeishuLarkOfficialLongConnectionTransport> {
+        let endpoint = self.discover_official_endpoint_hidden().await?;
+        FeishuLarkOfficialLongConnectionTransport::connect(endpoint.url).await
     }
 
     pub fn handle_event_before_platform_ack(
@@ -157,6 +269,57 @@ impl FeishuLarkLongConnectionRuntime {
                 FeishuLarkLongConnectionDecision::AckSkip(reason)
             }
         })
+    }
+
+    pub async fn receive_event_before_platform_ack_hidden(
+        &self,
+        ledger: &mut ResponseSurfaceLedger,
+        transport: &mut dyn FeishuLarkLongConnectionTransport,
+        payload_buffer: &mut FeishuLarkLongConnectionPayloadBuffer,
+        received_at: DateTime<Utc>,
+    ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
+        loop {
+            let message = transport.receive().await?;
+            let Some(mut frame) = lark_frame_from_transport_message(message)? else {
+                anyhow::bail!("Feishu/Lark long connection closed before receiving an event");
+            };
+
+            if frame.method == FRAME_METHOD_CONTROL {
+                continue;
+            }
+            ensure!(
+                frame.method == FRAME_METHOD_DATA,
+                "Feishu/Lark long connection frame used unsupported method {}",
+                frame.method
+            );
+
+            if header_value(&frame, HEADER_TYPE).as_deref() != Some(MESSAGE_TYPE_EVENT) {
+                continue;
+            }
+
+            let Some(raw_event) = payload_buffer.accept_frame(&frame)? else {
+                continue;
+            };
+            let decision = self.handle_event_before_platform_ack(
+                ledger,
+                FeishuLarkLongConnectionEvent {
+                    raw_event: &raw_event,
+                    received_at,
+                },
+            )?;
+            frame.headers.push(FeishuLarkLongConnectionFrameHeader {
+                key: HEADER_BIZ_RT.to_string(),
+                value: "0".to_string(),
+            });
+            frame.payload = Some(
+                serde_json::to_vec(&FeishuLarkLongConnectionPlatformAck {
+                    code: PLATFORM_ACK_CODE_OK,
+                })
+                .context("failed to serialize Feishu/Lark platform ack")?,
+            );
+            transport.send_binary(frame.encode_to_vec()).await?;
+            return Ok(decision);
+        }
     }
 
     pub async fn continue_claimed_event_hidden(
@@ -216,8 +379,248 @@ impl FeishuLarkLongConnectionRuntime {
     }
 }
 
+pub(crate) struct FeishuLarkOfficialLongConnectionTransport {
+    websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+}
+
+impl FeishuLarkOfficialLongConnectionTransport {
+    async fn connect(url: String) -> anyhow::Result<Self> {
+        let (websocket, _) = connect_async(&url)
+            .await
+            .context("failed to connect Feishu/Lark official long connection WebSocket")?;
+        Ok(Self { websocket })
+    }
+}
+
+impl FeishuLarkLongConnectionTransport for FeishuLarkOfficialLongConnectionTransport {
+    fn receive<'a>(
+        &'a mut self,
+    ) -> FeishuLarkTransportFuture<'a, FeishuLarkLongConnectionTransportMessage> {
+        Box::pin(async move {
+            let Some(message) = self.websocket.next().await else {
+                return Ok(FeishuLarkLongConnectionTransportMessage::Closed);
+            };
+            match message.context("Feishu/Lark long connection receive failed")? {
+                Message::Binary(bytes) => Ok(FeishuLarkLongConnectionTransportMessage::Binary(
+                    bytes.to_vec(),
+                )),
+                Message::Text(text) => Ok(FeishuLarkLongConnectionTransportMessage::Text(
+                    text.to_string(),
+                )),
+                Message::Close(_) => Ok(FeishuLarkLongConnectionTransportMessage::Closed),
+                Message::Ping(bytes) => {
+                    self.websocket
+                        .send(Message::Pong(bytes))
+                        .await
+                        .context("failed to send Feishu/Lark WebSocket pong")?;
+                    self.receive().await
+                }
+                Message::Pong(_) => self.receive().await,
+                Message::Frame(_) => self.receive().await,
+            }
+        })
+    }
+
+    fn send_binary<'a>(&'a mut self, data: Vec<u8>) -> FeishuLarkTransportFuture<'a, ()> {
+        Box::pin(async move {
+            self.websocket
+                .send(Message::Binary(data.into()))
+                .await
+                .context("failed to send Feishu/Lark long connection frame")?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FeishuLarkLongConnectionPayloadBuffer {
+    fragments: HashMap<String, Vec<Option<Vec<u8>>>>,
+}
+
+impl FeishuLarkLongConnectionPayloadBuffer {
+    pub fn accept_frame(
+        &mut self,
+        frame: &FeishuLarkLongConnectionFrame,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let payload = frame
+            .payload
+            .clone()
+            .context("Feishu/Lark event frame did not include payload")?;
+        let sum = header_value(frame, HEADER_SUM)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        if sum <= 1 {
+            return Ok(Some(payload));
+        }
+
+        let message_id = required_header(frame, HEADER_MESSAGE_ID)?;
+        let seq = required_header(frame, HEADER_SEQ)?
+            .parse::<usize>()
+            .context("Feishu/Lark event frame seq header was not a number")?;
+        ensure!(
+            seq < sum,
+            "Feishu/Lark event frame seq {} was outside fragment sum {}",
+            seq,
+            sum
+        );
+
+        let entry = self
+            .fragments
+            .entry(message_id.clone())
+            .or_insert_with(|| vec![None; sum]);
+        ensure!(
+            entry.len() == sum,
+            "Feishu/Lark event frame fragment sum changed for message `{}`",
+            message_id
+        );
+        entry[seq] = Some(payload);
+
+        if entry.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let completed = entry
+            .iter()
+            .filter_map(|fragment| fragment.as_ref())
+            .flat_map(|fragment| fragment.iter().copied())
+            .collect::<Vec<_>>();
+        self.fragments.remove(&message_id);
+        Ok(Some(completed))
+    }
+}
+
+#[derive(Clone, PartialEq, ProstMessage)]
+pub(crate) struct FeishuLarkLongConnectionFrameHeader {
+    #[prost(string, required, tag = "1")]
+    pub key: String,
+    #[prost(string, required, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, ProstMessage)]
+pub(crate) struct FeishuLarkLongConnectionFrame {
+    #[prost(uint64, required, tag = "1")]
+    pub seq_id: u64,
+    #[prost(uint64, required, tag = "2")]
+    pub log_id: u64,
+    #[prost(int32, required, tag = "3")]
+    pub service: i32,
+    #[prost(int32, required, tag = "4")]
+    pub method: i32,
+    #[prost(message, repeated, tag = "5")]
+    pub headers: Vec<FeishuLarkLongConnectionFrameHeader>,
+    #[prost(string, optional, tag = "6")]
+    pub payload_encoding: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub payload_type: Option<String>,
+    #[prost(bytes, optional, tag = "8")]
+    pub payload: Option<Vec<u8>>,
+    #[prost(string, optional, tag = "9")]
+    pub log_id_new: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkLongConnectionEndpointRequest<'a> {
+    #[serde(rename = "AppID")]
+    app_id: &'a str,
+    #[serde(rename = "AppSecret")]
+    app_secret: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkLongConnectionEndpointResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuLarkLongConnectionEndpointData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkLongConnectionEndpointData {
+    #[serde(rename = "URL")]
+    url: Option<String>,
+    #[serde(rename = "ClientConfig")]
+    client_config: Option<FeishuLarkLongConnectionEndpointClientConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkLongConnectionEndpointClientConfig {
+    #[serde(rename = "ReconnectCount")]
+    reconnect_count: Option<i64>,
+    #[serde(rename = "ReconnectInterval")]
+    reconnect_interval: Option<i64>,
+    #[serde(rename = "ReconnectNonce")]
+    reconnect_nonce: Option<i64>,
+    #[serde(rename = "PingInterval")]
+    ping_interval: Option<i64>,
+}
+
+impl From<FeishuLarkLongConnectionEndpointClientConfig> for FeishuLarkLongConnectionClientConfig {
+    fn from(value: FeishuLarkLongConnectionEndpointClientConfig) -> Self {
+        Self {
+            reconnect_count: value.reconnect_count,
+            reconnect_interval: value.reconnect_interval,
+            reconnect_nonce: value.reconnect_nonce,
+            ping_interval: value.ping_interval,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkLongConnectionPlatformAck {
+    code: u16,
+}
+
+fn lark_frame_from_transport_message(
+    message: FeishuLarkLongConnectionTransportMessage,
+) -> anyhow::Result<Option<FeishuLarkLongConnectionFrame>> {
+    match message {
+        FeishuLarkLongConnectionTransportMessage::Binary(bytes) => {
+            FeishuLarkLongConnectionFrame::decode(bytes.as_slice())
+                .map(Some)
+                .context("failed to decode Feishu/Lark long connection protobuf frame")
+        }
+        FeishuLarkLongConnectionTransportMessage::Text(_) => {
+            anyhow::bail!("Feishu/Lark long connection returned unsupported text frame")
+        }
+        FeishuLarkLongConnectionTransportMessage::Closed => Ok(None),
+    }
+}
+
+fn header_value(frame: &FeishuLarkLongConnectionFrame, key: &str) -> Option<String> {
+    frame
+        .headers
+        .iter()
+        .find(|header| header.key == key)
+        .map(|header| header.value.clone())
+}
+
+fn required_header(frame: &FeishuLarkLongConnectionFrame, key: &str) -> anyhow::Result<String> {
+    header_value(frame, key)
+        .with_context(|| format!("Feishu/Lark long connection frame was missing `{key}` header"))
+}
+
+fn long_connection_api_base_url(domain: FeishuLarkAppDomain) -> &'static str {
+    match domain {
+        FeishuLarkAppDomain::Feishu => "https://open.feishu.cn",
+        FeishuLarkAppDomain::Lark => "https://open.larksuite.com",
+    }
+}
+
+fn present_owned(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use chrono::{Duration, TimeZone};
 
     use super::*;
@@ -361,6 +764,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hidden_transport_receives_event_then_claims_and_acks_platform() {
+        let now = test_time();
+        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
+            .expect("App Bot should build hidden long connection runtime");
+        let mut ledger = ledger_with_lark_surface(now);
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
+                include_bytes!(
+                    "../../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"
+                )
+                .to_vec(),
+            )),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+
+        let decision = runtime
+            .receive_event_before_platform_ack_hidden(
+                &mut ledger,
+                &mut transport,
+                &mut payload_buffer,
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("hidden transport should receive and ack event");
+
+        let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = decision else {
+            panic!("surface reply should be ready after local claim");
+        };
+        assert_eq!(ready.reply.provider_thread_id, "om_root_message_id");
+        assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
+
+        let sent = transport.sent_messages();
+        assert_eq!(sent.len(), 1);
+        let ack = FeishuLarkLongConnectionFrame::decode(sent[0].as_slice())
+            .expect("platform ack should be a protobuf frame");
+        assert_eq!(ack.method, FRAME_METHOD_DATA);
+        assert_eq!(header_value(&ack, HEADER_BIZ_RT).as_deref(), Some("0"));
+        let payload = ack.payload.expect("ack should include JSON payload");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("ack payload should be JSON");
+        assert_eq!(payload["code"], PLATFORM_ACK_CODE_OK);
+    }
+
+    #[tokio::test]
+    async fn hidden_transport_ack_skips_non_surface_event_without_controller_trigger() {
+        let now = test_time();
+        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
+            .expect("App Bot should build hidden long connection runtime");
+        let mut ledger = ledger_with_lark_surface(now);
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
+                br#"{
+                    "schema": "2.0",
+                    "header": {
+                        "event_id": "event-1",
+                        "event_type": "im.message.receive_v1",
+                        "tenant_key": "2ca1d211f64f6438"
+                    },
+                    "event": {
+                        "sender": { "sender_type": "user" },
+                        "message": {
+                            "message_id": "om_rootless_reply",
+                            "root_id": "",
+                            "chat_id": "oc_5ce6d572455d361153b7xx51da133945",
+                            "message_type": "text",
+                            "content": "{\"text\":\"@_user_1 continue\"}"
+                        }
+                    }
+                }"#
+                .to_vec(),
+            )),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+
+        let decision = runtime
+            .receive_event_before_platform_ack_hidden(
+                &mut ledger,
+                &mut transport,
+                &mut payload_buffer,
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("hidden transport should ack skipped event");
+
+        assert_eq!(
+            decision,
+            FeishuLarkLongConnectionDecision::AckSkip(ProviderInboundSkipReason::NotSurfaceReply)
+        );
+        assert_eq!(transport.sent_messages().len(), 1);
+    }
+
+    #[test]
+    fn fragmented_event_frames_are_reassembled_before_normalization() {
+        let payload = br#"{"schema":"2.0"}"#;
+        let first = fragment_frame("message-1", 2, 0, payload[..8].to_vec());
+        let second = fragment_frame("message-1", 2, 1, payload[8..].to_vec());
+        let mut buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+
+        assert_eq!(
+            buffer
+                .accept_frame(&first)
+                .expect("first fragment should be accepted"),
+            None
+        );
+        assert_eq!(
+            buffer
+                .accept_frame(&second)
+                .expect("second fragment should complete payload"),
+            Some(payload.to_vec())
+        );
+    }
+
     fn app_bot_provider() -> ProviderConfig {
         ProviderConfig {
             id: "lark-app".to_string(),
@@ -415,5 +931,93 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 20, 1, 2, 3)
             .single()
             .expect("test time should be valid")
+    }
+
+    struct RecordingTransport {
+        received: VecDeque<FeishuLarkLongConnectionTransportMessage>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl RecordingTransport {
+        fn with_messages(messages: Vec<FeishuLarkLongConnectionTransportMessage>) -> Self {
+            Self {
+                received: messages.into(),
+                sent: Vec::new(),
+            }
+        }
+
+        fn sent_messages(&self) -> Vec<Vec<u8>> {
+            self.sent.clone()
+        }
+    }
+
+    impl FeishuLarkLongConnectionTransport for RecordingTransport {
+        fn receive<'a>(
+            &'a mut self,
+        ) -> FeishuLarkTransportFuture<'a, FeishuLarkLongConnectionTransportMessage> {
+            Box::pin(async move {
+                Ok(self
+                    .received
+                    .pop_front()
+                    .unwrap_or(FeishuLarkLongConnectionTransportMessage::Closed))
+            })
+        }
+
+        fn send_binary<'a>(&'a mut self, data: Vec<u8>) -> FeishuLarkTransportFuture<'a, ()> {
+            Box::pin(async move {
+                self.sent.push(data);
+                Ok(())
+            })
+        }
+    }
+
+    fn event_frame(payload: Vec<u8>) -> Vec<u8> {
+        base_event_frame(
+            payload,
+            vec![header(HEADER_SUM, "1"), header(HEADER_SEQ, "0")],
+        )
+        .encode_to_vec()
+    }
+
+    fn fragment_frame(
+        message_id: &str,
+        sum: usize,
+        seq: usize,
+        payload: Vec<u8>,
+    ) -> FeishuLarkLongConnectionFrame {
+        base_event_frame(
+            payload,
+            vec![
+                header(HEADER_MESSAGE_ID, message_id),
+                header(HEADER_SUM, &sum.to_string()),
+                header(HEADER_SEQ, &seq.to_string()),
+            ],
+        )
+    }
+
+    fn base_event_frame(
+        payload: Vec<u8>,
+        extra_headers: Vec<FeishuLarkLongConnectionFrameHeader>,
+    ) -> FeishuLarkLongConnectionFrame {
+        let mut headers = vec![header(HEADER_TYPE, MESSAGE_TYPE_EVENT)];
+        headers.extend(extra_headers);
+        FeishuLarkLongConnectionFrame {
+            seq_id: 1,
+            log_id: 2,
+            service: 3,
+            method: FRAME_METHOD_DATA,
+            headers,
+            payload_encoding: None,
+            payload_type: None,
+            payload: Some(payload),
+            log_id_new: None,
+        }
+    }
+
+    fn header(key: &str, value: &str) -> FeishuLarkLongConnectionFrameHeader {
+        FeishuLarkLongConnectionFrameHeader {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
     }
 }
