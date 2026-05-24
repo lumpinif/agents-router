@@ -1,17 +1,42 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::agent_controller::{ProviderThreadReplyAdapter, ProviderThreadReplyRequest};
-use crate::config::{FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, UrlSource};
-use crate::delivery::{DeliveryErrorKind, ProviderDeliveryReceiptStatus, ProviderSendStatus};
-use crate::provider_inbound::{
-    ProviderInboundNormalizeResult, normalize_feishu_lark_long_connection_surface_reply,
+use crate::agent_controller::{
+    AgentControllerAdapter, AgentControllerClosedLoopDecision, AgentControllerClosedLoopOutcome,
+    AgentControllerFuture, AgentControllerRequest, AgentControllerRuntime,
+    AgentControllerRuntimeSkipReason, AgentControllerSuccess, ProviderThreadReplyAdapter,
+    ProviderThreadReplyRequest,
 };
+use crate::agent_integration_catalog::{
+    AgentControllerKind, AgentIntegrationDescriptor, AgentIntegrationId, ContinuationCapability,
+    agent_integration_descriptor,
+};
+use crate::config::{
+    CONFIG_SCHEMA_VERSION, CliConfig, FeishuLarkAppBotProviderConfig,
+    FeishuLarkCustomBotProviderConfig, FeishuLarkProviderConfig, LogConfig, NotificationConfig,
+    RouteConfig, SecretSource, SourceConfig, SourceType, UrlSource, ValidatedConfig,
+};
+use crate::delivery::{DeliveryErrorKind, ProviderDeliveryReceiptStatus, ProviderSendStatus};
+use crate::provider_catalog::{ProviderMode, provider_mode_capability};
+use crate::provider_inbound::{
+    ProviderInboundNormalizeResult, ProviderInboundReady,
+    normalize_feishu_lark_long_connection_surface_reply,
+};
+use crate::providers::feishu_lark_long_connection::{
+    FeishuLarkLongConnectionDecision, FeishuLarkLongConnectionEvent,
+    FeishuLarkLongConnectionRuntime,
+};
+use crate::response_surface_ledger::{
+    InboundEventClaimDecision, InboundEventDedupInput, NewResponseSurface,
+    ProcessedInboundEventDecision, ResponseSurfaceLedger,
+};
+use crate::response_surface_policy::ResponseSurfacePolicySkipReason;
 use crate::signal::{
     SignalAnswer, SignalAnswerKind, SignalConversation, SignalLifecycle, SignalLifecycleStatus,
     SignalLink, SignalWorkspace,
@@ -330,6 +355,194 @@ async fn app_bot_sends_agent_result_text_to_same_root_thread() {
             .expect("text should be present")
             .contains("agents-router")
     );
+}
+
+#[tokio::test]
+async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_processed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "text",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_result_reply_message_id",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "text"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let now = lark_hidden_e2e_time();
+    let mut ledger = ResponseSurfaceLedger::in_memory();
+    ledger
+        .create_surface_at(lark_hidden_e2e_surface(), now)
+        .expect("surface should be created");
+    let long_connection =
+        FeishuLarkLongConnectionRuntime::from_provider_config(&lark_hidden_e2e_provider_config())
+            .expect("hidden App Bot long connection runtime should build");
+    let provider = test_app_bot_provider(server.uri());
+    let controller = RecordingCodexController::with_result("Codex final answer, unchanged.");
+    let controller_runtime = AgentControllerRuntime::new(vec![&controller]);
+
+    let claim_decision = long_connection
+        .handle_event_before_platform_ack(
+            &mut ledger,
+            FeishuLarkLongConnectionEvent {
+                raw_event: include_bytes!(
+                    "../../../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"
+                ),
+                received_at: now + Duration::seconds(1),
+            },
+        )
+        .expect("Lark reply should normalize, lookup, and claim");
+    let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = claim_decision else {
+        panic!("surface reply should be ready after local claim");
+    };
+    assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
+
+    let decision = long_connection
+        .continue_claimed_event_hidden_with_test_policy_facts(
+            &lark_hidden_e2e_config(),
+            &mut ledger,
+            ready.clone(),
+            &controller_runtime,
+            &provider,
+            now + Duration::seconds(2),
+            Some(available_codex_desktop()),
+            Some(provider_mode_capability(ProviderMode::FeishuLarkAppBot)),
+        )
+        .await
+        .expect("hidden closed loop should not fail");
+
+    let AgentControllerClosedLoopDecision::Completed(completion) = decision else {
+        panic!("hidden closed loop should complete");
+    };
+    assert!(matches!(
+        completion.outcome,
+        AgentControllerClosedLoopOutcome::ControllerSucceeded(_)
+    ));
+    assert_eq!(
+        completion.provider_reply_message_id.as_deref(),
+        Some("om_result_reply_message_id")
+    );
+    assert!(matches!(
+        completion.processed,
+        ProcessedInboundEventDecision::Recorded { .. }
+    ));
+
+    let controller_requests = controller.requests();
+    assert_eq!(controller_requests.len(), 1);
+    assert_eq!(controller_requests[0].source_session_id, "session-1");
+    assert_eq!(
+        controller_requests[0].reply_text,
+        "@_user_1 continue with README"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let reply_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply")
+        .expect("thread result reply should be sent");
+    let body: serde_json::Value = reply_request
+        .body_json()
+        .expect("reply body should be JSON");
+    let content: serde_json::Value = serde_json::from_str(
+        body["content"]
+            .as_str()
+            .expect("reply content should be a JSON string"),
+    )
+    .expect("reply content should be text message JSON");
+    assert_eq!(content["text"], "Codex final answer, unchanged.");
+    assert_eq!(body["reply_in_thread"], true);
+
+    assert!(matches!(
+        ledger
+            .claim_inbound_event_at(inbound_input_for_ready(&ready), now + Duration::seconds(3))
+            .expect("processed event should stay deduped"),
+        InboundEventClaimDecision::DuplicateProcessed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn hidden_lark_closed_loop_still_skips_planned_codex_catalog() {
+    let now = lark_hidden_e2e_time();
+    let mut ledger = ResponseSurfaceLedger::in_memory();
+    ledger
+        .create_surface_at(lark_hidden_e2e_surface(), now)
+        .expect("surface should be created");
+    let long_connection =
+        FeishuLarkLongConnectionRuntime::from_provider_config(&lark_hidden_e2e_provider_config())
+            .expect("hidden App Bot long connection runtime should build");
+    let provider = test_app_bot_provider("http://127.0.0.1:1".to_string());
+    let controller = RecordingCodexController::with_result("should not run");
+    let controller_runtime = AgentControllerRuntime::new(vec![&controller]);
+
+    let claim_decision = long_connection
+        .handle_event_before_platform_ack(
+            &mut ledger,
+            FeishuLarkLongConnectionEvent {
+                raw_event: include_bytes!(
+                    "../../../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"
+                ),
+                received_at: now + Duration::seconds(1),
+            },
+        )
+        .expect("Lark reply should normalize, lookup, and claim");
+    let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = claim_decision else {
+        panic!("surface reply should be ready after local claim");
+    };
+
+    let decision = long_connection
+        .continue_claimed_event_hidden(
+            &lark_hidden_e2e_config(),
+            &mut ledger,
+            ready.clone(),
+            &controller_runtime,
+            &provider,
+            now + Duration::seconds(2),
+        )
+        .await
+        .expect("hidden closed loop should not fail");
+
+    assert_eq!(
+        decision,
+        AgentControllerClosedLoopDecision::Skipped(AgentControllerRuntimeSkipReason::Policy(
+            ResponseSurfacePolicySkipReason::AgentContinuationPlanned
+        ))
+    );
+    assert!(controller.requests().is_empty());
+    assert!(matches!(
+        ledger
+            .claim_inbound_event_at(inbound_input_for_ready(&ready), now + Duration::seconds(3))
+            .expect("planned skip should release the claim"),
+        InboundEventClaimDecision::Claimed { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1031,6 +1244,134 @@ fn thread_reply_request(text: &str) -> ProviderThreadReplyRequest {
             .to_string(),
         text: text.to_string(),
     }
+}
+
+#[derive(Default)]
+struct RecordingCodexController {
+    requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
+    result_text: String,
+}
+
+impl RecordingCodexController {
+    fn with_result(result_text: &str) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result_text: result_text.to_string(),
+        }
+    }
+
+    fn requests(&self) -> Vec<AgentControllerRequest> {
+        self.requests
+            .lock()
+            .expect("controller requests mutex should not be poisoned")
+            .clone()
+    }
+}
+
+impl AgentControllerAdapter for RecordingCodexController {
+    fn controller_kind(&self) -> AgentControllerKind {
+        AgentControllerKind::CodexAppServer
+    }
+
+    fn continue_session<'a>(
+        &'a self,
+        request: AgentControllerRequest,
+    ) -> AgentControllerFuture<'a> {
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("controller requests mutex should not be poisoned")
+                .push(request);
+
+            Ok(
+                AgentControllerSuccess::from_result_text(self.result_text.clone())
+                    .expect("test controller result must not be blank"),
+            )
+        })
+    }
+}
+
+fn lark_hidden_e2e_config() -> ValidatedConfig {
+    let mut route = RouteConfig::new(
+        vec!["codex_desktop".to_string()],
+        vec!["work_chat".to_string()],
+    );
+    route.response_surface.enabled = true;
+
+    ValidatedConfig {
+        schema_version: CONFIG_SCHEMA_VERSION,
+        cli: CliConfig::default(),
+        log: LogConfig::default(),
+        notification: NotificationConfig::default(),
+        sources: vec![SourceConfig {
+            id: "codex_desktop".to_string(),
+            source_type: SourceType::CodexDesktop,
+        }],
+        providers: vec![lark_hidden_e2e_provider_config()],
+        routes: vec![route],
+    }
+}
+
+fn lark_hidden_e2e_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        id: "work_chat".to_string(),
+        detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(
+            FeishuLarkAppBotProviderConfig {
+                domain: FeishuLarkAppDomain::Lark,
+                app_id: "cli_test".to_string(),
+                app_secret: SecretSource::Inline("test-app-secret".to_string()),
+                tenant_key: "2ca1d211f64f6438".to_string(),
+                chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+            },
+        )),
+    }
+}
+
+fn lark_hidden_e2e_surface() -> NewResponseSurface {
+    NewResponseSurface {
+        signal_id: "signal-1".to_string(),
+        delivery_id: "delivery-1".to_string(),
+        source_id: "codex_desktop".to_string(),
+        source_type: "codex_desktop".to_string(),
+        source_session_id: "session-1".to_string(),
+        source_turn_id: Some("turn-1".to_string()),
+        provider_id: "work_chat".to_string(),
+        provider_type: ProviderType::FeishuLark.as_str().to_string(),
+        provider_mode: ProviderMode::FeishuLarkAppBot,
+        provider_account_id: "2ca1d211f64f6438".to_string(),
+        provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+        provider_message_id: "om_root_message_id".to_string(),
+        provider_thread_id: "om_root_message_id".to_string(),
+    }
+}
+
+fn available_codex_desktop() -> AgentIntegrationDescriptor {
+    let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+    let target = descriptor
+        .continuation_capability
+        .target()
+        .expect("Codex Desktop planned continuation target should be cataloged");
+    AgentIntegrationDescriptor {
+        continuation_capability: ContinuationCapability::Available(target),
+        ..descriptor
+    }
+}
+
+fn inbound_input_for_ready(ready: &ProviderInboundReady) -> InboundEventDedupInput {
+    InboundEventDedupInput {
+        provider_id: ready.reply.provider_id.clone(),
+        provider_type: ready.reply.provider_type.clone(),
+        provider_account_id: ready.reply.provider_account_id.clone(),
+        provider_conversation_id: ready.reply.provider_conversation_id.clone(),
+        provider_event_id: ready.reply.provider_event_id.clone(),
+        surface_id: ready.surface.surface_id.clone(),
+    }
+}
+
+fn lark_hidden_e2e_time() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 5, 23, 1, 2, 3)
+        .single()
+        .expect("test time should be valid")
 }
 
 struct EnvVarGuard {

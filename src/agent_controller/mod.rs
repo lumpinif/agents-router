@@ -228,7 +228,7 @@ impl<'a> AgentControllerRuntime<'a> {
     }
 
     #[cfg(test)]
-    async fn run_inbound_continuation_with_test_policy_facts(
+    pub(crate) async fn run_inbound_continuation_with_test_policy_facts(
         &self,
         config: &ValidatedConfig,
         ledger: &mut ResponseSurfaceLedger,
@@ -310,7 +310,7 @@ impl<'a> AgentControllerRuntime<'a> {
     }
 
     #[cfg(test)]
-    async fn run_inbound_continuation_closed_loop_with_test_policy_facts(
+    pub(crate) async fn run_inbound_continuation_closed_loop_with_test_policy_facts(
         &self,
         config: &ValidatedConfig,
         ledger: &mut ResponseSurfaceLedger,

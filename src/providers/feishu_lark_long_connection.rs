@@ -6,10 +6,17 @@ use std::fmt;
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 
+use crate::agent_controller::{
+    AgentControllerClosedLoopDecision, AgentControllerRuntime, ProviderThreadReplyAdapter,
+};
+#[cfg(test)]
+use crate::agent_integration_catalog::AgentIntegrationDescriptor;
 use crate::config::{
     FeishuLarkAppDomain, FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail,
-    ProviderType,
+    ProviderType, ValidatedConfig,
 };
+#[cfg(test)]
+use crate::provider_catalog::ProviderModeCapability;
 use crate::provider_catalog::{ProviderMode, provider_mode_capability};
 use crate::provider_inbound::{
     ProviderInboundDecision, ProviderInboundNormalizeResult, ProviderInboundReady,
@@ -150,6 +157,62 @@ impl FeishuLarkLongConnectionRuntime {
                 FeishuLarkLongConnectionDecision::AckSkip(reason)
             }
         })
+    }
+
+    pub async fn continue_claimed_event_hidden(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        controller_runtime: &AgentControllerRuntime<'_>,
+        provider_reply: &dyn ProviderThreadReplyAdapter,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        self.ensure_claimed_event_matches_runtime(&ready)?;
+        controller_runtime
+            .run_inbound_continuation_closed_loop(config, ledger, ready, provider_reply, now)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn continue_claimed_event_hidden_with_test_policy_facts(
+        &self,
+        config: &ValidatedConfig,
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        controller_runtime: &AgentControllerRuntime<'_>,
+        provider_reply: &dyn ProviderThreadReplyAdapter,
+        now: DateTime<Utc>,
+        agent_integration_override: Option<AgentIntegrationDescriptor>,
+        provider_capability_override: Option<&'static ProviderModeCapability>,
+    ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        self.ensure_claimed_event_matches_runtime(&ready)?;
+        controller_runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                config,
+                ledger,
+                ready,
+                provider_reply,
+                now,
+                agent_integration_override,
+                provider_capability_override,
+            )
+            .await
+    }
+
+    fn ensure_claimed_event_matches_runtime(
+        &self,
+        ready: &ProviderInboundReady,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            ready.reply.provider_id == self.config.provider_id,
+            "claimed Feishu/Lark event provider does not match long connection runtime"
+        );
+        ensure!(
+            ready.reply.provider_mode == ProviderMode::FeishuLarkAppBot,
+            "claimed Feishu/Lark event must come from App Bot mode"
+        );
+        Ok(())
     }
 }
 
