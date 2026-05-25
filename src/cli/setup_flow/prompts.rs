@@ -383,6 +383,180 @@ pub(in crate::cli) fn prompt_for_feishu_lark_secret(
     Ok(setup::resolve_feishu_lark_secret(input))
 }
 
+pub(in crate::cli) fn prompt_for_feishu_lark_mode(
+    default: Option<FeishuLarkSetupMode>,
+    i18n: I18n,
+) -> anyhow::Result<FeishuLarkSetupMode> {
+    let effective_default = default.unwrap_or_default();
+    let options = [
+        FeishuLarkSetupMode::CustomBotWebhook,
+        FeishuLarkSetupMode::AppBot,
+    ];
+    let default_index = options
+        .iter()
+        .position(|mode| *mode == effective_default)
+        .unwrap_or(0);
+    let items = options
+        .iter()
+        .map(|mode| feishu_lark_mode_option_label(*mode, default, i18n))
+        .collect::<Vec<_>>();
+    let theme = prompt_theme();
+    let selection = Select::with_theme(&theme)
+        .with_prompt(localized(i18n, "Feishu/Lark mode", "Feishu/Lark 模式"))
+        .items(&items)
+        .default(default_index)
+        .interact()
+        .context("failed to read Feishu/Lark mode")?;
+
+    Ok(options[selection])
+}
+
+fn feishu_lark_mode_option_label(
+    mode: FeishuLarkSetupMode,
+    default: Option<FeishuLarkSetupMode>,
+    i18n: I18n,
+) -> String {
+    let mut label = match mode {
+        FeishuLarkSetupMode::CustomBotWebhook => {
+            "Custom Bot Webhook — Stable\n  Send one-way notifications to a group. Fastest setup. No replies."
+                .to_string()
+        }
+        FeishuLarkSetupMode::AppBot => {
+            "App Bot — Experimental\n  Send notifications through an app bot. With Codex Desktop, replies in the message thread can continue the original session."
+                .to_string()
+        }
+    };
+
+    if Some(mode) == default {
+        label.push_str(&format!(" ({})", i18n.text(Text::CurrentSuffix)));
+    } else if default.is_none() && mode == FeishuLarkSetupMode::CustomBotWebhook {
+        label.push_str(&format!(" ({})", i18n.text(Text::RecommendedSuffix)));
+    }
+
+    label
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_app_domain(
+    current_domain: Option<&str>,
+    i18n: I18n,
+) -> anyhow::Result<String> {
+    let options = ["lark", "feishu"];
+    let current_domain =
+        current_domain.and_then(|domain| options.iter().position(|candidate| *candidate == domain));
+    let default_index = current_domain.unwrap_or(0);
+    let items = options
+        .iter()
+        .enumerate()
+        .map(|(index, domain)| {
+            let mut label = (*domain).to_string();
+            if Some(index) == current_domain {
+                label.push_str(&format!(" ({})", i18n.text(Text::CurrentSuffix)));
+            }
+            label
+        })
+        .collect::<Vec<_>>();
+    let theme = prompt_theme();
+    let selection = Select::with_theme(&theme)
+        .with_prompt("Domain")
+        .items(&items)
+        .default(default_index)
+        .interact()
+        .context("failed to read Feishu/Lark App Bot domain")?;
+
+    setup::resolve_feishu_lark_app_domain(options[selection])
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_app_id(
+    current_app_id: Option<&str>,
+) -> anyhow::Result<String> {
+    prompt_for_required_feishu_lark_app_bot_field(
+        "App ID",
+        current_app_id,
+        setup::resolve_feishu_lark_app_id,
+        "failed to read Feishu/Lark App ID",
+    )
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_app_secret_env(
+    current_env: Option<&str>,
+    domain: &str,
+) -> anyhow::Result<String> {
+    let default_env = match domain {
+        "feishu" => "AGENTS_ROUTER_FEISHU_APP_SECRET",
+        _ => "AGENTS_ROUTER_LARK_APP_SECRET",
+    };
+    let fallback = current_env.unwrap_or(default_env);
+    let prompt = if let Some(current_env) = current_env {
+        format!("App Secret env var name [{current_env}, press Enter to keep]")
+    } else {
+        format!("App Secret env var name [{default_env}]")
+    };
+    loop {
+        let input = prompt_text(
+            prompt.clone(),
+            "failed to read Feishu/Lark App Secret env var",
+        )?;
+        let candidate = if input.trim().is_empty() {
+            fallback
+        } else {
+            input.trim()
+        };
+
+        match setup::resolve_feishu_lark_app_secret_env(candidate) {
+            Ok(value) => return Ok(value),
+            Err(error) => println!("{error}"),
+        }
+    }
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_tenant_key(
+    current_tenant_key: Option<&str>,
+) -> anyhow::Result<String> {
+    prompt_for_required_feishu_lark_app_bot_field(
+        "Tenant Key",
+        current_tenant_key,
+        setup::resolve_feishu_lark_tenant_key,
+        "failed to read Feishu/Lark tenant_key",
+    )
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_chat_id(
+    current_chat_id: Option<&str>,
+) -> anyhow::Result<String> {
+    prompt_for_required_feishu_lark_app_bot_field(
+        "Chat ID",
+        current_chat_id,
+        setup::resolve_feishu_lark_chat_id,
+        "failed to read Feishu/Lark chat_id",
+    )
+}
+
+fn prompt_for_required_feishu_lark_app_bot_field(
+    label: &'static str,
+    current_value: Option<&str>,
+    resolve: fn(&str) -> anyhow::Result<String>,
+    read_context: &'static str,
+) -> anyhow::Result<String> {
+    loop {
+        let prompt = if let Some(current_value) = current_value {
+            format!("{label} [{current_value}, press Enter to keep]")
+        } else {
+            label.to_string()
+        };
+        let input = prompt_text(prompt, read_context)?;
+        let candidate = if input.trim().is_empty() {
+            current_value.unwrap_or("")
+        } else {
+            input.trim()
+        };
+
+        match resolve(candidate) {
+            Ok(value) => return Ok(value),
+            Err(error) => println!("{error}"),
+        }
+    }
+}
+
 pub(in crate::cli) fn prompt_for_webhook_url(
     current_url: Option<&str>,
     i18n: I18n,

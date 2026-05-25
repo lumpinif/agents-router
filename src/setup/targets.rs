@@ -20,6 +20,7 @@ pub fn feishu_lark_targets(config: &RawConfig) -> Vec<FeishuLarkTarget> {
         .providers
         .iter()
         .filter(|provider| provider.provider_type == ProviderType::FeishuLark)
+        .filter(|provider| provider.mode.as_deref() != Some("app_bot"))
         .filter_map(|provider| {
             let webhook_host = match (
                 provider
@@ -47,6 +48,25 @@ pub fn feishu_lark_targets(config: &RawConfig) -> Vec<FeishuLarkTarget> {
                         .secret_env
                         .as_deref()
                         .is_some_and(|value| !value.trim().is_empty()),
+            })
+        })
+        .collect()
+}
+
+pub fn feishu_lark_app_bot_targets(config: &RawConfig) -> Vec<FeishuLarkAppBotTarget> {
+    config
+        .providers
+        .iter()
+        .filter(|provider| provider.provider_type == ProviderType::FeishuLark)
+        .filter(|provider| provider.mode.as_deref() == Some("app_bot"))
+        .filter_map(|provider| {
+            Some(FeishuLarkAppBotTarget {
+                provider_id: provider.id.clone(),
+                domain: provider.domain.as_ref()?.clone(),
+                app_id: provider.app_id.as_ref()?.clone(),
+                app_secret_env: provider.app_secret_env.clone(),
+                tenant_key: provider.tenant_key.as_ref()?.clone(),
+                chat_id: provider.chat_id.as_ref()?.clone(),
             })
         })
         .collect()

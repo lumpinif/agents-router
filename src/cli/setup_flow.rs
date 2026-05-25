@@ -42,6 +42,7 @@ pub(super) enum GuidedSetup {
     },
     FeishuLark {
         agent: setup::AgentIntegrationId,
+        mode: FeishuLarkSetupMode,
     },
     Webhook {
         agent: setup::AgentIntegrationId,
@@ -70,6 +71,13 @@ pub(super) enum GuidedSetup {
     EmailSmtp {
         agent: setup::AgentIntegrationId,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum FeishuLarkSetupMode {
+    #[default]
+    CustomBotWebhook,
+    AppBot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +109,14 @@ pub(super) struct SetupDefaults {
     pub(super) only_forward_from_project_paths: Vec<String>,
     pub(super) provider_type: Option<ProviderType>,
     pub(super) ntfy_topic: Option<String>,
+    pub(super) feishu_lark_mode: Option<FeishuLarkSetupMode>,
     pub(super) feishu_lark_webhook_url: Option<String>,
     pub(super) feishu_lark_secret: Option<String>,
+    pub(super) feishu_lark_app_domain: Option<String>,
+    pub(super) feishu_lark_app_id: Option<String>,
+    pub(super) feishu_lark_app_secret_env: Option<String>,
+    pub(super) feishu_lark_tenant_key: Option<String>,
+    pub(super) feishu_lark_chat_id: Option<String>,
     pub(super) webhook_url: Option<String>,
     pub(super) pushover_app_token: Option<String>,
     pub(super) pushover_user_key: Option<String>,
@@ -153,10 +167,22 @@ impl SetupDefaults {
             provider_type: first_configured_provider(config),
             ntfy_topic: first_provider_of_type(config, ProviderType::Ntfy)
                 .and_then(|provider| provider.topic.clone()),
+            feishu_lark_mode: first_provider_of_type(config, ProviderType::FeishuLark)
+                .map(feishu_lark_setup_mode_from_raw_provider),
             feishu_lark_webhook_url: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(configured_provider_url),
             feishu_lark_secret: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(configured_provider_secret),
+            feishu_lark_app_domain: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.domain.clone()),
+            feishu_lark_app_id: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.app_id.clone()),
+            feishu_lark_app_secret_env: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.app_secret_env.clone()),
+            feishu_lark_tenant_key: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.tenant_key.clone()),
+            feishu_lark_chat_id: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.chat_id.clone()),
             webhook_url: first_provider_of_type(config, ProviderType::Webhook)
                 .and_then(configured_provider_url),
             pushover_app_token: first_provider_of_type(config, ProviderType::Pushover)
@@ -222,6 +248,13 @@ impl SetupDefaults {
 
         let loaded = ParsedConfig::from_path(path)?;
         Ok(Self::from_config(&loaded.raw))
+    }
+}
+
+fn feishu_lark_setup_mode_from_raw_provider(provider: &RawProviderConfig) -> FeishuLarkSetupMode {
+    match provider.mode.as_deref() {
+        Some("app_bot") => FeishuLarkSetupMode::AppBot,
+        _ => FeishuLarkSetupMode::CustomBotWebhook,
     }
 }
 
@@ -838,16 +871,55 @@ pub(super) fn run_feishu_lark_setup(
         i18n,
     } = context;
     println!();
-    println!("{}", i18n.text(Text::FeishuLarkIntro1));
-    println!("{}", i18n.text(Text::FeishuLarkIntro2));
-    println!("{}", i18n.text(Text::FeishuLarkIntro3));
-    println!();
+    let feishu_lark_mode = prompt_for_feishu_lark_mode(defaults.feishu_lark_mode, i18n)?;
+    let mut config = match feishu_lark_mode {
+        FeishuLarkSetupMode::CustomBotWebhook => {
+            println!();
+            println!("{}", i18n.text(Text::FeishuLarkIntro1));
+            println!("{}", i18n.text(Text::FeishuLarkIntro2));
+            println!("{}", i18n.text(Text::FeishuLarkIntro3));
+            println!();
 
-    let webhook_url =
-        prompt_for_feishu_lark_webhook_url(defaults.feishu_lark_webhook_url.as_deref(), i18n)?;
-    let secret = prompt_for_feishu_lark_secret(defaults.feishu_lark_secret.as_deref(), i18n)?;
-    let mut config =
-        setup::build_feishu_lark_config(agent, answer_detail, prompt_detail, &webhook_url, secret);
+            let webhook_url = prompt_for_feishu_lark_webhook_url(
+                defaults.feishu_lark_webhook_url.as_deref(),
+                i18n,
+            )?;
+            let secret =
+                prompt_for_feishu_lark_secret(defaults.feishu_lark_secret.as_deref(), i18n)?;
+            setup::build_feishu_lark_config(
+                agent,
+                answer_detail,
+                prompt_detail,
+                &webhook_url,
+                secret,
+            )
+        }
+        FeishuLarkSetupMode::AppBot => {
+            print_feishu_lark_app_bot_setup_checklist(i18n);
+            let domain = prompt_for_feishu_lark_app_domain(
+                defaults.feishu_lark_app_domain.as_deref(),
+                i18n,
+            )?;
+            let app_id = prompt_for_feishu_lark_app_id(defaults.feishu_lark_app_id.as_deref())?;
+            let app_secret_env = prompt_for_feishu_lark_app_secret_env(
+                defaults.feishu_lark_app_secret_env.as_deref(),
+                &domain,
+            )?;
+            let tenant_key =
+                prompt_for_feishu_lark_tenant_key(defaults.feishu_lark_tenant_key.as_deref())?;
+            let chat_id = prompt_for_feishu_lark_chat_id(defaults.feishu_lark_chat_id.as_deref())?;
+            setup::build_feishu_lark_app_bot_config(
+                agent,
+                answer_detail,
+                prompt_detail,
+                &domain,
+                &app_id,
+                &app_secret_env,
+                &tenant_key,
+                &chat_id,
+            )
+        }
+    };
     write_setup_config_with_route_filters(
         path,
         &mut config,
@@ -868,7 +940,48 @@ pub(super) fn run_feishu_lark_setup(
     );
     print_setup_provider_summary(&config, i18n);
 
-    loaded_config(config, Some(GuidedSetup::FeishuLark { agent }))
+    loaded_config(
+        config,
+        Some(GuidedSetup::FeishuLark {
+            agent,
+            mode: feishu_lark_mode,
+        }),
+    )
+}
+
+fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
+    println!();
+    match i18n.language() {
+        CliLanguage::English => {
+            println!("App Bot checklist:");
+            println!("- Add Bot capability.");
+            println!(
+                "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly."
+            );
+            println!("- Subscribe to im.message.receive_v1 with Long Connection / WebSocket.");
+            println!("- Publish a new app version after permission or event changes.");
+            println!(
+                "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"
+            );
+            println!(
+                "Keep App Secret in a local environment variable; setup only stores its env var name."
+            );
+        }
+        CliLanguage::SimplifiedChinese => {
+            println!("App Bot checklist:");
+            println!("- 添加 Bot 能力。");
+            println!(
+                "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly。"
+            );
+            println!("- 用 Long Connection / WebSocket 订阅 im.message.receive_v1。");
+            println!("- 修改权限或事件后，发布新版本并等待审批通过。");
+            println!(
+                "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"
+            );
+            println!("App Secret 只放在本机环境变量里；setup 只保存环境变量名。");
+        }
+    }
+    println!();
 }
 
 pub(super) fn run_webhook_setup(context: ProviderSetupContext<'_>) -> anyhow::Result<LoadedConfig> {

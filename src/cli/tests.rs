@@ -549,6 +549,96 @@ fn setup_provider_summary_reports_signature_without_exposing_secret() {
 }
 
 #[test]
+fn setup_provider_summary_reports_app_bot_without_exposing_secret_env_value() {
+    let config = setup::build_feishu_lark_app_bot_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    let summary = single_setup_provider_summary(&config);
+
+    assert_eq!(
+        summary,
+        SetupProviderSummary {
+            provider_name: "Feishu/Lark app bot",
+            fields: vec![
+                plain_summary_field("domain", "lark".to_string()),
+                plain_summary_field("app id", "cli_9f5343c580712544".to_string()),
+                SetupProviderSummaryField {
+                    label: "app secret",
+                    value: "configured".to_string(),
+                    tone: SetupProviderSummaryTone::Success,
+                },
+                plain_summary_field("tenant key", "2ca1d211f64f6438".to_string()),
+                plain_summary_field("chat id", "oc_5ce6d572455d361153b7xx51da133945".to_string()),
+            ],
+        }
+    );
+}
+
+#[test]
+fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
+    let mut config = setup::build_feishu_lark_app_bot_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+    config.cli.language = CliLanguage::English;
+
+    let defaults = SetupDefaults::from_config(&config);
+
+    assert_eq!(defaults.feishu_lark_mode, Some(FeishuLarkSetupMode::AppBot));
+    assert_eq!(defaults.feishu_lark_app_domain.as_deref(), Some("lark"));
+    assert_eq!(
+        defaults.feishu_lark_app_id.as_deref(),
+        Some("cli_9f5343c580712544")
+    );
+    assert_eq!(
+        defaults.feishu_lark_app_secret_env.as_deref(),
+        Some("AGENTS_ROUTER_LARK_APP_SECRET")
+    );
+    assert_eq!(
+        defaults.feishu_lark_tenant_key.as_deref(),
+        Some("2ca1d211f64f6438")
+    );
+    assert_eq!(
+        defaults.feishu_lark_chat_id.as_deref(),
+        Some("oc_5ce6d572455d361153b7xx51da133945")
+    );
+}
+
+#[test]
+fn app_bot_test_notification_body_explains_real_thread_reply_test() {
+    let config = setup::build_feishu_lark_app_bot_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    let body = test_notification_body_for_config(&config);
+
+    assert!(body.contains("confirms the App Bot can send messages"));
+    assert!(body.contains("wait for the next real Codex Desktop completion notification"));
+    assert!(body.contains("Replies to this test message will not continue Codex"));
+}
+
+#[test]
 fn setup_provider_summary_reports_hidden_credentials_without_printing_values() {
     let telegram_config = setup::build_telegram_config(
         setup::AgentIntegrationId::CodexDesktop,

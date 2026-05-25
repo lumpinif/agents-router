@@ -221,6 +221,63 @@ fn writes_parseable_feishu_lark_config() {
 }
 
 #[test]
+fn writes_parseable_feishu_lark_app_bot_config_with_codex_reply_route() {
+    let dir = tempdir().expect("tempdir should be created");
+    let path = dir.path().join("config.toml");
+    let config = build_feishu_lark_app_bot_config(
+        AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    write_config(&path, &config).expect("config should be written");
+
+    let parsed = read_valid_written_config(&path);
+    let provider = parsed
+        .provider("feishu_lark")
+        .expect("App Bot provider should be configured");
+    assert_eq!(provider.mode.as_deref(), Some("app_bot"));
+    assert_eq!(provider.domain.as_deref(), Some("lark"));
+    assert_eq!(
+        provider.app_secret_env.as_deref(),
+        Some("AGENTS_ROUTER_LARK_APP_SECRET")
+    );
+    assert_eq!(provider.tenant_key.as_deref(), Some("2ca1d211f64f6438"));
+    assert_eq!(
+        provider.chat_id.as_deref(),
+        Some("oc_5ce6d572455d361153b7xx51da133945")
+    );
+    assert_eq!(parsed.routes[0].sources, vec!["codex_desktop".to_string()]);
+    assert!(parsed.routes[0].response_surface.enabled);
+    assert_eq!(parsed.routes[1].sources, vec!["agents_router".to_string()]);
+    assert!(!parsed.routes[1].response_surface.enabled);
+}
+
+#[test]
+fn feishu_lark_app_bot_replies_are_not_enabled_for_non_codex_desktop_agents() {
+    let config = build_feishu_lark_app_bot_config(
+        AgentIntegrationId::ClaudeCode,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    assert_eq!(config.routes[0].sources, vec!["claude_code".to_string()]);
+    assert!(!config.routes[0].response_surface.enabled);
+    assert_eq!(config.routes[1].sources, vec!["agents_router".to_string()]);
+    assert!(!config.routes[1].response_surface.enabled);
+}
+
+#[test]
 fn writes_parseable_webhook_config() {
     let dir = tempdir().expect("tempdir should be created");
     let path = dir.path().join("config.toml");
@@ -503,6 +560,32 @@ fn accepts_feishu_and_lark_webhook_urls() {
         resolve_feishu_lark_webhook_url("https://open.larksuite.com/open-apis/bot/v2/hook/abc")
             .expect("Lark webhook should be valid"),
         "https://open.larksuite.com/open-apis/bot/v2/hook/abc"
+    );
+}
+
+#[test]
+fn accepts_feishu_lark_app_bot_setup_fields() {
+    assert_eq!(
+        resolve_feishu_lark_app_domain("lark").expect("lark domain should be valid"),
+        "lark"
+    );
+    assert_eq!(
+        resolve_feishu_lark_app_id("cli_9f5343c580712544").expect("App ID should be valid"),
+        "cli_9f5343c580712544"
+    );
+    assert_eq!(
+        resolve_feishu_lark_app_secret_env("AGENTS_ROUTER_LARK_APP_SECRET")
+            .expect("secret env var name should be valid"),
+        "AGENTS_ROUTER_LARK_APP_SECRET"
+    );
+    assert_eq!(
+        resolve_feishu_lark_tenant_key("2ca1d211f64f6438").expect("tenant_key should be valid"),
+        "2ca1d211f64f6438"
+    );
+    assert_eq!(
+        resolve_feishu_lark_chat_id("oc_5ce6d572455d361153b7xx51da133945")
+            .expect("chat_id should be valid"),
+        "oc_5ce6d572455d361153b7xx51da133945"
     );
 }
 

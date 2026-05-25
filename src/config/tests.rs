@@ -156,7 +156,7 @@ fn route_response_surface_is_disabled_by_default_and_not_serialized() {
 }
 
 #[test]
-fn route_response_surface_toml_is_ignored_until_user_visible_replies_are_available() {
+fn route_response_surface_toml_enables_replies_when_explicit() {
     let raw = r#"
 schema_version = 1
 
@@ -175,11 +175,14 @@ providers = ["debug_webhook"]
 response_surface = { enabled = true }
 "#;
 
-    let loaded = LoadedConfig::from_toml_str(raw)
-        .expect("future response surface TOML should not break current config parsing");
+    let loaded = LoadedConfig::from_toml_str(raw).expect("response surface TOML should parse");
 
-    assert!(!loaded.raw.routes[0].response_surface.enabled);
-    assert!(!loaded.validated.routes[0].response_surface.enabled);
+    assert!(loaded.raw.routes[0].response_surface.enabled);
+    assert!(loaded.validated.routes[0].response_surface.enabled);
+
+    let serialized = toml::to_string_pretty(&loaded.raw).expect("config should serialize");
+    assert!(serialized.contains("response_surface"));
+    assert!(serialized.contains("enabled = true"));
 }
 
 #[test]

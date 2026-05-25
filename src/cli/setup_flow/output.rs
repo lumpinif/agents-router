@@ -168,16 +168,7 @@ pub(in crate::cli) fn setup_provider_summary(provider: &RawProviderConfig) -> Se
                 plain_summary_field("topic", required_summary_string(provider, "topic")),
             ],
         },
-        ProviderType::FeishuLark => SetupProviderSummary {
-            provider_name: "Feishu/Lark custom bot",
-            fields: vec![
-                plain_summary_field("webhook", provider_url_summary(provider)),
-                configured_or_not_summary_field(
-                    "signature verification",
-                    provider_secret_configured(&provider.secret, &provider.secret_env),
-                ),
-            ],
-        },
+        ProviderType::FeishuLark => feishu_lark_setup_provider_summary(provider),
         ProviderType::Webhook => SetupProviderSummary {
             provider_name: "Webhook",
             fields: vec![plain_summary_field(
@@ -315,6 +306,38 @@ pub(in crate::cli) fn plain_summary_field(
     }
 }
 
+fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProviderSummary {
+    if provider.mode.as_deref() == Some("app_bot") {
+        return SetupProviderSummary {
+            provider_name: "Feishu/Lark app bot",
+            fields: vec![
+                plain_summary_field("domain", required_summary_string(provider, "domain")),
+                plain_summary_field("app id", required_summary_string(provider, "app_id")),
+                configured_or_not_summary_field(
+                    "app secret",
+                    provider_secret_configured(&provider.app_secret, &provider.app_secret_env),
+                ),
+                plain_summary_field(
+                    "tenant key",
+                    required_summary_string(provider, "tenant_key"),
+                ),
+                plain_summary_field("chat id", required_summary_string(provider, "chat_id")),
+            ],
+        };
+    }
+
+    SetupProviderSummary {
+        provider_name: "Feishu/Lark custom bot",
+        fields: vec![
+            plain_summary_field("webhook", provider_url_summary(provider)),
+            configured_or_not_summary_field(
+                "signature verification",
+                provider_secret_configured(&provider.secret, &provider.secret_env),
+            ),
+        ],
+    }
+}
+
 pub(in crate::cli) fn configured_or_not_summary_field(
     label: &'static str,
     configured: bool,
@@ -370,8 +393,11 @@ pub(in crate::cli) fn required_summary_string(
 ) -> String {
     let value = match field {
         "base_url" => provider.base_url.as_deref(),
+        "domain" => provider.domain.as_deref(),
         "server" => provider.server.as_deref(),
         "topic" => provider.topic.as_deref(),
+        "app_id" => provider.app_id.as_deref(),
+        "tenant_key" => provider.tenant_key.as_deref(),
         "chat_id" => provider.chat_id.as_deref(),
         "phone_number_id" => provider.phone_number_id.as_deref(),
         "recipient_phone_number" => provider.recipient_phone_number.as_deref(),

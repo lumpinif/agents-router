@@ -15,6 +15,7 @@ Set up the provider first. Then run `agents-router setup`.
 - [ntfy](ntfy.md)
 - [Pushover](pushover.md)
 - [Feishu/Lark Custom Bot](feishu-lark-custom-bot.md)
+- [Feishu/Lark App Bot](feishu-lark-app-bot.md)
 - [Webhook](webhook.md)
 - [WhatsApp](whatsapp.md)
 - [WeChat](wechat.md)

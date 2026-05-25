@@ -33,6 +33,30 @@ pub fn resolve_feishu_lark_secret(input: &str) -> Option<String> {
     }
 }
 
+pub fn resolve_feishu_lark_app_domain(input: &str) -> anyhow::Result<String> {
+    match input.trim() {
+        "feishu" => Ok("feishu".to_string()),
+        "lark" => Ok("lark".to_string()),
+        _ => anyhow::bail!("Feishu/Lark App Bot domain must be `feishu` or `lark`"),
+    }
+}
+
+pub fn resolve_feishu_lark_app_id(input: &str) -> anyhow::Result<String> {
+    resolve_non_empty_no_whitespace("Feishu/Lark App ID", input)
+}
+
+pub fn resolve_feishu_lark_app_secret_env(input: &str) -> anyhow::Result<String> {
+    resolve_non_empty_no_whitespace("Feishu/Lark App Secret env var name", input)
+}
+
+pub fn resolve_feishu_lark_tenant_key(input: &str) -> anyhow::Result<String> {
+    resolve_non_empty_no_whitespace("Feishu/Lark tenant_key", input)
+}
+
+pub fn resolve_feishu_lark_chat_id(input: &str) -> anyhow::Result<String> {
+    resolve_non_empty_no_whitespace("Feishu/Lark chat_id", input)
+}
+
 pub fn resolve_webhook_url(input: &str) -> anyhow::Result<String> {
     validate_custom_webhook_url(input)
 }
@@ -173,6 +197,15 @@ fn resolve_wechat_secret(label: &'static str, input: &str) -> anyhow::Result<Str
     }
 
     Ok(token.to_string())
+}
+
+fn resolve_non_empty_no_whitespace(label: &'static str, input: &str) -> anyhow::Result<String> {
+    let value = input.trim();
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        anyhow::bail!("{label} must be non-empty and must not contain whitespace");
+    }
+
+    Ok(value.to_string())
 }
 
 pub fn resolve_microsoft_teams_webhook_url(input: &str) -> anyhow::Result<String> {

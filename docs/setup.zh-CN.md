@@ -11,7 +11,7 @@ agents-router setup
 如果还没有配置，setup 会显示推荐默认值。如果已经有配置，setup 会用 `Current` 显示当前答案，直接按 Enter 会保留当前值。
 Webhook URL 只显示 host，签名 secret 和私有 provider key 只显示已配置状态，不会把完整敏感内容打印到终端里。
 
-如果要清空飞书/Lark 签名 secret，输入 `none`。
+如果要清空飞书/Lark Custom Bot 签名 secret，输入 `none`。
 
 ## 语言
 
@@ -81,7 +81,7 @@ hot reload 里确保 `~/.claude/settings.json` 有所需 hooks。它会添加 `S
 5. Email SMTP
 6. ntfy
 7. Pushover
-8. Feishu/Lark custom bot
+8. Feishu/Lark
 9. Webhook
 10. WhatsApp
 11. 微信
@@ -99,6 +99,7 @@ Provider 教程：
 - [ntfy](providers/ntfy.zh-CN.md)
 - [Pushover](providers/pushover.zh-CN.md)
 - [飞书/Lark Custom Bot](providers/feishu-lark-custom-bot.zh-CN.md)
+- [飞书/Lark App Bot](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.zh-CN.md)
 - [WhatsApp](providers/whatsapp.zh-CN.md)
 - [微信](providers/wechat.zh-CN.md)

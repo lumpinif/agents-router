@@ -12,7 +12,7 @@ Without an existing config, setup shows recommended defaults. If a config alread
 prints `Current` for existing answers, and pressing Enter keeps the current value. Webhook URLs are
 shown by host only. Signing secrets and private provider keys are shown only as configured.
 
-For a Feishu/Lark signing secret, type `none` to clear the existing secret.
+For a Feishu/Lark Custom Bot signing secret, type `none` to clear the existing secret.
 
 ## Language
 
@@ -82,7 +82,7 @@ Choose where notifications should go:
 5. Email SMTP
 6. ntfy
 7. Pushover
-8. Feishu/Lark custom bot
+8. Feishu/Lark
 9. Webhook
 10. WhatsApp
 11. WeChat
@@ -100,9 +100,22 @@ Provider guides:
 - [ntfy](providers/ntfy.md)
 - [Pushover](providers/pushover.md)
 - [Feishu/Lark Custom Bot](providers/feishu-lark-custom-bot.md)
+- [Feishu/Lark App Bot](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.md)
 - [WhatsApp](providers/whatsapp.md)
 - [WeChat](providers/wechat.md)
+
+When you choose Feishu/Lark, setup asks for the mode:
+
+```text
+Custom Bot Webhook — Stable
+  Send one-way notifications to a group. Fastest setup. No replies.
+
+App Bot — Experimental
+  Send notifications through an app bot. With Codex Desktop, replies in the message thread can continue the original session.
+```
+
+Custom Bot Webhook is the default and keeps the old one-way notification path. App Bot requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, and a published app version. Setup shows only a short checklist and links to the full [Feishu/Lark App Bot guide](providers/feishu-lark-app-bot.md).
 
 ## Provider IDs
 

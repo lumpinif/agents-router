@@ -28,6 +28,31 @@ pub fn build_feishu_lark_config(
     build_config(agent, answer_detail, prompt_detail, vec![provider])
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn build_feishu_lark_app_bot_config(
+    agent: AgentIntegrationId,
+    answer_detail: AnswerDetail,
+    prompt_detail: PromptDetail,
+    domain: &str,
+    app_id: &str,
+    app_secret_env: &str,
+    tenant_key: &str,
+    chat_id: &str,
+) -> RawConfig {
+    let mut provider =
+        RawProviderConfig::new(ProviderType::FeishuLark.as_str(), ProviderType::FeishuLark);
+    provider.mode = Some("app_bot".to_string());
+    provider.domain = Some(domain.to_string());
+    provider.app_id = Some(app_id.to_string());
+    provider.app_secret_env = Some(app_secret_env.to_string());
+    provider.tenant_key = Some(tenant_key.to_string());
+    provider.chat_id = Some(chat_id.to_string());
+
+    let mut config = build_config(agent, answer_detail, prompt_detail, vec![provider]);
+    enable_codex_desktop_reply_route_for_app_bot(&mut config, agent);
+    config
+}
+
 pub fn build_webhook_config(
     agent: AgentIntegrationId,
     answer_detail: AnswerDetail,
@@ -236,5 +261,20 @@ fn build_config(
             RouteConfig::new(vec![agent_source_id], provider_ids.clone()),
             RouteConfig::new(vec!["agents_router".to_string()], provider_ids),
         ],
+    }
+}
+
+fn enable_codex_desktop_reply_route_for_app_bot(config: &mut RawConfig, agent: AgentIntegrationId) {
+    if agent != AgentIntegrationId::CodexDesktop {
+        return;
+    }
+
+    let source_id = agent.source_id();
+    if let Some(route) = config
+        .routes
+        .iter_mut()
+        .find(|route| route.sources.iter().any(|source| source == source_id))
+    {
+        route.response_surface.enabled = true;
     }
 }

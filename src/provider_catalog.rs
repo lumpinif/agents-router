@@ -449,7 +449,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     },
     ProviderDescriptor {
         provider_type: ProviderType::FeishuLark,
-        display_name: "Feishu/Lark custom bot",
+        display_name: "Feishu/Lark",
         setup_order: 80,
         capabilities: ProviderCapabilities {
             message_constraints: NO_MESSAGE_CONSTRAINTS,

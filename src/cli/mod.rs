@@ -476,6 +476,7 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
     let agents = configured_agents(config);
     let subscriptions = setup::ntfy_subscriptions(config);
     let feishu_lark_targets = setup::feishu_lark_targets(config);
+    let feishu_lark_app_bot_targets = setup::feishu_lark_app_bot_targets(config);
     let webhook_targets = setup::webhook_targets(config);
     let pushover_targets = setup::pushover_targets(config);
     let slack_targets = setup::slack_targets(config);
@@ -524,6 +525,25 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
                     style(i18n.text(Text::NotConfigured)).yellow()
                 },
             );
+        }
+    }
+
+    if !feishu_lark_app_bot_targets.is_empty() {
+        print_section("Feishu/Lark app bot");
+        for target in &feishu_lark_app_bot_targets {
+            print_field("provider", &target.provider_id);
+            print_field("domain", &target.domain);
+            print_field("app id", &target.app_id);
+            print_field(
+                "app secret",
+                if target.app_secret_env.is_some() {
+                    style(i18n.text(Text::Configured)).green()
+                } else {
+                    style(i18n.text(Text::NotConfigured)).yellow()
+                },
+            );
+            print_field("tenant key", &target.tenant_key);
+            print_field("chat id", &target.chat_id);
         }
     }
 
@@ -838,6 +858,7 @@ fn cleanup_legacy_background_service() -> anyhow::Result<()> {
 async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<()> {
     let endpoint = ingress_endpoint()?;
     wait_for_service(&endpoint).await?;
+    let mut test_body = default_test_notification_body();
 
     match setup {
         GuidedSetup::Ntfy { agent, topic } => {
@@ -851,10 +872,25 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
             wait_for_enter(i18n.text(Text::SendTestPromptNtfy))?;
             print_source_integration_setup_note(agent, i18n);
         }
-        GuidedSetup::FeishuLark { agent } => {
+        GuidedSetup::FeishuLark { agent, mode } => {
             println!();
             println!("{}", i18n.text(Text::NextFeishuLark));
-            wait_for_enter(i18n.text(Text::SendTestPromptFeishuLark))?;
+            match mode {
+                FeishuLarkSetupMode::CustomBotWebhook => {
+                    wait_for_enter(i18n.text(Text::SendTestPromptFeishuLark))?;
+                }
+                FeishuLarkSetupMode::AppBot => {
+                    let prompt =
+                        localized(i18n, "Send a test message now?", "现在发送一条测试消息？");
+                    if !prompt_confirm(prompt, true)? {
+                        println!("{}", setup::TEST_NOTIFICATION_SKIPPED_MESSAGE);
+                        print_source_integration_setup_note(agent, i18n);
+                        println!("{}", style(i18n.text(Text::SetupComplete)).green());
+                        return Ok(());
+                    }
+                    test_body = feishu_lark_app_bot_test_notification_body();
+                }
+            }
             print_source_integration_setup_note(agent, i18n);
         }
         GuidedSetup::Webhook { agent } => {
@@ -913,7 +949,7 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
         }
     }
 
-    send_test_notification().await?;
+    send_test_notification_with_body(test_body).await?;
 
     println!("{}", style(i18n.text(Text::TestSent)).green());
     if prompt_confirm(i18n.text(Text::DidItArrive), true)? {
@@ -1038,7 +1074,7 @@ async fn offer_test_notification(config: &RawConfig, i18n: I18n) -> anyhow::Resu
         return Ok(());
     }
 
-    send_test_notification().await?;
+    send_test_notification_with_body(test_notification_body_for_config(config)).await?;
     println!("{}", style(i18n.text(Text::TestSent)).green());
     if prompt_confirm(i18n.text(Text::DidItArrive), true)? {
         println!("{}", style(i18n.text(Text::Working)).green());
@@ -1156,17 +1192,13 @@ fn print_local_source_integration_report(report: &LocalSourceIntegrationReport, 
     }
 }
 
-async fn send_test_notification() -> anyhow::Result<()> {
+async fn send_test_notification_with_body(body: &'static str) -> anyhow::Result<()> {
     let endpoint = ingress_endpoint()?;
     wait_for_service(&endpoint).await?;
 
     let report = local_ingress::submit_event_report(
         &endpoint,
-        &LocalSignalEvent::new(
-            "agents_router",
-            "Agents Router",
-            "Test notification from your computer. If this arrived, Agents Router is working.",
-        ),
+        &LocalSignalEvent::new("agents_router", "Agents Router", body),
     )
     .await
     .context("failed to send test notification through the local service")?;
@@ -1178,6 +1210,25 @@ async fn send_test_notification() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn default_test_notification_body() -> &'static str {
+    "Test notification from your computer. If this arrived, Agents Router is working."
+}
+
+fn test_notification_body_for_config(config: &RawConfig) -> &'static str {
+    if config.providers.iter().any(|provider| {
+        provider.provider_type == ProviderType::FeishuLark
+            && provider.mode.as_deref() == Some("app_bot")
+    }) {
+        feishu_lark_app_bot_test_notification_body()
+    } else {
+        default_test_notification_body()
+    }
+}
+
+fn feishu_lark_app_bot_test_notification_body() -> &'static str {
+    "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nTo test thread replies, wait for the next real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex."
 }
 
 async fn wait_for_service(endpoint: &agents_router::paths::IngressEndpoint) -> anyhow::Result<()> {

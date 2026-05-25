@@ -568,7 +568,10 @@ pub struct RouteConfig {
     pub minimum_task_duration_minutes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub only_forward_from_project_paths: Vec<String>,
-    #[serde(skip)]
+    #[serde(
+        default,
+        skip_serializing_if = "ResponseSurfaceRouteConfig::is_disabled"
+    )]
     pub response_surface: ResponseSurfaceRouteConfig,
 }
 

@@ -218,17 +218,16 @@ fn agent_controller_runtime_does_not_define_agent_support_facts() {
 }
 
 #[test]
-fn setup_paths_do_not_expose_response_surface_controls() {
+fn setup_paths_do_not_expose_manual_response_surface_controls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    collect_rust_files(&root.join("src/setup"), &mut files);
     collect_rust_files(&root.join("src/cli"), &mut files);
 
     for file in files {
         let content = production_rust_content(&file);
         assert!(
-            !content.contains("response_surface"),
-            "`{}` references `response_surface`; Step 2 must not expose replies in setup or CLI flows",
+            !content.contains("Enable replies") && !content.contains("Save this setup?"),
+            "`{}` exposes manual reply/setup controls; setup must derive App Bot replies from the selected agent/provider route without a second user-facing switch",
             file.strip_prefix(&root).unwrap_or(&file).display()
         );
     }

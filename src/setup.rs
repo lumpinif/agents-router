@@ -57,6 +57,16 @@ pub struct FeishuLarkTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuLarkAppBotTarget {
+    pub provider_id: String,
+    pub domain: String,
+    pub app_id: String,
+    pub app_secret_env: Option<String>,
+    pub tenant_key: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookTarget {
     pub provider_id: String,
     pub webhook_host: String,
