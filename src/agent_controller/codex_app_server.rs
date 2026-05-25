@@ -208,13 +208,14 @@ async fn continue_session_with_connection(
         event.hash = %request.provider_event_id_hash,
         event = "codex_app_server.thread_read.succeeded",
     );
-    match thread_status {
-        CodexThreadStatus::Idle => {}
+    match &thread_status {
+        CodexThreadStatus::Idle | CodexThreadStatus::Loadable(_) => {}
         CodexThreadStatus::Active(status) => {
             warn!(
                 surface.id = %request.surface_id,
                 source.session.id = %request.source_session_id,
                 thread.status = %status,
+                thread.stage = "thread_read",
                 event.hash = %request.provider_event_id_hash,
                 event = "codex_app_server.thread_active.fail_closed",
             );
@@ -229,8 +230,9 @@ async fn continue_session_with_connection(
                 surface.id = %request.surface_id,
                 source.session.id = %request.source_session_id,
                 thread.status = %status,
+                thread.stage = "thread_read",
                 event.hash = %request.provider_event_id_hash,
-                event = "codex_app_server.thread_not_idle.fail_closed",
+                event = "codex_app_server.thread_not_continuable.fail_closed",
             );
             return Err(AgentControllerError::failed_before_submit(
                 request,
@@ -238,9 +240,31 @@ async fn continue_session_with_connection(
                 format!("Codex App Server thread status `{status}` is not continuable"),
             ));
         }
+        CodexThreadStatus::Missing => {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.status = "missing",
+                thread.stage = "thread_read",
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_not_continuable.fail_closed",
+            );
+            return Err(AgentControllerError::failed_before_submit(
+                request,
+                AgentControllerErrorKind::SessionNotContinuable,
+                "Codex App Server thread/read response did not include thread status",
+            ));
+        }
     }
 
     let thread_resume_started_at = Instant::now();
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        thread.read.status = %thread_status.as_log_value(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.thread_resume.started",
+    );
     let resume_result = send_request(
         connection,
         request,
@@ -254,14 +278,57 @@ async fn continue_session_with_connection(
         None,
     )
     .await?;
-    ensure_resumed_thread_matches_request(request, &resume_result)?;
+    let post_resume_status = ensure_resumed_thread_matches_request(request, &resume_result)?;
     info!(
         surface.id = %request.surface_id,
         source.session.id = %request.source_session_id,
+        thread.post_resume.status = %post_resume_status.as_log_value(),
         elapsed.ms = thread_resume_started_at.elapsed().as_millis(),
         event.hash = %request.provider_event_id_hash,
         event = "codex_app_server.thread_resume.succeeded",
     );
+    match &post_resume_status {
+        CodexThreadStatus::Idle => {}
+        CodexThreadStatus::Missing => {
+            info!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.post_resume.status = "missing",
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_resume.status_missing_allowed",
+            );
+        }
+        CodexThreadStatus::Active(status) => {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.status = %status,
+                thread.stage = "thread_resume",
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_active.fail_closed",
+            );
+            return Err(AgentControllerError::failed_before_submit(
+                request,
+                AgentControllerErrorKind::SessionActive,
+                "original Codex session is currently active",
+            ));
+        }
+        CodexThreadStatus::Loadable(status) | CodexThreadStatus::Other(status) => {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.status = %status,
+                thread.stage = "thread_resume",
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_not_continuable.fail_closed",
+            );
+            return Err(AgentControllerError::failed_before_submit(
+                request,
+                AgentControllerErrorKind::SessionNotContinuable,
+                format!("Codex App Server post-resume thread status `{status}` is not continuable"),
+            ));
+        }
+    }
 
     let mut turn_state = TurnStartState::new(request.source_session_id.clone());
     let turn_start_started_at = Instant::now();
@@ -509,45 +576,10 @@ async fn read_message(
 fn ensure_resumed_thread_matches_request(
     request: &AgentControllerRequest,
     resume_result: &Value,
-) -> Result<(), AgentControllerError> {
-    let thread = resume_result.get("thread").ok_or_else(|| {
-        AgentControllerError::failed_before_submit(
-            request,
-            AgentControllerErrorKind::SessionNotContinuable,
-            "Codex App Server thread/resume response did not include thread facts",
-        )
-    })?;
-    let thread_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
-        AgentControllerError::failed_before_submit(
-            request,
-            AgentControllerErrorKind::SessionNotContinuable,
-            "Codex App Server thread/resume response did not include thread.id",
-        )
-    })?;
-
-    if thread_id != request.source_session_id {
-        return Err(AgentControllerError::failed_before_submit(
-            request,
-            AgentControllerErrorKind::SessionNotContinuable,
-            format!(
-                "Codex App Server resumed thread `{thread_id}` instead of requested source session"
-            ),
-        ));
-    }
-
-    if let Some(session_id) = thread.get("sessionId").and_then(Value::as_str)
-        && session_id != request.source_session_id
-    {
-        return Err(AgentControllerError::failed_before_submit(
-            request,
-            AgentControllerErrorKind::SessionNotContinuable,
-            format!(
-                "Codex App Server resumed session `{session_id}` instead of requested source session"
-            ),
-        ));
-    }
-
-    Ok(())
+) -> Result<CodexThreadStatus, AgentControllerError> {
+    let thread = thread_from_result(request, resume_result, "thread/resume")?;
+    ensure_thread_identity_matches_request(request, thread, "resume")?;
+    Ok(codex_thread_status(thread))
 }
 
 fn ensure_read_thread_matches_request(
@@ -614,7 +646,9 @@ fn ensure_thread_identity_matches_request(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexThreadStatus {
     Idle,
+    Loadable(String),
     Active(String),
+    Missing,
     Other(String),
 }
 
@@ -622,24 +656,25 @@ impl CodexThreadStatus {
     fn as_log_value(&self) -> &str {
         match self {
             Self::Idle => "idle",
-            Self::Active(status) | Self::Other(status) => status,
+            Self::Missing => "missing",
+            Self::Loadable(status) | Self::Active(status) | Self::Other(status) => status,
         }
     }
 }
 
 fn codex_thread_status(thread: &Value) -> CodexThreadStatus {
-    let status = thread
-        .get("status")
-        .and_then(|status| {
-            status
-                .get("type")
-                .and_then(Value::as_str)
-                .or_else(|| status.as_str())
-        })
-        .unwrap_or("missing");
+    let Some(status) = thread.get("status").and_then(|status| {
+        status
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| status.as_str())
+    }) else {
+        return CodexThreadStatus::Missing;
+    };
 
     match status {
         "idle" => CodexThreadStatus::Idle,
+        "notLoaded" => CodexThreadStatus::Loadable(status.to_string()),
         "active" | "busy" | "generating" | "running" | "working" => {
             CodexThreadStatus::Active(status.to_string())
         }
@@ -979,6 +1014,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn not_loaded_thread_resumes_to_idle_before_turn_start() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "notLoaded"),
+            thread_resume_response(3, Some("idle")),
+            response(4, json!({"turn": {"id": "turn-2"}})),
+            notification(
+                "item/completed",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-2",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item-2",
+                        "phase": "final_answer",
+                        "text": "loaded result"
+                    }
+                }),
+            ),
+        ]);
+        let request = controller_request("continue");
+
+        let result = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect("notLoaded thread should be resumed before turn/start");
+
+        assert_eq!(result.result_text(), "loaded result");
+        assert_eq!(connection.sent_json(2)["method"], "thread/read");
+        assert_eq!(connection.sent_json(3)["method"], "thread/resume");
+        assert_eq!(connection.sent_json(4)["method"], "turn/start");
+    }
+
+    #[tokio::test]
+    async fn not_loaded_thread_resumes_with_missing_post_resume_status_before_turn_start() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "notLoaded"),
+            response(
+                3,
+                json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
+            ),
+            response(4, json!({"turn": {"id": "turn-2"}})),
+            notification(
+                "item/completed",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-2",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item-2",
+                        "phase": "final_answer",
+                        "text": "loaded result"
+                    }
+                }),
+            ),
+        ]);
+        let request = controller_request("continue");
+
+        let result = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect("notLoaded thread should be resumed before turn/start");
+
+        assert_eq!(result.result_text(), "loaded result");
+        assert_eq!(connection.sent_json(2)["method"], "thread/read");
+        assert_eq!(connection.sent_json(3)["method"], "thread/resume");
+        assert_eq!(connection.sent_json(4)["method"], "turn/start");
+    }
+
+    #[tokio::test]
+    async fn not_loaded_thread_resume_active_fails_before_turn_start() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "notLoaded"),
+            thread_resume_response(3, Some("active")),
+        ]);
+        let request = controller_request("continue");
+
+        let error = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect_err("post-resume active thread should fail before turn/start");
+
+        assert_eq!(error.kind, AgentControllerErrorKind::SessionActive);
+        assert_eq!(
+            error.submit_boundary,
+            crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
+        );
+        assert_eq!(connection.sent_len(), 4);
+        assert_eq!(connection.sent_json(3)["method"], "thread/resume");
+    }
+
+    #[tokio::test]
+    async fn not_loaded_thread_resume_not_ready_status_fails_before_turn_start() {
+        for status in ["notLoaded", "systemError", "unknown"] {
+            let mut connection = FakeAppServerConnection::new(vec![
+                response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+                thread_read_response(2, "notLoaded"),
+                thread_resume_response(3, Some(status)),
+            ]);
+            let request = controller_request("continue");
+
+            let error = continue_session_with_connection(&mut connection, &request)
+                .await
+                .expect_err("post-resume not-ready status should fail before turn/start");
+
+            assert_eq!(error.kind, AgentControllerErrorKind::SessionNotContinuable);
+            assert_eq!(
+                error.submit_boundary,
+                crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
+            );
+            assert_eq!(connection.sent_len(), 4, "status {status}");
+            assert_eq!(connection.sent_json(3)["method"], "thread/resume");
+        }
+    }
+
+    #[tokio::test]
     async fn turn_start_rpc_error_is_after_possible_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
@@ -1237,16 +1387,27 @@ mod tests {
     }
 
     fn thread_read_response(id: u64, status: &str) -> String {
+        thread_response(id, Some(status))
+    }
+
+    fn thread_resume_response(id: u64, status: Option<&str>) -> String {
+        thread_response(id, status)
+    }
+
+    fn thread_response(id: u64, status: Option<&str>) -> String {
+        let mut thread = json!({
+            "id": "session-1",
+            "sessionId": "session-1",
+        });
+        if let Some(status) = status {
+            thread["status"] = json!({
+                "type": status
+            });
+        }
         response(
             id,
             json!({
-                "thread": {
-                    "id": "session-1",
-                    "sessionId": "session-1",
-                    "status": {
-                        "type": status
-                    }
-                }
+                "thread": thread
             }),
         )
     }
