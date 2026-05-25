@@ -5,13 +5,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
     AgentControllerAdapter, AgentControllerError, AgentControllerErrorKind, AgentControllerFuture,
-    AgentControllerRequest, AgentControllerSuccess,
+    AgentControllerRequest, AgentControllerSubmitObserver, AgentControllerSuccess,
 };
 use crate::agent_integration_catalog::AgentControllerKind;
+
+const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct CodexAppServerController {
@@ -61,6 +64,18 @@ impl AgentControllerAdapter for CodexAppServerController {
         request: AgentControllerRequest,
     ) -> AgentControllerFuture<'a> {
         Box::pin(async move {
+            let submit_observer = NoopSubmitObserver;
+            self.continue_session_with_submit_observer(request, &submit_observer)
+                .await
+        })
+    }
+
+    fn continue_session_with_submit_observer<'a>(
+        &'a self,
+        request: AgentControllerRequest,
+        submit_observer: &'a dyn AgentControllerSubmitObserver,
+    ) -> AgentControllerFuture<'a> {
+        Box::pin(async move {
             let mut connection = ProcessAppServerConnection::spawn(&self.command)
                 .await
                 .map_err(|message| {
@@ -71,10 +86,21 @@ impl AgentControllerAdapter for CodexAppServerController {
                     )
                 })?;
 
-            let result = continue_session_with_connection(&mut connection, &request).await;
+            let result =
+                continue_session_with_connection(&mut connection, &request, submit_observer).await;
             connection.shutdown().await;
             result
         })
+    }
+}
+
+struct NoopSubmitObserver;
+
+impl AgentControllerSubmitObserver for NoopSubmitObserver {
+    fn submitted_possible<'a>(
+        &'a self,
+    ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -142,6 +168,7 @@ impl AppServerConnection for ProcessAppServerConnection {
 async fn continue_session_with_connection(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
+    submit_observer: &dyn AgentControllerSubmitObserver,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
     let controller_started_at = Instant::now();
     info!(
@@ -365,13 +392,31 @@ async fn continue_session_with_connection(
         event.hash = %request.provider_event_id_hash,
         event = "codex_app_server.turn_start.accepted",
     );
+    submit_observer
+        .submitted_possible()
+        .await
+        .map_err(|error| {
+            error_after_possible_submit(
+                request,
+                AgentControllerErrorKind::Internal,
+                format!("failed to record submitted continuation boundary: {error}"),
+            )
+        })?;
 
-    wait_for_final_answer(connection, request, &mut turn_state, controller_started_at).await
+    wait_for_final_answer(
+        connection,
+        request,
+        &mut next_request_id,
+        &mut turn_state,
+        controller_started_at,
+    )
+    .await
 }
 
 async fn wait_for_final_answer(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
+    next_request_id: &mut u64,
     turn_state: &mut TurnStartState,
     controller_started_at: Instant,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
@@ -424,10 +469,69 @@ async fn wait_for_final_answer(
             ));
         }
 
-        let message =
-            read_message(connection, request, SubmitBoundary::AfterPossibleSubmit).await?;
+        // This is not an agent execution timeout. The router does not decide
+        // that a long Codex turn failed because time passed. The timer only
+        // gives the controller a chance to read official thread status when
+        // the app-server stream is quiet.
+        let message = match timeout(
+            TURN_STATUS_POLL_INTERVAL,
+            read_message(connection, request, SubmitBoundary::AfterPossibleSubmit),
+        )
+        .await
+        {
+            Ok(message) => message?,
+            Err(_) => {
+                poll_turn_status_from_thread_snapshot(
+                    connection,
+                    request,
+                    next_request_id,
+                    turn_state,
+                    controller_started_at,
+                )
+                .await?;
+                continue;
+            }
+        };
         turn_state.observe(&message);
     }
+}
+
+async fn poll_turn_status_from_thread_snapshot(
+    connection: &mut impl AppServerConnection,
+    request: &AgentControllerRequest,
+    next_request_id: &mut u64,
+    turn_state: &mut TurnStartState,
+    controller_started_at: Instant,
+) -> Result<(), AgentControllerError> {
+    let poll_started_at = Instant::now();
+    let snapshot = send_request(
+        connection,
+        request,
+        next_request_id,
+        "thread/resume",
+        json!({
+            "threadId": request.source_session_id,
+        }),
+        SubmitBoundary::AfterPossibleSubmit,
+        Some(turn_state),
+    )
+    .await?;
+    let post_resume_status = ensure_resumed_thread_matches_request(request, &snapshot)?;
+    turn_state.observe_thread_snapshot(&snapshot);
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        thread.post_resume.status = %post_resume_status.as_log_value(),
+        turn.id = turn_state.turn_id.as_deref(),
+        turn.status = turn_state.last_observed_turn_status.as_deref(),
+        final_answer.observed = turn_state.final_answer.is_some(),
+        turn.terminal = turn_state.turn_completed,
+        elapsed.ms = controller_started_at.elapsed().as_millis(),
+        poll.elapsed.ms = poll_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.turn_status.polled",
+    );
+    Ok(())
 }
 
 async fn send_request(
@@ -759,6 +863,7 @@ struct TurnStartState {
     final_answer: Option<String>,
     error_message: Option<String>,
     turn_completed: bool,
+    last_observed_turn_status: Option<String>,
 }
 
 impl TurnStartState {
@@ -769,6 +874,7 @@ impl TurnStartState {
             final_answer: None,
             error_message: None,
             turn_completed: false,
+            last_observed_turn_status: None,
         }
     }
 
@@ -861,6 +967,33 @@ impl TurnStartState {
         }
     }
 
+    fn observe_thread_snapshot(&mut self, snapshot: &Value) {
+        let Some(turn_id) = self.turn_id.as_deref() else {
+            return;
+        };
+        let Some(turn) = turns_from_snapshot(snapshot)
+            .into_iter()
+            .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        else {
+            return;
+        };
+
+        self.last_observed_turn_status = turn_status_from_value(turn).map(str::to_string);
+        if let Some(final_answer) = final_answer_from_items(turn.get("items")) {
+            self.final_answer = Some(final_answer.to_string());
+            self.turn_completed = true;
+            return;
+        }
+
+        if self
+            .last_observed_turn_status
+            .as_deref()
+            .is_some_and(is_terminal_turn_status)
+        {
+            self.turn_completed = true;
+        }
+    }
+
     fn matches_thread(&self, params: &Value) -> bool {
         notification_thread_id(params) == Some(self.thread_id.as_str())
     }
@@ -909,16 +1042,63 @@ fn turn_id_from_value(value: &Value) -> Option<&str> {
 }
 
 fn notification_thread_id(params: &Value) -> Option<&str> {
-    params.get("threadId").and_then(Value::as_str)
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("thread_id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn notification_turn_id(params: &Value) -> Option<&str> {
-    params.get("turnId").and_then(Value::as_str).or_else(|| {
-        params
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-    })
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("turn_id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn turns_from_snapshot(snapshot: &Value) -> Vec<&Value> {
+    snapshot
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .map(|turns| turns.iter().collect())
+        .unwrap_or_default()
+}
+
+fn turn_status_from_value(turn: &Value) -> Option<&str> {
+    let status = turn.get("status")?;
+    status
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| status.as_str())
+}
+
+fn final_answer_from_items(items: Option<&Value>) -> Option<&str> {
+    items?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .filter(|item| item.get("phase").and_then(Value::as_str) == Some("final_answer"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .next_back()
+}
+
+fn is_terminal_turn_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "interrupted" | "errored" | "failed" | "cancelled" | "canceled" | "aborted"
+    )
 }
 
 #[cfg(test)]
@@ -928,6 +1108,14 @@ mod tests {
 
     use super::*;
     use crate::config::SourceType;
+
+    async fn continue_session_with_connection(
+        connection: &mut impl AppServerConnection,
+        request: &AgentControllerRequest,
+    ) -> Result<AgentControllerSuccess, AgentControllerError> {
+        let submit_observer = NoopSubmitObserver;
+        super::continue_session_with_connection(connection, request, &submit_observer).await
+    }
 
     #[tokio::test]
     async fn success_path_returns_final_answer_text_without_rewriting() {
@@ -1292,6 +1480,124 @@ mod tests {
         assert_eq!(
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
+        );
+    }
+
+    #[tokio::test]
+    async fn snake_case_notification_ids_match_current_turn() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
+            response(
+                3,
+                json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
+            ),
+            response(4, json!({"turn": {"id": "turn-current"}})),
+            notification(
+                "item/completed",
+                json!({
+                    "thread_id": "session-1",
+                    "turn_id": "turn-current",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-final",
+                        "phase": "final_answer",
+                        "text": "snake case final"
+                    },
+                    "completedAtMs": 1779528751002i64
+                }),
+            ),
+        ]);
+        let request = controller_request("continue");
+
+        let result = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect("snake_case ids should match current turn");
+
+        assert_eq!(result.result_text(), "snake case final");
+    }
+
+    #[test]
+    fn thread_snapshot_final_answer_marks_current_turn_done() {
+        let mut state = TurnStartState::new("session-1".to_string());
+        state.turn_id = Some("turn-current".to_string());
+
+        state.observe_thread_snapshot(&json!({
+            "thread": {
+                "id": "session-1",
+                "sessionId": "session-1",
+                "status": "idle",
+                "turns": [
+                    {
+                        "id": "turn-other",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "wrong answer"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "turn-current",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "commentary",
+                                "text": "progress"
+                            },
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "snapshot final"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(state.final_answer.as_deref(), Some("snapshot final"));
+        assert!(state.turn_completed);
+        assert_eq!(
+            state.last_observed_turn_status.as_deref(),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn thread_snapshot_terminal_without_final_marks_current_turn_done() {
+        let mut state = TurnStartState::new("session-1".to_string());
+        state.turn_id = Some("turn-current".to_string());
+
+        state.observe_thread_snapshot(&json!({
+            "thread": {
+                "id": "session-1",
+                "sessionId": "session-1",
+                "status": "idle",
+                "turns": [
+                    {
+                        "id": "turn-current",
+                        "status": "interrupted",
+                        "items": [
+                            {
+                                "type": "agentMessage",
+                                "phase": "commentary",
+                                "text": "partial"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(state.final_answer, None);
+        assert!(state.turn_completed);
+        assert_eq!(
+            state.last_observed_turn_status.as_deref(),
+            Some("interrupted")
         );
     }
 

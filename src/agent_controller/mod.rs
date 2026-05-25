@@ -37,10 +37,26 @@ pub type ProviderThreadReplyFuture<'a> = Pin<
     >,
 >;
 
+pub type AgentControllerSubmitFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
 pub trait AgentControllerAdapter: Send + Sync {
     fn controller_kind(&self) -> AgentControllerKind;
     fn continue_session<'a>(&'a self, request: AgentControllerRequest)
     -> AgentControllerFuture<'a>;
+
+    fn continue_session_with_submit_observer<'a>(
+        &'a self,
+        request: AgentControllerRequest,
+        submit_observer: &'a dyn AgentControllerSubmitObserver,
+    ) -> AgentControllerFuture<'a> {
+        let _ = submit_observer;
+        self.continue_session(request)
+    }
+}
+
+pub trait AgentControllerSubmitObserver: Send + Sync {
+    fn submitted_possible<'a>(&'a self) -> AgentControllerSubmitFuture<'a>;
 }
 
 pub trait ProviderThreadReplyAdapter: Send + Sync {
@@ -375,20 +391,96 @@ impl<'a> AgentControllerRuntime<'a> {
         agent_integration_override: Option<AgentIntegrationDescriptor>,
         provider_capability_override: Option<&'static ProviderModeCapability>,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
-        let decision = self
-            .run_claimed_inbound_continuation_with_policy_facts(
-                config,
-                ready.clone(),
-                agent_integration_override,
-                provider_capability_override,
-            )
-            .await?;
+        let prepared = self.prepare_inbound_continuation(
+            config,
+            &ready,
+            agent_integration_override,
+            provider_capability_override,
+        );
 
-        let outcome = match decision {
-            AgentControllerRuntimeDecision::Executed(execution) => {
-                AgentControllerClosedLoopOutcome::ControllerSucceeded(execution)
+        let (request, adapter) = match prepared {
+            PreparedInboundContinuation::Ready { request, adapter } => (request, adapter),
+            PreparedInboundContinuation::Failed(error) => {
+                return send_reply_and_record_status_with_store(
+                    ledger_store,
+                    &ready,
+                    provider_reply,
+                    AgentControllerClosedLoopOutcome::ControllerFailed(error),
+                    InboundEventDedupStatus::FailedNotified,
+                    now,
+                )
+                .await;
             }
-            AgentControllerRuntimeDecision::Failed(error) => {
+            PreparedInboundContinuation::Skipped(reason) => {
+                ledger_store
+                    .update(|ledger| {
+                        release_inbound_claim(ledger, &ready)?;
+                        Ok(())
+                    })
+                    .await?;
+                return Ok(AgentControllerClosedLoopDecision::Skipped(reason));
+            }
+        };
+
+        info!(
+            surface.id = %ready.surface.surface_id,
+            source.id = %request.source_id,
+            source.type = %request.source_type.as_str(),
+            source.session.id = %request.source_session_id,
+            controller.kind = ?request.controller_kind,
+            event.hash = %request.provider_event_id_hash,
+            event = "agent_controller.continuation.started",
+        );
+        let submit_observer = StoreSubmittedPossibleObserver {
+            ledger_store,
+            ready: &ready,
+            now,
+        };
+        let outcome = match adapter
+            .continue_session_with_submit_observer(request.clone(), &submit_observer)
+            .await
+        {
+            Ok(result) => match controller_execution_from_success(&request, &ready, result) {
+                Ok(execution) => {
+                    info!(
+                        surface.id = %ready.surface.surface_id,
+                        source.session.id = %request.source_session_id,
+                        controller.kind = ?request.controller_kind,
+                        event.hash = %request.provider_event_id_hash,
+                        event = "agent_controller.continuation.executed",
+                    );
+                    AgentControllerClosedLoopOutcome::ControllerSucceeded(execution)
+                }
+                Err(error) => {
+                    warn!(
+                        surface.id = %ready.surface.surface_id,
+                        source.session.id = %request.source_session_id,
+                        controller.kind = ?request.controller_kind,
+                        controller.error.kind = ?error.kind,
+                        submit.boundary = ?error.submit_boundary,
+                        event.hash = %request.provider_event_id_hash,
+                        event = "agent_controller.continuation.failed",
+                    );
+                    return send_submitted_unknown_notice_with_store(
+                        ledger_store,
+                        &ready,
+                        provider_reply,
+                        error,
+                        now,
+                    )
+                    .await;
+                }
+            },
+            Err(error) => {
+                warn!(
+                    surface.id = %ready.surface.surface_id,
+                    source.session.id = %request.source_session_id,
+                    controller.kind = ?request.controller_kind,
+                    controller.error.kind = ?error.kind,
+                    submit.boundary = ?error.submit_boundary,
+                    event.hash = %request.provider_event_id_hash,
+                    event = "agent_controller.continuation.failed",
+                );
                 if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
                 {
                     return send_reply_and_record_status_with_store(
@@ -409,15 +501,6 @@ impl<'a> AgentControllerRuntime<'a> {
                     now,
                 )
                 .await;
-            }
-            AgentControllerRuntimeDecision::Skipped(reason) => {
-                ledger_store
-                    .update(|ledger| {
-                        release_inbound_claim(ledger, &ready)?;
-                        Ok(())
-                    })
-                    .await?;
-                return Ok(AgentControllerClosedLoopDecision::Skipped(reason));
             }
         };
 
@@ -712,6 +795,20 @@ impl ProviderThreadReplyError {
             provider_event_id_hash: ready.provider_event_id_hash.clone(),
             message: message.into(),
         }
+    }
+}
+
+struct StoreSubmittedPossibleObserver<'a> {
+    ledger_store: &'a ResponseSurfaceLedgerStore,
+    ready: &'a ProviderInboundReady,
+    now: DateTime<Utc>,
+}
+
+impl AgentControllerSubmitObserver for StoreSubmittedPossibleObserver<'_> {
+    fn submitted_possible<'a>(&'a self) -> AgentControllerSubmitFuture<'a> {
+        Box::pin(async move {
+            record_submitted_possible_with_store(self.ledger_store, self.ready, self.now).await
+        })
     }
 }
 
@@ -1260,6 +1357,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use chrono::{Duration, TimeZone, Utc};
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
     use crate::agent_integration_catalog::{
@@ -1678,6 +1776,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_closed_loop_records_submitted_possible_at_submit_boundary() {
+        let (_dir, ledger_store, ready) = ledger_store_and_ready_with_claim().await;
+        let adapter = SubmittedThenPendingAdapter::default();
+        let provider_reply = RecordingProviderThreadReplyAdapter::default();
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runtime.run_claimed_inbound_continuation_closed_loop_with_store(
+                &enabled_config(),
+                &ledger_store,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "controller intentionally remains pending");
+        let mut ledger = ResponseSurfaceLedger::load(ledger_store.state_path().to_path_buf())
+            .expect("ledger should load");
+        assert_event_is_submitted_possible(&mut ledger, ready);
+        assert_eq!(adapter.requests().len(), 1);
+        assert!(provider_reply.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn closed_loop_sends_agent_result_text_before_processed() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::with_success_message("agent final result");
@@ -1991,6 +2118,57 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct SubmittedThenPendingAdapter {
+        requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
+    }
+
+    impl SubmittedThenPendingAdapter {
+        fn requests(&self) -> Vec<AgentControllerRequest> {
+            self.requests
+                .lock()
+                .expect("requests mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl AgentControllerAdapter for SubmittedThenPendingAdapter {
+        fn controller_kind(&self) -> AgentControllerKind {
+            AgentControllerKind::CodexAppServer
+        }
+
+        fn continue_session<'a>(
+            &'a self,
+            request: AgentControllerRequest,
+        ) -> AgentControllerFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("requests mutex should not be poisoned")
+                    .push(request);
+                std::future::pending().await
+            })
+        }
+
+        fn continue_session_with_submit_observer<'a>(
+            &'a self,
+            request: AgentControllerRequest,
+            submit_observer: &'a dyn AgentControllerSubmitObserver,
+        ) -> AgentControllerFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("requests mutex should not be poisoned")
+                    .push(request);
+                submit_observer
+                    .submitted_possible()
+                    .await
+                    .expect("submitted boundary should be recorded");
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct EmptyResultAdapter {
         requests: Arc<Mutex<Vec<AgentControllerRequest>>>,
     }
@@ -2144,6 +2322,42 @@ mod tests {
             InboundEventClaimDecision::Claimed { .. }
         ));
         (ledger, ready)
+    }
+
+    async fn ledger_store_and_ready_with_claim()
+    -> (TempDir, ResponseSurfaceLedgerStore, ProviderInboundReady) {
+        let dir = tempdir().expect("temp dir should be created");
+        let store =
+            ResponseSurfaceLedgerStore::new(dir.path().join("response-surface-ledger.json"))
+                .expect("ledger store should be created");
+        let mut ready = None;
+        store
+            .update(|ledger| {
+                let now = test_time();
+                ledger.create_surface_at(new_surface(now), now)?;
+                let surface =
+                    match ledger.lookup_surface_at(lookup_query(), now + Duration::seconds(1))? {
+                        ResponseSurfaceLookupResult::Hit(surface) => surface,
+                        other => panic!("surface should be hit, got {other:?}"),
+                    };
+                let claimed_ready = ready_for_surface(surface);
+                assert!(matches!(
+                    ledger.claim_inbound_event_at(
+                        inbound_event_input(&claimed_ready),
+                        now + Duration::seconds(1),
+                    )?,
+                    InboundEventClaimDecision::Claimed { .. }
+                ));
+                ready = Some(claimed_ready);
+                Ok(())
+            })
+            .await
+            .expect("ledger store should be initialized");
+        (
+            dir,
+            store,
+            ready.expect("ready should be initialized in ledger store"),
+        )
     }
 
     fn assert_claim_can_be_taken_again(
