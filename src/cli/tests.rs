@@ -211,6 +211,14 @@ fn catalog_emit_hook_commands_are_explicit_prefixes() {
 }
 
 #[test]
+fn ingress_ready_requires_running_service_and_live_ping() {
+    assert!(!ingress_ready_from_probe(false, false));
+    assert!(!ingress_ready_from_probe(false, true));
+    assert!(!ingress_ready_from_probe(true, false));
+    assert!(ingress_ready_from_probe(true, true));
+}
+
+#[test]
 fn emit_event_includes_supplied_duration() {
     let event = local_event_from_emit(
         "aider",

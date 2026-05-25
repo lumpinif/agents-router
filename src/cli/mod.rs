@@ -268,7 +268,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Command::Stop => run_stop(),
         Command::Uninstall => run_uninstall(),
-        Command::Status => run_status(),
+        Command::Status => run_status().await,
         Command::Safety { command } => run_safety(command).await,
         Command::Version => {
             println!("agents-router {}", env!("CARGO_PKG_VERSION"));
@@ -743,7 +743,7 @@ fn print_status_notification_targets(config_path: &Path) {
     }
 }
 
-fn run_status() -> anyhow::Result<()> {
+async fn run_status() -> anyhow::Result<()> {
     let manager = PlatformServiceManager::system()?;
     let service_file = manager.service_file_path()?;
     let metadata_path = service_metadata_path()?;
@@ -765,7 +765,7 @@ fn run_status() -> anyhow::Result<()> {
     print_path_field("ingress", endpoint.display());
     print_bool_field(
         "ingress ready",
-        local_ingress_ready_now(&endpoint, status.running),
+        local_ingress_ready_now(&endpoint, status.running).await,
     );
 
     let config_path = metadata
@@ -823,19 +823,19 @@ fn print_delivery_safety_status() {
     }
 }
 
-fn local_ingress_ready_now(
+async fn local_ingress_ready_now(
     endpoint: &agents_router::paths::IngressEndpoint,
     service_running: bool,
 ) -> bool {
-    #[cfg(unix)]
-    let _ = service_running;
-
-    match endpoint {
-        #[cfg(unix)]
-        agents_router::paths::IngressEndpoint::UnixSocket(path) => path.exists(),
-        #[cfg(windows)]
-        agents_router::paths::IngressEndpoint::WindowsNamedPipe(_) => service_running,
+    if !service_running {
+        return ingress_ready_from_probe(false, false);
     }
+
+    ingress_ready_from_probe(true, local_ingress::is_ready(endpoint).await)
+}
+
+fn ingress_ready_from_probe(service_running: bool, endpoint_accepts_ping: bool) -> bool {
+    service_running && endpoint_accepts_ping
 }
 
 #[cfg(not(target_os = "macos"))]
