@@ -62,12 +62,14 @@ pub async fn watch(runtime: RuntimeState) -> anyhow::Result<()> {
                 let batch = watcher.poll(&snapshot.config, source)?;
                 let providers = snapshot.provider_refs();
                 let delivery_safety = runtime.delivery_safety();
+                let response_surface_ledger = runtime.response_surface_ledger();
                 route_and_checkpoint_batch(
                     watcher,
                     &snapshot.config,
                     &providers,
                     batch,
                     Some(&delivery_safety),
+                    Some(&response_surface_ledger),
                 )
                 .await?;
             }
@@ -90,6 +92,7 @@ async fn route_and_checkpoint_batch(
     providers: &[&dyn Provider],
     batch: CodexDesktopPollBatch,
     delivery_safety: Option<&DeliverySafetyGuard>,
+    response_surface_ledger: Option<&crate::response_surface_ledger::ResponseSurfaceLedgerStore>,
 ) -> anyhow::Result<()> {
     for signal in &batch.signals {
         info!(
@@ -100,7 +103,12 @@ async fn route_and_checkpoint_batch(
         );
 
         if let Err(error) = Router::new(config)
-            .route_with_safety(signal, providers, delivery_safety)
+            .route_with_safety_and_response_surfaces(
+                signal,
+                providers,
+                delivery_safety,
+                response_surface_ledger,
+            )
             .await
         {
             warn!(

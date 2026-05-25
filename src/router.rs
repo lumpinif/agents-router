@@ -5,12 +5,24 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
+use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::config::{RouteConfig, ValidatedConfig, is_clean_absolute_project_path};
-use crate::delivery::{DeliveryError, DeliveryErrorKind, ProviderSendResult};
+use crate::delivery::{
+    DeliveryError, DeliveryErrorKind, ProviderDeliveryReceipt, ProviderDeliveryReceiptStatus,
+    ProviderSendResult,
+};
 use crate::delivery_safety::{
     DeliveryAttempt, DeliverySafetyDecision, DeliverySafetyGuard, DeliverySuppression,
+};
+use crate::provider_catalog::provider_config_mode_capability;
+use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
+use crate::response_surface_policy::ResponseSurfaceDeliveryReceipt;
+use crate::response_surface_runtime::{
+    ResponseSurfaceCreationDecision, ResponseSurfaceDeliveryFacts,
+    create_response_surface_after_delivery_with_agent_integration_override,
+    dogfood_agent_integration_for_signal,
 };
 use crate::signal::Signal;
 
@@ -115,6 +127,17 @@ impl<'a> Router<'a> {
         providers: &[&dyn Provider],
         delivery_safety: Option<&DeliverySafetyGuard>,
     ) -> Result<DeliveryReport, RouterError> {
+        self.route_with_safety_and_response_surfaces(signal, providers, delivery_safety, None)
+            .await
+    }
+
+    pub async fn route_with_safety_and_response_surfaces(
+        &self,
+        signal: &Signal,
+        providers: &[&dyn Provider],
+        delivery_safety: Option<&DeliverySafetyGuard>,
+        response_surface_ledger: Option<&ResponseSurfaceLedgerStore>,
+    ) -> Result<DeliveryReport, RouterError> {
         let providers_by_id: HashMap<&str, &dyn Provider> = providers
             .iter()
             .map(|provider| (provider.id(), *provider))
@@ -216,6 +239,16 @@ impl<'a> Router<'a> {
                             http.status = result.http_status,
                             event = "provider.send.succeeded",
                         );
+                        if let Some(response_surface_ledger) = response_surface_ledger {
+                            self.create_response_surface_after_delivery(
+                                response_surface_ledger,
+                                signal,
+                                route,
+                                *provider,
+                                &result,
+                            )
+                            .await;
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -256,6 +289,97 @@ impl<'a> Router<'a> {
             })
         } else {
             Err(RouterError::ProviderFailures(failures))
+        }
+    }
+
+    async fn create_response_surface_after_delivery(
+        &self,
+        response_surface_ledger: &ResponseSurfaceLedgerStore,
+        signal: &Signal,
+        route: &RouteConfig,
+        provider: &dyn Provider,
+        result: &ProviderSendResult,
+    ) {
+        let Some(receipt) = result.delivery_receipt.as_ref() else {
+            return;
+        };
+        if receipt.status != ProviderDeliveryReceiptStatus::SurfaceReady {
+            debug!(
+                signal.id = %signal.id,
+                source.id = %signal.source_id(),
+                provider.id = %provider.id(),
+                provider.type = %provider.provider_type(),
+                receipt.status = ?receipt.status,
+                event = "response_surface.creation.skipped",
+                reason = "delivery_receipt_not_surface_ready",
+            );
+            return;
+        }
+        let Some(config_provider) = self.config.provider(provider.id()) else {
+            warn!(
+                signal.id = %signal.id,
+                source.id = %signal.source_id(),
+                provider.id = %provider.id(),
+                provider.type = %provider.provider_type(),
+                event = "response_surface.creation.failed",
+                error = "provider config missing after delivery",
+            );
+            return;
+        };
+
+        let provider_capability = provider_config_mode_capability(config_provider);
+        let delivery = ResponseSurfaceDeliveryFacts {
+            delivery_id: format!("{}:{}", signal.id, provider.id()),
+            provider_id: provider.id().to_string(),
+            receipt: response_surface_delivery_receipt(receipt),
+        };
+        let agent_integration_override = dogfood_agent_integration_for_signal(signal);
+        let outcome = response_surface_ledger
+            .update(|ledger| {
+                create_response_surface_after_delivery_with_agent_integration_override(
+                    ledger,
+                    signal,
+                    route,
+                    provider_capability,
+                    delivery,
+                    Utc::now(),
+                    agent_integration_override,
+                )
+            })
+            .await;
+
+        match outcome {
+            Ok(ResponseSurfaceCreationDecision::Created(record)) => {
+                info!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    surface.id = %record.surface_id,
+                    ledger.path = %response_surface_ledger.state_path().display(),
+                    event = "response_surface.created",
+                );
+            }
+            Ok(ResponseSurfaceCreationDecision::Skipped(reason)) => {
+                debug!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    reason = ?reason,
+                    event = "response_surface.creation.skipped",
+                );
+            }
+            Err(error) => {
+                warn!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    error = %error,
+                    event = "response_surface.creation.failed",
+                );
+            }
         }
     }
 
@@ -310,6 +434,17 @@ fn log_delivery_suppressed(
             window.seconds = pause_started.window_seconds,
             event = "delivery.pause.started",
         );
+    }
+}
+
+fn response_surface_delivery_receipt(
+    receipt: &ProviderDeliveryReceipt,
+) -> ResponseSurfaceDeliveryReceipt {
+    ResponseSurfaceDeliveryReceipt {
+        provider_account_id: receipt.provider_account_id.clone(),
+        provider_conversation_id: receipt.provider_conversation_id.clone(),
+        provider_message_id: receipt.provider_message_id.clone(),
+        provider_thread_id: receipt.provider_thread_id.clone(),
     }
 }
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tracing::info;
 
 use crate::provider_catalog::{
     InboundReplyMode, ProviderMode, ProviderModeCapability, RESPONSE_SURFACE_REPLY_SURFACES,
@@ -275,13 +276,41 @@ pub fn lookup_and_claim_provider_surface_reply(
     )?;
 
     let surface = match lookup {
-        ResponseSurfaceLookupResult::Hit(surface) => surface,
+        ResponseSurfaceLookupResult::Hit(surface) => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                provider.conversation.id = %reply.provider_conversation_id,
+                provider.thread.id = %reply.provider_thread_id,
+                surface.id = %surface.surface_id,
+                event = "provider_inbound.surface_lookup.hit",
+            );
+            surface
+        }
         ResponseSurfaceLookupResult::Miss => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                provider.conversation.id = %reply.provider_conversation_id,
+                provider.thread.id = %reply.provider_thread_id,
+                event = "provider_inbound.surface_lookup.miss",
+            );
             return Ok(ProviderInboundDecision::Skip(
                 ProviderInboundSkipReason::SurfaceLookupMiss,
             ));
         }
         ResponseSurfaceLookupResult::Closed { surface_id } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                provider.conversation.id = %reply.provider_conversation_id,
+                provider.thread.id = %reply.provider_thread_id,
+                surface.id = %surface_id,
+                event = "provider_inbound.surface_lookup.closed",
+            );
             return Ok(ProviderInboundDecision::Skip(
                 ProviderInboundSkipReason::SurfaceClosed { surface_id },
             ));
@@ -305,19 +334,53 @@ pub fn lookup_and_claim_provider_surface_reply(
     match claim {
         InboundEventClaimDecision::Claimed {
             provider_event_id_hash,
-        } => Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
-            reply,
-            surface,
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                surface.id = %surface.surface_id,
+                event.hash = %provider_event_id_hash,
+                event = "provider_inbound.event_claim.succeeded",
+            );
+            Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
+                reply,
+                surface,
+                provider_event_id_hash,
+            }))
+        }
+        InboundEventClaimDecision::AlreadyProcessing {
+            surface_id,
             provider_event_id_hash,
-        })),
-        InboundEventClaimDecision::AlreadyProcessing { surface_id, .. } => {
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                surface.id = %surface_id,
+                event.hash = %provider_event_id_hash,
+                event = "provider_inbound.event_claim.already_processing",
+            );
             Ok(ProviderInboundDecision::Skip(
                 ProviderInboundSkipReason::EventAlreadyProcessing { surface_id },
             ))
         }
-        InboundEventClaimDecision::DuplicateProcessed { surface_id, .. } => Ok(
-            ProviderInboundDecision::Skip(ProviderInboundSkipReason::DuplicateEvent { surface_id }),
-        ),
+        InboundEventClaimDecision::DuplicateProcessed {
+            surface_id,
+            provider_event_id_hash,
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                surface.id = %surface_id,
+                event.hash = %provider_event_id_hash,
+                event = "provider_inbound.event_claim.duplicate_processed",
+            );
+            Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::DuplicateEvent { surface_id },
+            ))
+        }
     }
 }
 
@@ -963,6 +1026,7 @@ mod tests {
             provider_conversation_id: "C123ABC456".to_string(),
             provider_message_id: "1716200000.000100".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
+            route_binding_hash: None,
         }
     }
 

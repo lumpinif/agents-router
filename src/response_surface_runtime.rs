@@ -1,7 +1,12 @@
 use chrono::{DateTime, Utc};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
-use crate::agent_integration_catalog::AgentIntegrationDescriptor;
-use crate::config::RouteConfig;
+use crate::agent_integration_catalog::{
+    AgentIntegrationDescriptor, AgentIntegrationId, ContinuationCapability,
+    agent_integration_descriptor,
+};
+use crate::config::{RouteConfig, SourceType};
 use crate::provider_catalog::ProviderModeCapability;
 use crate::response_surface_ledger::{
     NewResponseSurface, ResponseSurfaceLedger, ResponseSurfaceRecord,
@@ -12,6 +17,8 @@ use crate::response_surface_policy::{
     agent_integration_for_signal, evaluate_response_surface_policy,
 };
 use crate::signal::Signal;
+
+pub const INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV: &str = "AGENTS_ROUTER_INTERNAL_CODEX_DESKTOP_REPLIES";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSurfaceDeliveryFacts {
@@ -39,15 +46,14 @@ pub fn create_response_surface_after_delivery(
     )
 }
 
-#[cfg(test)]
-fn create_response_surface_after_delivery_with_agent_integration(
+pub(crate) fn create_response_surface_after_delivery_with_agent_integration_override(
     ledger: &mut ResponseSurfaceLedger,
     signal: &Signal,
     route: &RouteConfig,
     provider: &ProviderModeCapability,
     delivery: ResponseSurfaceDeliveryFacts,
     now: DateTime<Utc>,
-    agent_integration: AgentIntegrationDescriptor,
+    agent_integration: Option<AgentIntegrationDescriptor>,
 ) -> anyhow::Result<ResponseSurfaceCreationDecision> {
     create_response_surface_after_delivery_inner(
         ledger,
@@ -56,7 +62,7 @@ fn create_response_surface_after_delivery_with_agent_integration(
         provider,
         delivery,
         now,
-        Some(agent_integration),
+        agent_integration,
     )
 }
 
@@ -116,11 +122,61 @@ fn create_response_surface_after_delivery_inner(
                 .receipt
                 .provider_thread_id
                 .expect("policy allow requires provider_thread_id receipt"),
+            route_binding_hash: Some(response_surface_route_binding_hash(route)),
         },
         now,
     )?;
 
     Ok(ResponseSurfaceCreationDecision::Created(record))
+}
+
+pub fn response_surface_route_binding_hash(route: &RouteConfig) -> String {
+    let raw = serde_json::to_vec(&json!({
+        "sources": &route.sources,
+        "providers": &route.providers,
+        "minimum_task_duration_minutes": route.minimum_task_duration_minutes,
+        "only_forward_from_project_paths": &route.only_forward_from_project_paths,
+        "response_surface_enabled": route.response_surface.enabled,
+    }))
+    .expect("route binding hash input should serialize");
+    let digest = Sha256::digest(raw);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn internal_codex_desktop_dogfood_enabled() -> bool {
+    std::env::var(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV)
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn dogfood_agent_integration_for_signal(
+    signal: &Signal,
+) -> Option<AgentIntegrationDescriptor> {
+    let source_type = SourceType::from_signal_value(signal.source_type())?;
+    dogfood_agent_integration_for_source(signal.source_id(), source_type)
+}
+
+pub(crate) fn dogfood_agent_integration_for_source(
+    source_id: &str,
+    source_type: SourceType,
+) -> Option<AgentIntegrationDescriptor> {
+    if !internal_codex_desktop_dogfood_enabled()
+        || source_id != "codex_desktop"
+        || source_type != SourceType::CodexDesktop
+    {
+        return None;
+    }
+
+    let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+    let target = descriptor.continuation_capability.target()?;
+    Some(AgentIntegrationDescriptor {
+        // This is a narrow internal dogfood override. The catalog remains the
+        // source of the target facts; only the planned/available status is
+        // lifted for this local hidden runtime path.
+        continuation_capability: ContinuationCapability::Available(target),
+        ..descriptor
+    })
 }
 
 #[cfg(test)]
@@ -166,14 +222,14 @@ mod tests {
         let signal = codex_desktop_signal();
         let route = route_with_replies_enabled();
         let provider = provider_mode_capability(ProviderMode::SlackApp);
-        let decision = create_response_surface_after_delivery_with_agent_integration(
+        let decision = create_response_surface_after_delivery_with_agent_integration_override(
             &mut ledger,
             &signal,
             &route,
             provider,
             delivery_facts(full_receipt()),
             test_time(),
-            available_codex_desktop(),
+            Some(available_codex_desktop()),
         )
         .expect("test available path should not fail");
 
@@ -203,7 +259,7 @@ mod tests {
         let mut ledger = ResponseSurfaceLedger::in_memory();
         let signal = codex_desktop_signal();
         let route = route_with_replies_enabled();
-        let decision = create_response_surface_after_delivery_with_agent_integration(
+        let decision = create_response_surface_after_delivery_with_agent_integration_override(
             &mut ledger,
             &signal,
             &route,
@@ -215,7 +271,7 @@ mod tests {
                 provider_thread_id: Some("1716200000.000100".to_string()),
             }),
             test_time(),
-            available_codex_desktop(),
+            Some(available_codex_desktop()),
         )
         .expect("creation should not fail");
 

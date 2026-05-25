@@ -1385,6 +1385,11 @@ async fn run_service_tasks(
     tasks.spawn(reload_config_on_change(config_path, runtime.clone()));
     tasks.spawn(codex_desktop::watch(runtime.clone()));
     tasks.spawn(local_ingress::serve(runtime.clone(), endpoint));
+    tasks.spawn(
+        agents_router::providers::feishu_lark_long_connection::run_hidden_live_lark_long_connection(
+            runtime.clone(),
+        ),
+    );
     tasks.spawn(local_open_bridge::serve_when_needed(runtime));
     wait_for_service_task(tasks).await
 }
@@ -1398,6 +1403,11 @@ async fn run_service_tasks(
     let mut tasks = JoinSet::new();
     tasks.spawn(reload_config_on_change(config_path, runtime.clone()));
     tasks.spawn(local_ingress::serve(runtime.clone(), endpoint));
+    tasks.spawn(
+        agents_router::providers::feishu_lark_long_connection::run_hidden_live_lark_long_connection(
+            runtime.clone(),
+        ),
+    );
     tasks.spawn(local_open_bridge::serve_when_needed(runtime));
     wait_for_service_task(tasks).await
 }

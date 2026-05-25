@@ -13,6 +13,7 @@ use crate::config::{LoadedConfig, ValidatedConfig};
 use crate::delivery_safety::DeliverySafetyGuard;
 use crate::local_integrations::{self, LocalSourceIntegrationPaths, LocalSourceIntegrationReport};
 use crate::providers::build_providers;
+use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
 use crate::router::Provider;
 
 const CONFIG_RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -22,6 +23,7 @@ const CONFIG_RELOAD_SETTLE_DELAY: Duration = Duration::from_millis(200);
 pub struct RuntimeState {
     current: Arc<RwLock<Arc<RuntimeSnapshot>>>,
     delivery_safety: DeliverySafetyGuard,
+    response_surface_ledger: ResponseSurfaceLedgerStore,
 }
 
 pub struct RuntimeSnapshot {
@@ -41,6 +43,7 @@ impl RuntimeState {
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(RuntimeSnapshot::new(config)?))),
             delivery_safety,
+            response_surface_ledger: ResponseSurfaceLedgerStore::load_default()?,
         })
     }
 
@@ -53,6 +56,10 @@ impl RuntimeState {
 
     pub fn delivery_safety(&self) -> DeliverySafetyGuard {
         self.delivery_safety.clone()
+    }
+
+    pub fn response_surface_ledger(&self) -> ResponseSurfaceLedgerStore {
+        self.response_surface_ledger.clone()
     }
 
     pub fn reload_from_path(&self, path: &Path) -> anyhow::Result<()> {

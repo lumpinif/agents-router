@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use crate::config::{SourceType, ValidatedConfig};
 use crate::delivery_safety::DeliverySafetyGuard;
 use crate::paths::{IngressEndpoint, codex_sessions_dir_path};
+use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
 use crate::router::{DeliveryReport, Provider, Router};
 use crate::runtime::RuntimeState;
 use crate::signal::{
@@ -510,6 +511,27 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety(
     codex_sessions_dir: Option<&Path>,
     delivery_safety: Option<&DeliverySafetyGuard>,
 ) -> anyhow::Result<DeliveryReport> {
+    route_event_with_state_and_codex_sessions_dir_and_safety_and_response_surfaces(
+        config,
+        providers,
+        state,
+        event,
+        codex_sessions_dir,
+        delivery_safety,
+        None,
+    )
+    .await
+}
+
+async fn route_event_with_state_and_codex_sessions_dir_and_safety_and_response_surfaces(
+    config: &ValidatedConfig,
+    providers: &[&dyn Provider],
+    state: &LocalIngressState,
+    event: LocalSignalEvent,
+    codex_sessions_dir: Option<&Path>,
+    delivery_safety: Option<&DeliverySafetyGuard>,
+    response_surface_ledger: Option<&ResponseSurfaceLedgerStore>,
+) -> anyhow::Result<DeliveryReport> {
     info!(
         source.id = %event.source_id,
         action = ?event.action,
@@ -544,28 +566,14 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety(
     );
 
     Router::new(config)
-        .route_with_safety(&signal, providers, delivery_safety)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            providers,
+            delivery_safety,
+            response_surface_ledger,
+        )
         .await
         .map_err(Into::into)
-}
-
-async fn route_event_with_state_and_safety(
-    config: &ValidatedConfig,
-    providers: &[&dyn Provider],
-    state: &LocalIngressState,
-    event: LocalSignalEvent,
-    delivery_safety: &DeliverySafetyGuard,
-) -> anyhow::Result<DeliveryReport> {
-    let codex_sessions_dir = codex_sessions_dir_path().ok();
-    route_event_with_state_and_codex_sessions_dir_and_safety(
-        config,
-        providers,
-        state,
-        event,
-        codex_sessions_dir.as_deref(),
-        Some(delivery_safety),
-    )
-    .await
 }
 
 fn codex_cli_stop_event_is_shadowed_by_codex_desktop(
@@ -610,8 +618,18 @@ pub async fn route_event_with_runtime(
     let snapshot = runtime.current()?;
     let providers = snapshot.provider_refs();
     let delivery_safety = runtime.delivery_safety();
-    route_event_with_state_and_safety(&snapshot.config, &providers, state, event, &delivery_safety)
-        .await
+    let response_surface_ledger = runtime.response_surface_ledger();
+    let codex_sessions_dir = codex_sessions_dir_path().ok();
+    route_event_with_state_and_codex_sessions_dir_and_safety_and_response_surfaces(
+        &snapshot.config,
+        &providers,
+        state,
+        event,
+        codex_sessions_dir.as_deref(),
+        Some(&delivery_safety),
+        Some(&response_surface_ledger),
+    )
+    .await
 }
 
 fn store_session_context(

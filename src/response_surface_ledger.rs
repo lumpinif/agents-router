@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::paths::response_surface_ledger_path;
@@ -16,6 +18,12 @@ const LEDGER_SCHEMA_VERSION: u32 = 1;
 pub struct ResponseSurfaceLedger {
     state_path: Option<PathBuf>,
     state: ResponseSurfaceLedgerFile,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseSurfaceLedgerStore {
+    state_path: PathBuf,
+    lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +50,8 @@ pub struct ResponseSurfaceRecord {
     pub provider_conversation_id: String,
     pub provider_message_id: String,
     pub provider_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_binding_hash: Option<String>,
     pub status: ResponseSurfaceStatus,
     pub created_at: DateTime<Utc>,
 }
@@ -71,6 +81,7 @@ pub struct NewResponseSurface {
     pub provider_conversation_id: String,
     pub provider_message_id: String,
     pub provider_thread_id: String,
+    pub route_binding_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +115,7 @@ pub struct ResponseSurfaceLookupRecord {
     pub provider_conversation_id: String,
     pub provider_message_id: String,
     pub provider_thread_id: String,
+    pub route_binding_hash: Option<String>,
     pub status: ResponseSurfaceStatus,
 }
 
@@ -232,6 +244,9 @@ impl ResponseSurfaceLedger {
             provider_conversation_id: input.provider_conversation_id,
             provider_message_id: input.provider_message_id,
             provider_thread_id: input.provider_thread_id,
+            route_binding_hash: input
+                .route_binding_hash
+                .filter(|value| !value.trim().is_empty()),
             status: ResponseSurfaceStatus::Open,
             created_at: now,
         };
@@ -438,6 +453,41 @@ impl ResponseSurfaceLedger {
     }
 }
 
+impl ResponseSurfaceLedgerStore {
+    pub fn load_default() -> anyhow::Result<Self> {
+        Self::new(response_surface_ledger_path()?)
+    }
+
+    pub fn new(state_path: PathBuf) -> anyhow::Result<Self> {
+        if let Some(parent) = state_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create response surface ledger directory `{}`",
+                    parent.display()
+                )
+            })?;
+        }
+
+        Ok(Self {
+            state_path,
+            lock: Arc::new(AsyncMutex::new(())),
+        })
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    pub async fn update<R>(
+        &self,
+        operation: impl FnOnce(&mut ResponseSurfaceLedger) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let _guard = self.lock.lock().await;
+        let mut ledger = ResponseSurfaceLedger::load(self.state_path.clone())?;
+        operation(&mut ledger)
+    }
+}
+
 impl NewResponseSurface {
     fn validate(&self) -> anyhow::Result<()> {
         ensure_present("signal_id", &self.signal_id)?;
@@ -494,6 +544,7 @@ impl ResponseSurfaceLookupRecord {
             provider_conversation_id: record.provider_conversation_id.clone(),
             provider_message_id: record.provider_message_id.clone(),
             provider_thread_id: record.provider_thread_id.clone(),
+            route_binding_hash: record.route_binding_hash.clone(),
             status: record.status,
         }
     }
@@ -532,6 +583,8 @@ fn surface_create_is_idempotent(
         && record.provider_type == input.provider_type
         && record.provider_mode == input.provider_mode
         && record.provider_message_id == input.provider_message_id
+        && record.route_binding_hash.as_deref()
+            == normalized_optional_value(&input.route_binding_hash)
 }
 
 fn normalized_optional_value(value: &Option<String>) -> Option<&str> {
@@ -669,6 +722,7 @@ mod tests {
                 provider_conversation_id: "C123".to_string(),
                 provider_message_id: "1716200000.000100".to_string(),
                 provider_thread_id: "1716200000.000100".to_string(),
+                route_binding_hash: Some("route-hash-1".to_string()),
                 status: ResponseSurfaceStatus::Open,
             })
         );
@@ -1038,6 +1092,7 @@ mod tests {
             provider_conversation_id: "C123".to_string(),
             provider_message_id: "1716200000.000100".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
+            route_binding_hash: Some("route-hash-1".to_string()),
         }
     }
 

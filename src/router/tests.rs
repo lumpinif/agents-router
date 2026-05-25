@@ -4,19 +4,29 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 
 use super::*;
+use tempfile::tempdir;
+
 use crate::config::{
     CliConfig, LogConfig, NotificationConfig, ProviderType, RawConfig, RawProviderConfig,
     RouteConfig, SourceConfig, SourceType, ValidatedConfig,
 };
-use crate::delivery::DeliveryErrorContext;
+use crate::delivery::{DeliveryErrorContext, ProviderDeliveryReceipt};
 use crate::delivery_safety::DeliverySafetyGuard;
+use crate::response_surface_ledger::{
+    ResponseSurfaceLedger, ResponseSurfaceLedgerStore, ResponseSurfaceLookupQuery,
+    ResponseSurfaceLookupResult,
+};
+use crate::response_surface_runtime::INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV;
 use crate::signal::{SignalLifecycle, SignalWorkspace};
+
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 struct TestProvider {
     id: String,
     provider_type: String,
     calls: Arc<Mutex<Vec<String>>>,
     result: Result<(), DeliveryErrorKind>,
+    delivery_receipt: Option<ProviderDeliveryReceipt>,
 }
 
 impl TestProvider {
@@ -26,6 +36,22 @@ impl TestProvider {
             provider_type: "test".to_string(),
             calls,
             result: Ok(()),
+            delivery_receipt: None,
+        }
+    }
+
+    fn succeeding_with_receipt(
+        id: &str,
+        provider_type: &str,
+        calls: Arc<Mutex<Vec<String>>>,
+        delivery_receipt: ProviderDeliveryReceipt,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            provider_type: provider_type.to_string(),
+            calls,
+            result: Ok(()),
+            delivery_receipt: Some(delivery_receipt),
         }
     }
 
@@ -35,6 +61,7 @@ impl TestProvider {
             provider_type: "test".to_string(),
             calls,
             result: Err(kind),
+            delivery_receipt: None,
         }
     }
 }
@@ -52,11 +79,14 @@ impl Provider for TestProvider {
         Box::pin(async move {
             self.calls.lock().unwrap().push(signal.id.clone());
             match &self.result {
-                Ok(()) => Ok(ProviderSendResult::sent(
-                    &self.id,
-                    &self.provider_type,
-                    signal,
-                )),
+                Ok(()) => {
+                    let mut result =
+                        ProviderSendResult::sent(&self.id, &self.provider_type, signal);
+                    if let Some(receipt) = self.delivery_receipt.clone() {
+                        result = result.with_delivery_receipt(receipt);
+                    }
+                    Ok(result)
+                }
                 Err(kind) => Err(DeliveryError::new(
                     *kind,
                     DeliveryErrorContext::provider_send(signal, &self.id, &self.provider_type),
@@ -196,6 +226,108 @@ async fn duplicate_delivery_safety_suppresses_without_provider_failure() {
     assert_eq!(report.succeeded, 0);
     assert_eq!(report.suppressed, 1);
     assert_eq!(calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn app_bot_surface_ready_delivery_creates_response_surface_under_internal_gate() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should not be poisoned");
+    let _guard = EnvGuard::set(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV, "1");
+    let temp = tempdir().expect("temp dir should exist");
+    let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("ledger.json"))
+        .expect("ledger store should build");
+    let config = lark_app_bot_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_receipt(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        ProviderDeliveryReceipt::surface_ready(
+            Some("tenant-1".to_string()),
+            Some("chat-1".to_string()),
+            Some("message-root-1".to_string()),
+            Some("message-root-1".to_string()),
+        ),
+    );
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &codex_desktop_signal_with_session(),
+            &[&provider],
+            None,
+            Some(&ledger_store),
+        )
+        .await
+        .expect("provider send should succeed");
+
+    assert_eq!(report.succeeded, 1);
+    let mut ledger = ResponseSurfaceLedger::load(ledger_store.state_path().to_path_buf())
+        .expect("ledger should load");
+    let lookup = ledger
+        .lookup_surface_at(
+            ResponseSurfaceLookupQuery {
+                provider_id: "work_chat".to_string(),
+                provider_account_id: "tenant-1".to_string(),
+                provider_conversation_id: "chat-1".to_string(),
+                provider_thread_id: "message-root-1".to_string(),
+            },
+            Utc::now(),
+        )
+        .expect("surface lookup should succeed");
+
+    assert!(matches!(
+        lookup,
+        ResponseSurfaceLookupResult::Hit(record)
+            if record.source_session_id == "session-1"
+                && record.route_binding_hash.is_some()
+    ));
+}
+
+#[tokio::test]
+async fn candidate_delivery_receipt_does_not_create_response_surface() {
+    let _env_lock = ENV_MUTEX.lock().expect("env mutex should not be poisoned");
+    let _guard = EnvGuard::set(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV, "1");
+    let temp = tempdir().expect("temp dir should exist");
+    let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("ledger.json"))
+        .expect("ledger store should build");
+    let config = lark_app_bot_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_receipt(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        ProviderDeliveryReceipt::candidate(
+            Some("tenant-1".to_string()),
+            Some("chat-1".to_string()),
+            Some("message-root-1".to_string()),
+            Some("message-root-1".to_string()),
+        ),
+    );
+
+    Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &codex_desktop_signal_with_session(),
+            &[&provider],
+            None,
+            Some(&ledger_store),
+        )
+        .await
+        .expect("provider send should succeed");
+
+    let mut ledger = ResponseSurfaceLedger::load(ledger_store.state_path().to_path_buf())
+        .expect("ledger should load");
+    let lookup = ledger
+        .lookup_surface_at(
+            ResponseSurfaceLookupQuery {
+                provider_id: "work_chat".to_string(),
+                provider_account_id: "tenant-1".to_string(),
+                provider_conversation_id: "chat-1".to_string(),
+                provider_thread_id: "message-root-1".to_string(),
+            },
+            Utc::now(),
+        )
+        .expect("surface lookup should succeed");
+
+    assert_eq!(lookup, ResponseSurfaceLookupResult::Miss);
 }
 
 #[tokio::test]
@@ -401,6 +533,19 @@ fn test_signal_with_duration_and_project_path(
     signal
 }
 
+fn codex_desktop_signal_with_session() -> Signal {
+    let mut signal = test_signal("codex_desktop");
+    signal.conversation = Some(crate::signal::SignalConversation {
+        session_id: Some("session-1".to_string()),
+        session_title: None,
+        turn_id: Some("turn-1".to_string()),
+        prompt: None,
+        answer: None,
+        model: None,
+    });
+    signal
+}
+
 fn test_config(routes: Vec<RouteConfig>) -> ValidatedConfig {
     let mut ntfy = RawProviderConfig::new("phone", ProviderType::Ntfy);
     ntfy.server = Some("https://ntfy.sh".to_string());
@@ -433,4 +578,57 @@ fn test_config(routes: Vec<RouteConfig>) -> ValidatedConfig {
     }
     .validate()
     .expect("test config should validate")
+}
+
+fn lark_app_bot_response_surface_config() -> ValidatedConfig {
+    let mut lark = RawProviderConfig::new("work_chat", ProviderType::FeishuLark);
+    lark.mode = Some("app_bot".to_string());
+    lark.domain = Some("lark".to_string());
+    lark.app_id = Some("cli_test".to_string());
+    lark.app_secret = Some("test-secret".to_string());
+    lark.tenant_key = Some("tenant-1".to_string());
+    lark.chat_id = Some("chat-1".to_string());
+
+    let mut route = RouteConfig::new(
+        vec!["codex_desktop".to_string()],
+        vec!["work_chat".to_string()],
+    );
+    route.response_surface.enabled = true;
+
+    RawConfig {
+        schema_version: 1,
+        cli: CliConfig::default(),
+        log: LogConfig::default(),
+        notification: NotificationConfig::default(),
+        sources: vec![SourceConfig {
+            id: "codex_desktop".to_string(),
+            source_type: SourceType::CodexDesktop,
+        }],
+        providers: vec![lark],
+        routes: vec![route],
+    }
+    .validate()
+    .expect("test config should validate")
+}
+
+struct EnvGuard {
+    name: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var(name).ok();
+        unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            None => unsafe { std::env::remove_var(self.name) },
+        }
+    }
 }
