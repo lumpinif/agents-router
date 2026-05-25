@@ -51,6 +51,7 @@ use agents_router::providers::build_providers;
 use agents_router::runtime::{
     RuntimeState, ensure_sources_supported_on_current_platform, reload_config_on_change,
 };
+use agents_router::runtime_owner::RuntimeOwnerLock;
 use agents_router::service::{
     PlatformServiceManager, ServiceDefinition, ServiceStartOutcome, ServiceStopOutcome,
     load_metadata,
@@ -1368,6 +1369,7 @@ fn cleanup_ingress_endpoint_if_exists() -> anyhow::Result<()> {
 }
 
 async fn run_watch(config_path: &Path, config: ValidatedConfig) -> anyhow::Result<()> {
+    let _owner_lock = RuntimeOwnerLock::acquire_default(config_path)?;
     local_integrations::ensure_local_source_integrations(&config)?;
     let runtime =
         RuntimeState::new_with_delivery_safety(config, DeliverySafetyGuard::load_default()?)?;

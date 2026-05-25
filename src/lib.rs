@@ -22,6 +22,7 @@ pub mod response_surface_policy;
 pub mod response_surface_runtime;
 pub mod router;
 pub mod runtime;
+pub mod runtime_owner;
 pub mod service;
 pub mod setup;
 pub mod signal;
