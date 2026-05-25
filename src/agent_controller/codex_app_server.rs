@@ -1,9 +1,11 @@
 use std::process::Stdio;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
     AgentControllerAdapter, AgentControllerError, AgentControllerErrorKind, AgentControllerFuture,
@@ -141,6 +143,14 @@ async fn continue_session_with_connection(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
+    let controller_started_at = Instant::now();
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        controller.kind = ?request.controller_kind,
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.controller.started",
+    );
     let mut next_request_id = 1;
     send_request(
         connection,
@@ -160,6 +170,13 @@ async fn continue_session_with_connection(
         None,
     )
     .await?;
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        elapsed.ms = controller_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.initialize.succeeded",
+    );
     send_notification(
         connection,
         request,
@@ -169,6 +186,61 @@ async fn continue_session_with_connection(
     )
     .await?;
 
+    let thread_read_started_at = Instant::now();
+    let thread_read_result = send_request(
+        connection,
+        request,
+        &mut next_request_id,
+        "thread/read",
+        json!({
+            "threadId": request.source_session_id,
+        }),
+        SubmitBoundary::BeforeSubmit,
+        None,
+    )
+    .await?;
+    let thread_status = ensure_read_thread_matches_request(request, &thread_read_result)?;
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        thread.status = %thread_status.as_log_value(),
+        elapsed.ms = thread_read_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.thread_read.succeeded",
+    );
+    match thread_status {
+        CodexThreadStatus::Idle => {}
+        CodexThreadStatus::Active(status) => {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.status = %status,
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_active.fail_closed",
+            );
+            return Err(AgentControllerError::failed_before_submit(
+                request,
+                AgentControllerErrorKind::SessionActive,
+                "original Codex session is currently active",
+            ));
+        }
+        CodexThreadStatus::Other(status) => {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                thread.status = %status,
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.thread_not_idle.fail_closed",
+            );
+            return Err(AgentControllerError::failed_before_submit(
+                request,
+                AgentControllerErrorKind::SessionNotContinuable,
+                format!("Codex App Server thread status `{status}` is not continuable"),
+            ));
+        }
+    }
+
+    let thread_resume_started_at = Instant::now();
     let resume_result = send_request(
         connection,
         request,
@@ -183,8 +255,22 @@ async fn continue_session_with_connection(
     )
     .await?;
     ensure_resumed_thread_matches_request(request, &resume_result)?;
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        elapsed.ms = thread_resume_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.thread_resume.succeeded",
+    );
 
     let mut turn_state = TurnStartState::new(request.source_session_id.clone());
+    let turn_start_started_at = Instant::now();
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.turn_start.sent",
+    );
     let turn_start_result = send_request(
         connection,
         request,
@@ -204,17 +290,34 @@ async fn continue_session_with_connection(
     )
     .await?;
     turn_state.bind_turn_from_start_response(request, &turn_start_result)?;
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        turn.id = turn_state.turn_id.as_deref(),
+        elapsed.ms = turn_start_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.turn_start.accepted",
+    );
 
-    wait_for_final_answer(connection, request, &mut turn_state).await
+    wait_for_final_answer(connection, request, &mut turn_state, controller_started_at).await
 }
 
 async fn wait_for_final_answer(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
     turn_state: &mut TurnStartState,
+    controller_started_at: Instant,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
     loop {
         if let Some(message) = turn_state.error_message.take() {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                turn.id = turn_state.turn_id.as_deref(),
+                elapsed.ms = controller_started_at.elapsed().as_millis(),
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.turn_start.rejected",
+            );
             return Err(error_after_possible_submit(
                 request,
                 AgentControllerErrorKind::ControllerRejected,
@@ -222,6 +325,14 @@ async fn wait_for_final_answer(
             ));
         }
         if let Some(final_answer) = turn_state.final_answer.take() {
+            info!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                turn.id = turn_state.turn_id.as_deref(),
+                elapsed.ms = controller_started_at.elapsed().as_millis(),
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.final_answer.observed",
+            );
             return AgentControllerSuccess::from_result_text(final_answer).ok_or_else(|| {
                 error_after_possible_submit(
                     request,
@@ -231,6 +342,14 @@ async fn wait_for_final_answer(
             });
         }
         if turn_state.turn_completed {
+            warn!(
+                surface.id = %request.surface_id,
+                source.session.id = %request.source_session_id,
+                turn.id = turn_state.turn_id.as_deref(),
+                elapsed.ms = controller_started_at.elapsed().as_millis(),
+                event.hash = %request.provider_event_id_hash,
+                event = "codex_app_server.turn_completed_without_final_answer",
+            );
             return Err(error_after_possible_submit(
                 request,
                 AgentControllerErrorKind::Internal,
@@ -278,6 +397,15 @@ async fn send_request(
             format!("failed to send Codex App Server {method} request: {error}"),
         )
     })?;
+    debug!(
+        surface.id = %request.surface_id,
+        source.session.id = %request.source_session_id,
+        method = method,
+        request.id = request_id,
+        submit.boundary = ?boundary,
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.request.sent",
+    );
 
     loop {
         let message = read_message(connection, request, boundary).await?;
@@ -420,6 +548,103 @@ fn ensure_resumed_thread_matches_request(
     }
 
     Ok(())
+}
+
+fn ensure_read_thread_matches_request(
+    request: &AgentControllerRequest,
+    read_result: &Value,
+) -> Result<CodexThreadStatus, AgentControllerError> {
+    let thread = thread_from_result(request, read_result, "thread/read")?;
+    ensure_thread_identity_matches_request(request, thread, "read")?;
+    Ok(codex_thread_status(thread))
+}
+
+fn thread_from_result<'a>(
+    request: &AgentControllerRequest,
+    result: &'a Value,
+    method: &str,
+) -> Result<&'a Value, AgentControllerError> {
+    result.get("thread").ok_or_else(|| {
+        AgentControllerError::failed_before_submit(
+            request,
+            AgentControllerErrorKind::SessionNotContinuable,
+            format!("Codex App Server {method} response did not include thread facts"),
+        )
+    })
+}
+
+fn ensure_thread_identity_matches_request(
+    request: &AgentControllerRequest,
+    thread: &Value,
+    action: &str,
+) -> Result<(), AgentControllerError> {
+    let thread_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
+        AgentControllerError::failed_before_submit(
+            request,
+            AgentControllerErrorKind::SessionNotContinuable,
+            format!("Codex App Server thread/{action} response did not include thread.id"),
+        )
+    })?;
+
+    if thread_id != request.source_session_id {
+        return Err(AgentControllerError::failed_before_submit(
+            request,
+            AgentControllerErrorKind::SessionNotContinuable,
+            format!(
+                "Codex App Server {action} thread `{thread_id}` instead of requested source session"
+            ),
+        ));
+    }
+
+    if let Some(session_id) = thread.get("sessionId").and_then(Value::as_str)
+        && session_id != request.source_session_id
+    {
+        return Err(AgentControllerError::failed_before_submit(
+            request,
+            AgentControllerErrorKind::SessionNotContinuable,
+            format!(
+                "Codex App Server {action} session `{session_id}` instead of requested source session"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexThreadStatus {
+    Idle,
+    Active(String),
+    Other(String),
+}
+
+impl CodexThreadStatus {
+    fn as_log_value(&self) -> &str {
+        match self {
+            Self::Idle => "idle",
+            Self::Active(status) | Self::Other(status) => status,
+        }
+    }
+}
+
+fn codex_thread_status(thread: &Value) -> CodexThreadStatus {
+    let status = thread
+        .get("status")
+        .and_then(|status| {
+            status
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| status.as_str())
+        })
+        .unwrap_or("missing");
+
+    match status {
+        "idle" => CodexThreadStatus::Idle,
+        "active" | "busy" | "generating" | "running" | "working" => {
+            CodexThreadStatus::Active(status.to_string())
+        }
+        other => CodexThreadStatus::Other(other.to_string()),
+    }
 }
 
 fn controller_error(
@@ -673,11 +898,12 @@ mod tests {
     async fn success_path_returns_final_answer_text_without_rewriting() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
-            response(3, json!({"turn": {"id": "turn-2"}})),
+            response(4, json!({"turn": {"id": "turn-2"}})),
             notification(
                 "item/completed",
                 json!({
@@ -701,7 +927,7 @@ mod tests {
 
         assert_eq!(result.result_text(), "  exact agent result\nwith spacing  ");
         assert_eq!(connection.sent_json(1)["method"], "initialized");
-        let turn_start = connection.sent_json(3);
+        let turn_start = connection.sent_json(4);
         assert_eq!(turn_start["method"], "turn/start");
         assert_eq!(
             turn_start["params"]["input"][0]["text"],
@@ -714,7 +940,8 @@ mod tests {
     async fn thread_resume_failure_is_before_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
-            rpc_error(2, "thread not found"),
+            thread_read_response(2, "idle"),
+            rpc_error(3, "thread not found"),
         ]);
         let request = controller_request("continue");
 
@@ -727,18 +954,40 @@ mod tests {
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
         );
+        assert_eq!(connection.sent_len(), 4);
+    }
+
+    #[tokio::test]
+    async fn active_thread_fails_before_submit_without_turn_start() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "running"),
+        ]);
+        let request = controller_request("continue");
+
+        let error = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect_err("active thread should fail before turn/start");
+
+        assert_eq!(error.kind, AgentControllerErrorKind::SessionActive);
+        assert_eq!(
+            error.submit_boundary,
+            crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
+        );
         assert_eq!(connection.sent_len(), 3);
+        assert_eq!(connection.sent_json(2)["method"], "thread/read");
     }
 
     #[tokio::test]
     async fn turn_start_rpc_error_is_after_possible_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
-            rpc_error(3, "active turn is already running"),
+            rpc_error(4, "active turn is already running"),
         ]);
         let request = controller_request("continue");
 
@@ -751,15 +1000,16 @@ mod tests {
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
         );
-        assert_eq!(connection.sent_len(), 4);
+        assert_eq!(connection.sent_len(), 5);
     }
 
     #[tokio::test]
     async fn turn_start_notification_error_is_after_possible_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
             notification(
@@ -783,18 +1033,19 @@ mod tests {
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
         );
-        assert_eq!(connection.sent_len(), 4);
+        assert_eq!(connection.sent_len(), 5);
     }
 
     #[tokio::test]
     async fn ignores_other_thread_or_turn_final_answer_until_current_turn_final_answer() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
-            response(3, json!({"turn": {"id": "turn-current"}})),
+            response(4, json!({"turn": {"id": "turn-current"}})),
             notification(
                 "item/completed",
                 json!({
@@ -851,11 +1102,12 @@ mod tests {
     async fn current_turn_completed_without_current_final_answer_fails_after_possible_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
-            response(3, json!({"turn": {"id": "turn-current"}})),
+            response(4, json!({"turn": {"id": "turn-current"}})),
             notification(
                 "item/completed",
                 json!({
@@ -897,11 +1149,12 @@ mod tests {
     async fn stream_end_after_turn_start_is_after_possible_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
             ),
-            response(3, json!({"turn": {"id": "turn-2"}})),
+            response(4, json!({"turn": {"id": "turn-2"}})),
         ]);
         let request = controller_request("continue");
 
@@ -914,15 +1167,16 @@ mod tests {
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
         );
-        assert_eq!(connection.sent_len(), 4);
+        assert_eq!(connection.sent_len(), 5);
     }
 
     #[tokio::test]
     async fn mismatched_resumed_thread_is_before_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+            thread_read_response(2, "idle"),
             response(
-                2,
+                3,
                 json!({"thread": {"id": "other-session", "sessionId": "other-session"}}),
             ),
         ]);
@@ -937,7 +1191,7 @@ mod tests {
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
         );
-        assert_eq!(connection.sent_len(), 3);
+        assert_eq!(connection.sent_len(), 4);
     }
 
     #[derive(Debug)]
@@ -980,6 +1234,21 @@ mod tests {
             "result": result,
         })
         .to_string()
+    }
+
+    fn thread_read_response(id: u64, status: &str) -> String {
+        response(
+            id,
+            json!({
+                "thread": {
+                    "id": "session-1",
+                    "sessionId": "session-1",
+                    "status": {
+                        "type": status
+                    }
+                }
+            }),
+        )
     }
 
     fn rpc_error(id: u64, message: &str) -> String {
