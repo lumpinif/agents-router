@@ -1115,7 +1115,7 @@ fn format_signal_card_elements(card_body: FeishuLarkCardBody) -> Vec<FeishuLarkC
         elements.push(FeishuLarkCardElement::Div {
             text: FeishuLarkLarkMarkdown {
                 tag: "lark_md",
-                content: format!("**{title}**"),
+                content: lark_card_markdown(format!("**{title}**")),
             },
         });
     }
@@ -1130,7 +1130,7 @@ fn format_signal_card_elements(card_body: FeishuLarkCardBody) -> Vec<FeishuLarkC
     }
     if !card_body.other_details.is_empty() {
         elements.push(FeishuLarkCardElement::Markdown {
-            content: card_body.other_details.join("\n"),
+            content: lark_card_markdown(card_body.other_details.join("\n")),
         });
     }
 
@@ -1156,7 +1156,7 @@ fn format_signal_card_elements(card_body: FeishuLarkCardBody) -> Vec<FeishuLarkC
 
     if let Some(prompt) = card_body.prompt {
         elements.push(FeishuLarkCardElement::Markdown {
-            content: format!("**Prompt**\n{prompt}"),
+            content: lark_card_markdown(format!("**Prompt**\n{prompt}")),
         });
     }
 
@@ -1165,7 +1165,7 @@ fn format_signal_card_elements(card_body: FeishuLarkCardBody) -> Vec<FeishuLarkC
             elements.push(FeishuLarkCardElement::Divider);
         }
         elements.push(FeishuLarkCardElement::Markdown {
-            content: format!("**{}**\n{}", answer.label, answer.content),
+            content: lark_card_markdown(format!("**{}**\n{}", answer.label, answer.content)),
         });
     }
 
@@ -1415,10 +1415,18 @@ fn metric_column(label: &str, value: &str, secondary_value: Option<&str>) -> Fei
         elements: vec![FeishuLarkCardElement::Div {
             text: FeishuLarkLarkMarkdown {
                 tag: "lark_md",
-                content,
+                content: lark_card_markdown(content),
             },
         }],
     }
+}
+
+fn lark_card_markdown(content: impl Into<String>) -> String {
+    let content = content.into();
+    // Feishu/Lark cards treat `![alt](url)` as an image element and reject it
+    // unless the URL is an uploaded image_key. Agent output may include local
+    // Markdown image links, so render the marker as text in notification cards.
+    content.replace("![", "\\![")
 }
 
 fn strip_numeric_timezone(value: &str) -> &str {

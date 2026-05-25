@@ -829,6 +829,32 @@ fn formats_codex_desktop_message_with_clickable_open_link() {
 }
 
 #[test]
+fn escapes_markdown_image_markers_in_card_markdown() {
+    let signal = structured_codex_signal(
+        Some("agents-router sync report"),
+        None,
+        Some(SignalAnswer {
+            kind: SignalAnswerKind::Full,
+            content: "See ![screenshot](/tmp/smoke.png) for the browser smoke.".to_string(),
+        }),
+    );
+
+    let elements = format_signal_card_elements_with_time(&signal, "2026-05-10 01:35:42 +08:00");
+    let answer = elements
+        .iter()
+        .find_map(|element| match element {
+            FeishuLarkCardElement::Markdown { content } if content.contains("screenshot") => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .expect("answer markdown should be present");
+
+    assert!(answer.contains(r"\![screenshot](/tmp/smoke.png)"));
+    assert!(!answer.contains(" ![screenshot]"));
+}
+
+#[test]
 fn builds_card_body_from_structured_signal() {
     let signal = structured_codex_signal(
         None,
@@ -1342,6 +1368,7 @@ fn lark_hidden_e2e_surface() -> NewResponseSurface {
         provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
         provider_message_id: "om_root_message_id".to_string(),
         provider_thread_id: "om_root_message_id".to_string(),
+        route_binding_hash: None,
     }
 }
 
