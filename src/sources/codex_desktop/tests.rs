@@ -84,6 +84,181 @@ fn first_run_skips_existing_rollout_events_then_emits_new_events() {
 }
 
 #[test]
+fn restart_skips_known_file_backlog_then_emits_runtime_append() {
+    let dir = tempdir().expect("tempdir should be created");
+    let sessions_dir = dir.path().join("sessions");
+    let day_dir = sessions_dir.join("2026").join("05").join("10");
+    fs::create_dir_all(&day_dir).expect("session dir should be created");
+    let rollout_path = day_dir.join("rollout-2026-05-10T01-00-00-session-1.jsonl");
+    let index_path = dir.path().join("session_index.jsonl");
+    let state_path = dir.path().join("source-state.json");
+
+    write_lines(&rollout_path, &[session_meta_line("session-1")]);
+    write_lines(
+        &index_path,
+        &[r#"{"id":"session-1","thread_name":"agents-router sync report","updated_at":"2026-05-09T17:00:00Z"}"#.to_string()],
+    );
+
+    let mut watcher = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher should start");
+    watcher
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .and_then(|batch| watcher.commit(batch))
+        .expect("initial poll should pass");
+
+    append_line(
+        &rollout_path,
+        &task_complete_line("turn-downtime", "2026-05-09T17:01:32.000Z", "missed"),
+    );
+
+    let mut restarted = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher restart should baseline downtime backlog");
+    let after_restart = restarted
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .expect("post-restart poll should pass");
+    assert!(
+        after_restart.signals.is_empty(),
+        "Codex Desktop source must not replay completions written while service was down"
+    );
+    restarted
+        .commit(after_restart)
+        .expect("post-restart baseline should commit");
+
+    append_line(&rollout_path, &turn_context_line("gpt-5.5"));
+    append_line(
+        &rollout_path,
+        &task_complete_line("turn-runtime", "2026-05-09T17:02:32.000Z", "new result"),
+    );
+    let runtime_batch = restarted
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .expect("runtime poll should pass");
+
+    assert_eq!(runtime_batch.signals.len(), 1);
+    assert_eq!(
+        runtime_batch.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.turn_id.as_deref()),
+        Some("turn-runtime")
+    );
+    assert_eq!(
+        runtime_batch.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.answer.as_ref())
+            .map(|answer| answer.content.as_str()),
+        Some("new result")
+    );
+}
+
+#[test]
+fn restart_skips_new_file_created_while_stopped_then_emits_runtime_append() {
+    let dir = tempdir().expect("tempdir should be created");
+    let sessions_dir = dir.path().join("sessions");
+    let day_dir = sessions_dir.join("2026").join("05").join("10");
+    fs::create_dir_all(&day_dir).expect("session dir should be created");
+    let first_rollout_path = day_dir.join("rollout-2026-05-10T01-00-00-session-1.jsonl");
+    let second_rollout_path = day_dir.join("rollout-2026-05-10T02-00-00-session-2.jsonl");
+    let index_path = dir.path().join("session_index.jsonl");
+    let state_path = dir.path().join("source-state.json");
+
+    write_lines(&first_rollout_path, &[session_meta_line("session-1")]);
+    write_lines(
+        &index_path,
+        &[
+            r#"{"id":"session-1","thread_name":"agents-router sync report","updated_at":"2026-05-09T17:00:00Z"}"#.to_string(),
+            r#"{"id":"session-2","thread_name":"agents-router runtime report","updated_at":"2026-05-09T17:00:00Z"}"#.to_string(),
+        ],
+    );
+
+    let mut watcher = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher should start");
+    watcher
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .and_then(|batch| watcher.commit(batch))
+        .expect("initial poll should pass");
+
+    write_lines(
+        &second_rollout_path,
+        &[
+            session_meta_line("session-2"),
+            task_complete_line("turn-downtime", "2026-05-09T17:01:32.000Z", "missed"),
+        ],
+    );
+
+    let mut restarted = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher restart should baseline downtime file");
+    let after_restart = restarted
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .expect("post-restart poll should pass");
+    assert!(
+        after_restart.signals.is_empty(),
+        "Codex Desktop source must not replay session files created while service was down"
+    );
+    restarted
+        .commit(after_restart)
+        .expect("post-restart baseline should commit");
+
+    append_line(
+        &second_rollout_path,
+        &task_complete_line("turn-runtime", "2026-05-09T17:02:32.000Z", "new result"),
+    );
+    let runtime_batch = restarted
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .expect("runtime poll should pass");
+
+    assert_eq!(runtime_batch.signals.len(), 1);
+    assert_eq!(
+        runtime_batch.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.turn_id.as_deref()),
+        Some("turn-runtime")
+    );
+    assert_eq!(
+        runtime_batch.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.session_id.as_deref()),
+        Some("session-2")
+    );
+}
+
+#[test]
 fn prompt_detail_on_attaches_prompt_without_persisting_it() {
     let dir = tempdir().expect("tempdir should be created");
     let sessions_dir = dir.path().join("sessions");

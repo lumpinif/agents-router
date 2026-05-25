@@ -169,14 +169,12 @@ struct CodexDesktopSessionWatcher {
     state_path: PathBuf,
     state: WatchState,
     pending_prompts: BTreeMap<String, String>,
-    bootstrap_existing_files: bool,
 }
 
 struct CodexDesktopPollBatch {
     signals: Vec<Signal>,
     state: WatchState,
     pending_prompts: BTreeMap<String, String>,
-    bootstrap_existing_files: bool,
     changed: bool,
 }
 
@@ -187,16 +185,14 @@ impl CodexDesktopSessionWatcher {
         state_path: PathBuf,
     ) -> anyhow::Result<Self> {
         let state = WatchState::load(&state_path)?;
-        let bootstrap_existing_files = !state_path.exists();
         let mut watcher = Self {
             sessions_dir,
             session_index_path,
             state_path,
             state,
             pending_prompts: BTreeMap::new(),
-            bootstrap_existing_files,
         };
-        watcher.bootstrap()?;
+        watcher.baseline_existing_files()?;
         Ok(watcher)
     }
 
@@ -215,11 +211,7 @@ impl CodexDesktopSessionWatcher {
         for path in discover_rollout_paths(&self.sessions_dir)? {
             let path_key = path_key(&path);
             if !state.files.contains_key(&path_key) {
-                let offset = if self.bootstrap_existing_files {
-                    completed_rollout_offset(&path)?
-                } else {
-                    0
-                };
+                let offset = 0;
                 let session = read_session_info(&path)?;
                 state
                     .files
@@ -318,7 +310,6 @@ impl CodexDesktopSessionWatcher {
             signals,
             state,
             pending_prompts,
-            bootstrap_existing_files: false,
             changed,
         })
     }
@@ -326,45 +317,54 @@ impl CodexDesktopSessionWatcher {
     fn commit(&mut self, batch: CodexDesktopPollBatch) -> anyhow::Result<()> {
         self.state = batch.state;
         self.pending_prompts = batch.pending_prompts;
-        self.bootstrap_existing_files = batch.bootstrap_existing_files;
         if batch.changed {
             self.save_state()?;
         }
         Ok(())
     }
 
-    fn bootstrap(&mut self) -> anyhow::Result<()> {
-        if !self.bootstrap_existing_files {
-            for path in discover_rollout_paths(&self.sessions_dir)? {
-                let path_key = path_key(&path);
-                if let Some(file_state) = self.state.files.get_mut(&path_key) {
-                    file_state.session = read_session_info(&path)?;
-                }
-            }
-            return Ok(());
-        }
-
+    fn baseline_existing_files(&mut self) -> anyhow::Result<()> {
+        // Completion notifications are live events. A watch restart should not
+        // replay tasks that finished while agents-router was not running.
         let mut changed = false;
+        let mut discovered_files = 0usize;
+        let mut inserted_files = 0usize;
+        let mut updated_offsets = 0usize;
+        let mut refreshed_sessions = 0usize;
         for path in discover_rollout_paths(&self.sessions_dir)? {
+            discovered_files += 1;
             let path_key = path_key(&path);
-            if self.state.files.contains_key(&path_key) {
-                continue;
-            }
-
             let offset = completed_rollout_offset(&path)?;
-            self.state.files.insert(
-                path_key,
-                FileWatchState {
-                    offset,
-                    session: read_session_info(&path)?,
-                },
-            );
-            changed = true;
+            let session = read_session_info(&path)?;
+
+            if let Some(file_state) = self.state.files.get_mut(&path_key) {
+                if file_state.offset != offset {
+                    file_state.offset = offset;
+                    updated_offsets += 1;
+                    changed = true;
+                }
+                file_state.session = session;
+                refreshed_sessions += 1;
+            } else {
+                self.state
+                    .files
+                    .insert(path_key, FileWatchState { offset, session });
+                inserted_files += 1;
+                changed = true;
+            }
         }
 
         if changed {
             self.save_state()?;
         }
+        info!(
+            files.discovered = discovered_files,
+            files.inserted = inserted_files,
+            files.offsets_updated = updated_offsets,
+            files.sessions_refreshed = refreshed_sessions,
+            state.path = %self.state_path.display(),
+            event = "codex_desktop.watch.startup_baseline",
+        );
 
         Ok(())
     }
