@@ -33,8 +33,8 @@ use crate::providers::feishu_lark_long_connection::{
     FeishuLarkLongConnectionRuntime,
 };
 use crate::response_surface_ledger::{
-    InboundEventClaimDecision, InboundEventDedupInput, NewResponseSurface,
-    ProcessedInboundEventDecision, ResponseSurfaceLedger,
+    InboundEventClaimDecision, InboundEventDedupInput, InboundEventRecordDecision,
+    NewResponseSurface, ResponseSurfaceLedger,
 };
 use crate::response_surface_policy::ResponseSurfacePolicySkipReason;
 use crate::signal::{
@@ -449,8 +449,8 @@ async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_proces
         Some("om_result_reply_message_id")
     );
     assert!(matches!(
-        completion.processed,
-        ProcessedInboundEventDecision::Recorded { .. }
+        completion.inbound_event,
+        InboundEventRecordDecision::Recorded { .. }
     ));
 
     let controller_requests = controller.requests();

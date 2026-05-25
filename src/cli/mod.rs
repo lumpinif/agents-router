@@ -1373,8 +1373,28 @@ async fn run_watch(config_path: &Path, config: ValidatedConfig) -> anyhow::Resul
     local_integrations::ensure_local_source_integrations(&config)?;
     let runtime =
         RuntimeState::new_with_delivery_safety(config, DeliverySafetyGuard::load_default()?)?;
+    log_unfinished_response_surface_events(&runtime).await?;
     let endpoint = ingress_endpoint()?;
     run_service_tasks(config_path.to_path_buf(), runtime, endpoint).await
+}
+
+async fn log_unfinished_response_surface_events(runtime: &RuntimeState) -> anyhow::Result<()> {
+    for record in runtime
+        .response_surface_ledger()
+        .unfinished_inbound_events()
+        .await?
+    {
+        tracing::warn!(
+            provider.id = %record.provider_id,
+            provider.type = %record.provider_type,
+            surface.id = %record.surface_id,
+            event.hash = %record.provider_event_id_hash,
+            inbound.status = %record.status.as_str(),
+            received.at = %record.received_at,
+            event = "response_surface.inbound_event.unfinished_on_start",
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

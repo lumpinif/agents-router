@@ -352,6 +352,7 @@ pub fn lookup_and_claim_provider_surface_reply(
         InboundEventClaimDecision::AlreadyProcessing {
             surface_id,
             provider_event_id_hash,
+            status,
         } => {
             info!(
                 provider.id = %reply.provider_id,
@@ -359,6 +360,7 @@ pub fn lookup_and_claim_provider_surface_reply(
                 provider.mode = %reply.provider_mode.as_str(),
                 surface.id = %surface_id,
                 event.hash = %provider_event_id_hash,
+                inbound.status = %status.as_str(),
                 event = "provider_inbound.event_claim.already_processing",
             );
             Ok(ProviderInboundDecision::Skip(
@@ -368,6 +370,7 @@ pub fn lookup_and_claim_provider_surface_reply(
         InboundEventClaimDecision::DuplicateProcessed {
             surface_id,
             provider_event_id_hash,
+            status,
         } => {
             info!(
                 provider.id = %reply.provider_id,
@@ -375,6 +378,7 @@ pub fn lookup_and_claim_provider_surface_reply(
                 provider.mode = %reply.provider_mode.as_str(),
                 surface.id = %surface_id,
                 event.hash = %provider_event_id_hash,
+                inbound.status = %status.as_str(),
                 event = "provider_inbound.event_claim.duplicate_processed",
             );
             Ok(ProviderInboundDecision::Skip(
@@ -508,7 +512,7 @@ mod tests {
 
     use super::*;
     use crate::provider_catalog::{ProviderMode, provider_mode_capability};
-    use crate::response_surface_ledger::{NewResponseSurface, ProcessedInboundEventDecision};
+    use crate::response_surface_ledger::{InboundEventRecordDecision, NewResponseSurface};
 
     #[test]
     fn normalizes_slack_socket_mode_surface_reply_using_thread_ts_as_lookup_key() {
@@ -909,7 +913,7 @@ mod tests {
                     now + Duration::seconds(1),
                 )
                 .expect("processed event should record"),
-            ProcessedInboundEventDecision::Recorded { .. }
+            InboundEventRecordDecision::Recorded { .. }
         ));
 
         let decision = lookup_and_claim_provider_surface_reply(

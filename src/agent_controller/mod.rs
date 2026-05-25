@@ -12,8 +12,8 @@ use crate::config::{RouteConfig, SourceType, ValidatedConfig};
 use crate::provider_catalog::{ProviderModeCapability, provider_config_mode_capability};
 use crate::provider_inbound::ProviderInboundReady;
 use crate::response_surface_ledger::{
-    InboundEventDedupInput, ProcessedInboundEventDecision, ResponseSurfaceLedger,
-    ResponseSurfaceLedgerStore,
+    InboundEventDedupInput, InboundEventDedupStatus, InboundEventRecordDecision,
+    ResponseSurfaceLedger, ResponseSurfaceLedgerStore,
 };
 use crate::response_surface_policy::{
     ResponseSurfaceDeliveryReceipt, ResponseSurfacePolicyDecision, ResponseSurfacePolicyInput,
@@ -23,6 +23,8 @@ use crate::response_surface_policy::{
 use crate::response_surface_runtime::response_surface_route_binding_hash;
 
 pub mod codex_app_server;
+
+const SUBMITTED_UNKNOWN_NOTICE_TEXT: &str = "Your reply may have reached Codex, but Agents Router could not confirm the final result. To avoid running it twice, it will not retry automatically. Please check Codex Desktop.";
 
 pub type AgentControllerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
@@ -157,7 +159,7 @@ pub enum AgentControllerClosedLoopDecision {
 pub struct AgentControllerClosedLoopCompletion {
     pub outcome: AgentControllerClosedLoopOutcome,
     pub provider_reply_message_id: Option<String>,
-    pub processed: ProcessedInboundEventDecision,
+    pub inbound_event: InboundEventRecordDecision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,9 +273,16 @@ impl<'a> AgentControllerRuntime<'a> {
         match &decision {
             AgentControllerRuntimeDecision::Skipped(_) => release_inbound_claim(ledger, &ready)?,
             AgentControllerRuntimeDecision::Failed(error) => {
-                release_claim_if_controller_failed_before_submit(ledger, &ready, error)?;
+                if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
+                {
+                    release_inbound_claim(ledger, &ready)?;
+                } else {
+                    record_submitted_possible(ledger, &ready, Utc::now())?;
+                }
             }
-            AgentControllerRuntimeDecision::Executed(_) => {}
+            AgentControllerRuntimeDecision::Executed(_) => {
+                record_submitted_possible(ledger, &ready, Utc::now())?;
+            }
         }
 
         Ok(decision)
@@ -382,16 +391,24 @@ impl<'a> AgentControllerRuntime<'a> {
             AgentControllerRuntimeDecision::Failed(error) => {
                 if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
                 {
-                    return send_result_reply_and_record_processed_with_store(
+                    return send_reply_and_record_status_with_store(
                         ledger_store,
                         &ready,
                         provider_reply,
                         AgentControllerClosedLoopOutcome::ControllerFailed(error),
+                        InboundEventDedupStatus::FailedNotified,
                         now,
                     )
                     .await;
                 }
-                return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
+                return send_submitted_unknown_notice_with_store(
+                    ledger_store,
+                    &ready,
+                    provider_reply,
+                    error,
+                    now,
+                )
+                .await;
             }
             AgentControllerRuntimeDecision::Skipped(reason) => {
                 ledger_store
@@ -404,11 +421,13 @@ impl<'a> AgentControllerRuntime<'a> {
             }
         };
 
-        send_result_reply_and_record_processed_with_store(
+        record_submitted_possible_with_store(ledger_store, &ready, now).await?;
+        send_reply_and_record_status_with_store(
             ledger_store,
             &ready,
             provider_reply,
             outcome,
+            InboundEventDedupStatus::Processed,
             now,
         )
         .await
@@ -490,28 +509,44 @@ impl<'a> AgentControllerRuntime<'a> {
             Ok(result) => match controller_execution_from_success(&request, &ready, result) {
                 Ok(execution) => AgentControllerClosedLoopOutcome::ControllerSucceeded(execution),
                 Err(error) => {
-                    release_claim_if_controller_failed_before_submit(ledger, &ready, &error)?;
-                    return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
+                    return send_submitted_unknown_notice(
+                        ledger,
+                        &ready,
+                        provider_reply,
+                        error,
+                        now,
+                    )
+                    .await;
                 }
             },
             Err(error) => {
                 if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
                 {
-                    return send_result_reply_and_record_processed(
+                    return send_reply_and_record_status(
                         ledger,
                         &ready,
                         provider_reply,
                         AgentControllerClosedLoopOutcome::ControllerFailed(error),
+                        InboundEventDedupStatus::FailedNotified,
                         now,
                     )
                     .await;
                 }
-                release_claim_if_controller_failed_before_submit(ledger, &ready, &error)?;
-                return Ok(AgentControllerClosedLoopDecision::ControllerFailed(error));
+                return send_submitted_unknown_notice(ledger, &ready, provider_reply, error, now)
+                    .await;
             }
         };
 
-        send_result_reply_and_record_processed(ledger, &ready, provider_reply, outcome, now).await
+        record_submitted_possible(ledger, &ready, now)?;
+        send_reply_and_record_status(
+            ledger,
+            &ready,
+            provider_reply,
+            outcome,
+            InboundEventDedupStatus::Processed,
+            now,
+        )
+        .await
     }
 
     fn prepare_inbound_continuation(
@@ -701,11 +736,34 @@ fn controller_execution_from_success(
     })
 }
 
-async fn send_result_reply_and_record_processed(
+async fn send_reply_and_record_status(
     ledger: &mut ResponseSurfaceLedger,
     ready: &ProviderInboundReady,
     provider_reply: &dyn ProviderThreadReplyAdapter,
     outcome: AgentControllerClosedLoopOutcome,
+    record_status: InboundEventDedupStatus,
+    now: DateTime<Utc>,
+) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+    let text = provider_thread_result_text(&outcome).to_string();
+    send_explicit_text_reply_and_record_status(
+        ledger,
+        ready,
+        provider_reply,
+        outcome,
+        &text,
+        record_status,
+        now,
+    )
+    .await
+}
+
+async fn send_explicit_text_reply_and_record_status(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    outcome: AgentControllerClosedLoopOutcome,
+    text: &str,
+    record_status: InboundEventDedupStatus,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
     if provider_reply.provider_id() != ready.reply.provider_id
@@ -724,7 +782,7 @@ async fn send_result_reply_and_record_processed(
         );
     }
 
-    let request = provider_thread_reply_request(ready, provider_thread_result_text(&outcome));
+    let request = provider_thread_reply_request(ready, text);
     info!(
         surface.id = %ready.surface.surface_id,
         provider.id = %ready.reply.provider_id,
@@ -765,34 +823,46 @@ async fn send_result_reply_and_record_processed(
         }
     };
 
-    // agents-router does not set an agent execution hard timeout. The event is
-    // processed only after the controller outcome is replied back to the thread.
-    let processed = ledger
-        .record_processed_inbound_event_at(inbound_event_input(ready), now)
-        .context("failed to record processed inbound event")?;
-    info!(
-        surface.id = %ready.surface.surface_id,
-        provider.id = %ready.reply.provider_id,
-        provider.type = %ready.reply.provider_type,
-        event.hash = %ready.provider_event_id_hash,
-        processed = ?processed,
-        event = "response_surface.inbound_event.processed",
-    );
+    let inbound_event = record_inbound_event_status(ledger, ready, record_status, now)?;
+    log_inbound_event_recorded(ready, record_status, &inbound_event);
 
     Ok(AgentControllerClosedLoopDecision::Completed(
         AgentControllerClosedLoopCompletion {
             outcome,
             provider_reply_message_id: provider_reply_success.provider_reply_message_id,
-            processed,
+            inbound_event,
         },
     ))
 }
 
-async fn send_result_reply_and_record_processed_with_store(
+async fn send_reply_and_record_status_with_store(
     ledger_store: &ResponseSurfaceLedgerStore,
     ready: &ProviderInboundReady,
     provider_reply: &dyn ProviderThreadReplyAdapter,
     outcome: AgentControllerClosedLoopOutcome,
+    record_status: InboundEventDedupStatus,
+    now: DateTime<Utc>,
+) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+    let text = provider_thread_result_text(&outcome).to_string();
+    send_explicit_text_reply_and_record_status_with_store(
+        ledger_store,
+        ready,
+        provider_reply,
+        outcome,
+        &text,
+        record_status,
+        now,
+    )
+    .await
+}
+
+async fn send_explicit_text_reply_and_record_status_with_store(
+    ledger_store: &ResponseSurfaceLedgerStore,
+    ready: &ProviderInboundReady,
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    outcome: AgentControllerClosedLoopOutcome,
+    text: &str,
+    record_status: InboundEventDedupStatus,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
     if provider_reply.provider_id() != ready.reply.provider_id
@@ -811,7 +881,7 @@ async fn send_result_reply_and_record_processed_with_store(
         );
     }
 
-    let request = provider_thread_reply_request(ready, provider_thread_result_text(&outcome));
+    let request = provider_thread_reply_request(ready, text);
     info!(
         surface.id = %ready.surface.surface_id,
         provider.id = %ready.reply.provider_id,
@@ -852,29 +922,58 @@ async fn send_result_reply_and_record_processed_with_store(
         }
     };
 
-    let processed = ledger_store
-        .update(|ledger| {
-            ledger
-                .record_processed_inbound_event_at(inbound_event_input(ready), now)
-                .context("failed to record processed inbound event")
-        })
+    let inbound_event = ledger_store
+        .update(|ledger| record_inbound_event_status(ledger, ready, record_status, now))
         .await?;
-    info!(
-        surface.id = %ready.surface.surface_id,
-        provider.id = %ready.reply.provider_id,
-        provider.type = %ready.reply.provider_type,
-        event.hash = %ready.provider_event_id_hash,
-        processed = ?processed,
-        event = "response_surface.inbound_event.processed",
-    );
+    log_inbound_event_recorded(ready, record_status, &inbound_event);
 
     Ok(AgentControllerClosedLoopDecision::Completed(
         AgentControllerClosedLoopCompletion {
             outcome,
             provider_reply_message_id: provider_reply_success.provider_reply_message_id,
-            processed,
+            inbound_event,
         },
     ))
+}
+
+async fn send_submitted_unknown_notice(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    error: AgentControllerError,
+    now: DateTime<Utc>,
+) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+    record_submitted_possible(ledger, ready, now)?;
+    send_explicit_text_reply_and_record_status(
+        ledger,
+        ready,
+        provider_reply,
+        AgentControllerClosedLoopOutcome::ControllerFailed(error),
+        SUBMITTED_UNKNOWN_NOTICE_TEXT,
+        InboundEventDedupStatus::SubmittedUnknownNotified,
+        now,
+    )
+    .await
+}
+
+async fn send_submitted_unknown_notice_with_store(
+    ledger_store: &ResponseSurfaceLedgerStore,
+    ready: &ProviderInboundReady,
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    error: AgentControllerError,
+    now: DateTime<Utc>,
+) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+    record_submitted_possible_with_store(ledger_store, ready, now).await?;
+    send_explicit_text_reply_and_record_status_with_store(
+        ledger_store,
+        ready,
+        provider_reply,
+        AgentControllerClosedLoopOutcome::ControllerFailed(error),
+        SUBMITTED_UNKNOWN_NOTICE_TEXT,
+        InboundEventDedupStatus::SubmittedUnknownNotified,
+        now,
+    )
+    .await
 }
 
 fn provider_thread_reply_request(
@@ -890,6 +989,34 @@ fn provider_thread_reply_request(
         surface_id: ready.surface.surface_id.clone(),
         provider_event_id_hash: ready.provider_event_id_hash.clone(),
         text: text.into(),
+    }
+}
+
+fn log_inbound_event_recorded(
+    ready: &ProviderInboundReady,
+    status: InboundEventDedupStatus,
+    decision: &InboundEventRecordDecision,
+) {
+    if status == InboundEventDedupStatus::Processed {
+        info!(
+            surface.id = %ready.surface.surface_id,
+            provider.id = %ready.reply.provider_id,
+            provider.type = %ready.reply.provider_type,
+            event.hash = %ready.provider_event_id_hash,
+            inbound.status = %status.as_str(),
+            recorded = ?decision,
+            event = "response_surface.inbound_event.processed",
+        );
+    } else {
+        info!(
+            surface.id = %ready.surface.surface_id,
+            provider.id = %ready.reply.provider_id,
+            provider.type = %ready.reply.provider_type,
+            event.hash = %ready.provider_event_id_hash,
+            inbound.status = %status.as_str(),
+            recorded = ?decision,
+            event = "response_surface.inbound_event.recorded",
+        );
     }
 }
 
@@ -1050,15 +1177,71 @@ fn release_inbound_claim(
     Ok(())
 }
 
-fn release_claim_if_controller_failed_before_submit(
+fn record_submitted_possible(
     ledger: &mut ResponseSurfaceLedger,
     ready: &ProviderInboundReady,
-    error: &AgentControllerError,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if error.submit_boundary == AgentControllerFailureSubmitBoundary::FailedBeforeSubmit {
-        release_inbound_claim(ledger, ready)?;
-    }
+    let decision = ledger
+        .record_submitted_possible_inbound_event_at(inbound_event_input(ready), now)
+        .context("failed to record submitted possible inbound event")?;
+    info!(
+        surface.id = %ready.surface.surface_id,
+        provider.id = %ready.reply.provider_id,
+        provider.type = %ready.reply.provider_type,
+        event.hash = %ready.provider_event_id_hash,
+        decision = ?decision,
+        event = "response_surface.inbound_event.submitted_possible",
+    );
     Ok(())
+}
+
+async fn record_submitted_possible_with_store(
+    ledger_store: &ResponseSurfaceLedgerStore,
+    ready: &ProviderInboundReady,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let decision = ledger_store
+        .update(|ledger| {
+            ledger
+                .record_submitted_possible_inbound_event_at(inbound_event_input(ready), now)
+                .context("failed to record submitted possible inbound event")
+        })
+        .await?;
+    info!(
+        surface.id = %ready.surface.surface_id,
+        provider.id = %ready.reply.provider_id,
+        provider.type = %ready.reply.provider_type,
+        event.hash = %ready.provider_event_id_hash,
+        decision = ?decision,
+        event = "response_surface.inbound_event.submitted_possible",
+    );
+    Ok(())
+}
+
+fn record_inbound_event_status(
+    ledger: &mut ResponseSurfaceLedger,
+    ready: &ProviderInboundReady,
+    status: InboundEventDedupStatus,
+    now: DateTime<Utc>,
+) -> anyhow::Result<InboundEventRecordDecision> {
+    match status {
+        InboundEventDedupStatus::Processed => ledger
+            .record_processed_inbound_event_at(inbound_event_input(ready), now)
+            .context("failed to record processed inbound event"),
+        InboundEventDedupStatus::FailedNotified => ledger
+            .record_failed_notified_inbound_event_at(inbound_event_input(ready), now)
+            .context("failed to record failed notified inbound event"),
+        InboundEventDedupStatus::SubmittedUnknownNotified => ledger
+            .record_submitted_unknown_notified_inbound_event_at(inbound_event_input(ready), now)
+            .context("failed to record submitted unknown notified inbound event"),
+        InboundEventDedupStatus::SubmittedPossible => ledger
+            .record_submitted_possible_inbound_event_at(inbound_event_input(ready), now)
+            .context("failed to record submitted possible inbound event"),
+        InboundEventDedupStatus::ClaimedBeforeSubmit => {
+            anyhow::bail!("claimed_before_submit is only written by inbound event claim")
+        }
+    }
 }
 
 fn inbound_event_input(ready: &ProviderInboundReady) -> InboundEventDedupInput {
@@ -1365,7 +1548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_failed_after_possible_submit_keeps_processing() {
+    async fn controller_failed_after_possible_submit_marks_submitted_possible() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::with_error_after_possible_submit(
             AgentControllerErrorKind::ControllerRejected,
@@ -1391,11 +1574,11 @@ mod tests {
                 ..
             })
         ));
-        assert_event_is_still_processing(&mut ledger, ready);
+        assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
     #[tokio::test]
-    async fn duplicate_provider_event_does_not_call_controller_twice_after_possible_submit() {
+    async fn submitted_unknown_notice_success_marks_terminal_and_skips_duplicate() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = RecordingAdapter::with_error_after_possible_submit(
             AgentControllerErrorKind::ControllerRejected,
@@ -1418,11 +1601,22 @@ mod tests {
 
         assert!(matches!(
             decision,
-            AgentControllerClosedLoopDecision::ControllerFailed(AgentControllerError {
-                submit_boundary: AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
+                    submit_boundary:
+                        AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                    ..
+                }),
+                inbound_event: InboundEventRecordDecision::Recorded {
+                    status: InboundEventDedupStatus::SubmittedUnknownNotified,
+                    ..
+                },
                 ..
             })
         ));
+        let provider_requests = provider_reply.requests();
+        assert_eq!(provider_requests.len(), 1);
+        assert_eq!(provider_requests[0].text, SUBMITTED_UNKNOWN_NOTICE_TEXT);
         let duplicate = lookup_and_claim_provider_surface_reply(
             &mut ledger,
             slack_app_capability(),
@@ -1434,11 +1628,53 @@ mod tests {
         assert!(matches!(
             duplicate,
             ProviderInboundDecision::Skip(
-                crate::provider_inbound::ProviderInboundSkipReason::EventAlreadyProcessing { .. }
+                crate::provider_inbound::ProviderInboundSkipReason::DuplicateEvent { .. }
             )
         ));
         assert_eq!(adapter.requests().len(), 1);
-        assert!(provider_reply.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn submitted_unknown_notice_failure_keeps_submitted_possible() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_error_after_possible_submit(
+            AgentControllerErrorKind::ControllerRejected,
+        );
+        let provider_reply =
+            RecordingProviderThreadReplyAdapter::with_error("submitted unknown notice failed");
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::ProviderThreadReplyFailed(
+                AgentControllerProviderThreadReplyFailure {
+                    outcome: AgentControllerClosedLoopOutcome::ControllerFailed(
+                        AgentControllerError {
+                            submit_boundary:
+                                AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                            ..
+                        }
+                    ),
+                    ..
+                }
+            )
+        ));
+        assert_eq!(adapter.requests().len(), 1);
+        assert_eq!(provider_reply.requests().len(), 1);
+        assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
     #[tokio::test]
@@ -1505,11 +1741,12 @@ mod tests {
         ));
         assert_eq!(adapter.requests().len(), 1);
         assert_eq!(provider_reply.requests().len(), 1);
-        assert_event_is_still_processing(&mut ledger, ready);
+        assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
     #[tokio::test]
-    async fn closed_loop_controller_failed_before_submit_replies_failure_and_marks_processed() {
+    async fn closed_loop_controller_failed_before_submit_replies_failure_and_marks_failed_notified()
+    {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter =
             RecordingAdapter::with_error_before_submit(AgentControllerErrorKind::SessionNotFound);
@@ -1537,6 +1774,10 @@ mod tests {
                     submit_boundary: AgentControllerFailureSubmitBoundary::FailedBeforeSubmit,
                     ..
                 }),
+                inbound_event: InboundEventRecordDecision::Recorded {
+                    status: InboundEventDedupStatus::FailedNotified,
+                    ..
+                },
                 ..
             })
         ));
@@ -1546,7 +1787,11 @@ mod tests {
             provider_requests[0].text,
             "The original agent session was not found."
         );
-        assert_event_is_duplicate_processed(&mut ledger, ready);
+        assert_event_is_terminal_duplicate(
+            &mut ledger,
+            ready,
+            InboundEventDedupStatus::FailedNotified,
+        );
     }
 
     #[tokio::test]
@@ -1578,6 +1823,10 @@ mod tests {
                     submit_boundary: AgentControllerFailureSubmitBoundary::FailedBeforeSubmit,
                     ..
                 }),
+                inbound_event: InboundEventRecordDecision::Recorded {
+                    status: InboundEventDedupStatus::FailedNotified,
+                    ..
+                },
                 ..
             })
         ));
@@ -1587,11 +1836,15 @@ mod tests {
             provider_requests[0].text,
             "The original Codex session is still running. Please reply again after it finishes."
         );
-        assert_event_is_duplicate_processed(&mut ledger, ready);
+        assert_event_is_terminal_duplicate(
+            &mut ledger,
+            ready,
+            InboundEventDedupStatus::FailedNotified,
+        );
     }
 
     #[tokio::test]
-    async fn closed_loop_controller_success_without_result_text_is_treated_as_failure() {
+    async fn closed_loop_controller_success_without_result_text_reports_submitted_unknown() {
         let (mut ledger, ready) = ledger_and_ready_with_claim();
         let adapter = EmptyResultAdapter::default();
         let provider_reply = RecordingProviderThreadReplyAdapter::default();
@@ -1612,14 +1865,28 @@ mod tests {
 
         assert!(matches!(
             decision,
-            AgentControllerClosedLoopDecision::ControllerFailed(AgentControllerError {
-                kind: AgentControllerErrorKind::Internal,
-                submit_boundary: AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerFailed(AgentControllerError {
+                    kind: AgentControllerErrorKind::Internal,
+                    submit_boundary:
+                        AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit,
+                    ..
+                }),
+                inbound_event: InboundEventRecordDecision::Recorded {
+                    status: InboundEventDedupStatus::SubmittedUnknownNotified,
+                    ..
+                },
                 ..
             })
         ));
-        assert!(provider_reply.requests().is_empty());
-        assert_event_is_still_processing(&mut ledger, ready);
+        let provider_requests = provider_reply.requests();
+        assert_eq!(provider_requests.len(), 1);
+        assert_eq!(provider_requests[0].text, SUBMITTED_UNKNOWN_NOTICE_TEXT);
+        assert_event_is_terminal_duplicate(
+            &mut ledger,
+            ready,
+            InboundEventDedupStatus::SubmittedUnknownNotified,
+        );
     }
 
     #[test]
@@ -1905,14 +2172,25 @@ mod tests {
         ledger: &mut ResponseSurfaceLedger,
         ready: ProviderInboundReady,
     ) {
+        assert_event_is_terminal_duplicate(ledger, ready, InboundEventDedupStatus::Processed);
+    }
+
+    fn assert_event_is_terminal_duplicate(
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+        status: InboundEventDedupStatus,
+    ) {
         assert!(matches!(
             ledger
                 .claim_inbound_event_at(
                     inbound_event_input(&ready),
                     test_time() + Duration::seconds(3),
                 )
-                .expect("processed event should be duplicate"),
-            InboundEventClaimDecision::DuplicateProcessed { .. }
+                .expect("terminal event should be duplicate"),
+            InboundEventClaimDecision::DuplicateProcessed {
+                status: duplicate_status,
+                ..
+            } if duplicate_status == status
         ));
     }
 
@@ -1928,6 +2206,24 @@ mod tests {
                 )
                 .expect("incomplete event should still be processing"),
             InboundEventClaimDecision::AlreadyProcessing { .. }
+        ));
+    }
+
+    fn assert_event_is_submitted_possible(
+        ledger: &mut ResponseSurfaceLedger,
+        ready: ProviderInboundReady,
+    ) {
+        assert!(matches!(
+            ledger
+                .claim_inbound_event_at(
+                    inbound_event_input(&ready),
+                    test_time() + Duration::seconds(3),
+                )
+                .expect("submitted event should stay in-flight"),
+            InboundEventClaimDecision::AlreadyProcessing {
+                status: InboundEventDedupStatus::SubmittedPossible,
+                ..
+            }
         ));
     }
 
