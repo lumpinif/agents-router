@@ -50,7 +50,7 @@ Providers（你想在哪里收到通知？）：
 - [ntfy](https://ntfy.sh/)
 - [Pushover](https://pushover.net/api)
 - Feishu/Lark Custom Bot（[飞书](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot) / [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot)）
-- Feishu/Lark App Bot，实验性（[指南](providers/feishu-lark-app-bot.md)）
+- Feishu/Lark App Bot；Lark replies 实验性（[指南](providers/feishu-lark-app-bot.md)）
 - Webhook
 - [WhatsApp](https://developers.facebook.com/docs/whatsapp)
 - 微信（个人微信 iLink）
@@ -166,7 +166,7 @@ Provider 设置教程：
 - [ntfy](providers/ntfy.zh-CN.md)
 - [Pushover](providers/pushover.zh-CN.md)
 - [飞书/Lark Custom Bot](providers/feishu-lark-custom-bot.zh-CN.md)
-- [飞书/Lark App Bot，实验性](providers/feishu-lark-app-bot.md)
+- [飞书/Lark App Bot；Lark replies 实验性](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.zh-CN.md)
 - [WhatsApp](providers/whatsapp.zh-CN.md)
 - [微信](providers/wechat.zh-CN.md)

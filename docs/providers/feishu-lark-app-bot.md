@@ -1,6 +1,6 @@
 # Feishu/Lark App Bot
 
-Experimental. Use this when you want Agents Router to send notifications through a Lark or Feishu app bot.
+Use this when you want Agents Router to send notifications through a Lark or Feishu app bot. Lark Codex Desktop thread replies are Experimental.
 
 Lark App Bot thread replies for Codex Desktop are the verified Experimental path. Feishu App Bot uses the same setup shape, but validate it in your workspace before relying on replies. Use Feishu/Lark Custom Bot when you want the fastest stable one-way notification setup.
 
@@ -168,7 +168,7 @@ Setup can send one test message.
 
 That test message only confirms the app bot can send to the target group. It is not a Codex continuation surface. Replying to the setup test message will not continue Codex.
 
-To test Experimental thread replies, wait for a new real Codex Desktop completion notification in the group. Reply in that notification's thread. Codex sends the result back to the same thread.
+To test Experimental Lark thread replies, wait for a new real Codex Desktop completion notification in the group. Reply in that notification's thread. Codex sends the result back to the same thread.
 
 Old notifications and setup test messages are not replyable continuation surfaces.
 

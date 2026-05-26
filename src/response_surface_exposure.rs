@@ -1,4 +1,6 @@
-use crate::agent_integration_catalog::{AgentIntegrationDescriptor, ContinuationSupportStatus};
+use crate::agent_integration_catalog::{
+    AgentIntegrationDescriptor, ContinuationReleaseStage, ContinuationSupportStatus,
+};
 use crate::config::RouteConfig;
 use crate::provider_catalog::{
     DeliveryReceiptField, InboundReplyMode, ProviderModeCapability,
@@ -8,8 +10,19 @@ use crate::provider_catalog::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseSurfaceExposureDecision {
-    Eligible,
+    Eligible(ResponseSurfaceExposureEligibility),
     Ineligible(ResponseSurfaceExposureSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseSurfaceExposureEligibility {
+    pub release_stage: ContinuationReleaseStage,
+}
+
+impl ResponseSurfaceExposureDecision {
+    pub fn is_eligible(&self) -> bool {
+        matches!(self, Self::Eligible(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +42,7 @@ pub fn evaluate_response_surface_exposure(
     provider: &ProviderModeCapability,
     route: &RouteConfig,
 ) -> ResponseSurfaceExposureDecision {
-    match agent.continuation_status() {
+    let release_stage = match agent.continuation_status() {
         ContinuationSupportStatus::Unsupported => {
             return ResponseSurfaceExposureDecision::Ineligible(
                 ResponseSurfaceExposureSkipReason::AgentContinuationUnsupported,
@@ -40,8 +53,11 @@ pub fn evaluate_response_surface_exposure(
                 ResponseSurfaceExposureSkipReason::AgentContinuationPlanned,
             );
         }
-        ContinuationSupportStatus::Available => {}
-    }
+        ContinuationSupportStatus::Available => agent
+            .continuation_capability()
+            .release_stage()
+            .expect("available continuation capability must include a release stage"),
+    };
 
     if provider.inbound_reply.mode != InboundReplyMode::LocalConnection {
         return ResponseSurfaceExposureDecision::Ineligible(
@@ -81,7 +97,7 @@ pub fn evaluate_response_surface_exposure(
         );
     }
 
-    ResponseSurfaceExposureDecision::Eligible
+    ResponseSurfaceExposureDecision::Eligible(ResponseSurfaceExposureEligibility { release_stage })
 }
 
 #[cfg(test)]
@@ -143,7 +159,9 @@ mod tests {
                 provider_mode_capability(ProviderMode::SlackApp),
                 &route,
             ),
-            ResponseSurfaceExposureDecision::Eligible
+            ResponseSurfaceExposureDecision::Eligible(ResponseSurfaceExposureEligibility {
+                release_stage: ContinuationReleaseStage::Experimental
+            })
         );
         assert_eq!(
             evaluate_response_surface_exposure(
@@ -205,7 +223,9 @@ mod tests {
                 provider_mode_capability(ProviderMode::FeishuLarkAppBot),
                 &route,
             ),
-            ResponseSurfaceExposureDecision::Eligible
+            ResponseSurfaceExposureDecision::Eligible(ResponseSurfaceExposureEligibility {
+                release_stage: ContinuationReleaseStage::Experimental
+            })
         );
     }
 

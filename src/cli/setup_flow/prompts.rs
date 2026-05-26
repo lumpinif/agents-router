@@ -384,6 +384,7 @@ pub(in crate::cli) fn prompt_for_feishu_lark_secret(
 }
 
 pub(in crate::cli) fn prompt_for_feishu_lark_mode(
+    agent: setup::AgentIntegrationId,
     default: Option<FeishuLarkSetupMode>,
     i18n: I18n,
 ) -> anyhow::Result<FeishuLarkSetupMode> {
@@ -398,7 +399,7 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
         .unwrap_or(0);
     let items = options
         .iter()
-        .map(|mode| feishu_lark_mode_option_label(*mode, default, i18n))
+        .map(|mode| feishu_lark_mode_option_label(*mode, agent, default, i18n))
         .collect::<Vec<_>>();
     let theme = prompt_theme();
     let selection = Select::with_theme(&theme)
@@ -413,6 +414,7 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
 
 fn feishu_lark_mode_option_label(
     mode: FeishuLarkSetupMode,
+    agent: setup::AgentIntegrationId,
     default: Option<FeishuLarkSetupMode>,
     i18n: I18n,
 ) -> String {
@@ -422,8 +424,19 @@ fn feishu_lark_mode_option_label(
                 .to_string()
         }
         FeishuLarkSetupMode::AppBot => {
-            "App Bot — Experimental\n  Send notifications through an app bot. With Codex Desktop, replies in a new notification thread can continue the original session."
-                .to_string()
+            if let Some(release_stage) = agent
+                .descriptor()
+                .continuation_capability()
+                .release_stage()
+            {
+                format!(
+                    "App Bot — {}\n  Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.",
+                    continuation_release_stage_label(release_stage)
+                )
+            } else {
+                "App Bot\n  Send notifications through an app bot. Replies are only available for Codex Desktop when continuation support is available."
+                    .to_string()
+            }
         }
     };
 
@@ -434,6 +447,13 @@ fn feishu_lark_mode_option_label(
     }
 
     label
+}
+
+fn continuation_release_stage_label(release_stage: ContinuationReleaseStage) -> &'static str {
+    match release_stage {
+        ContinuationReleaseStage::Experimental => "Experimental",
+        ContinuationReleaseStage::Stable => "Stable",
+    }
 }
 
 pub(in crate::cli) fn prompt_for_feishu_lark_app_domain(

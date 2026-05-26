@@ -38,9 +38,7 @@ use crate::provider_inbound::{
     normalize_feishu_lark_long_connection_surface_reply,
 };
 use crate::providers::feishu_lark::FeishuLarkProvider;
-use crate::response_surface_exposure::{
-    ResponseSurfaceExposureDecision, evaluate_response_surface_exposure,
-};
+use crate::response_surface_exposure::evaluate_response_surface_exposure;
 use crate::response_surface_ledger::{ResponseSurfaceLedger, ResponseSurfaceLedgerStore};
 use crate::runtime::RuntimeState;
 
@@ -651,8 +649,7 @@ fn has_codex_desktop_response_surface_route(
                 .providers
                 .iter()
                 .any(|route_provider| route_provider == &provider.id)
-            && evaluate_response_surface_exposure(agent, provider_capability, route)
-                == ResponseSurfaceExposureDecision::Eligible
+            && evaluate_response_surface_exposure(agent, provider_capability, route).is_eligible()
     })
 }
 

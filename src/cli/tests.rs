@@ -642,8 +642,29 @@ fn app_bot_test_notification_body_explains_real_thread_reply_test() {
     let body = test_notification_body_for_config(&config);
 
     assert!(body.contains("confirms the App Bot can send messages"));
-    assert!(body.contains("Thread replies are experimental"));
+    assert!(body.contains("Lark thread replies are Experimental"));
+    assert!(body.contains("Feishu App Bot uses the same setup shape"));
     assert!(body.contains("Replies to this test message will not continue Codex"));
+}
+
+#[test]
+fn app_bot_test_notification_does_not_advertise_replies_for_unsupported_agents() {
+    let config = setup::build_feishu_lark_app_bot_config(
+        setup::AgentIntegrationId::ClaudeCode,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    let body = test_notification_body_for_config(&config);
+
+    assert!(body.contains("confirms the App Bot can send messages"));
+    assert!(body.contains("Replies are only available for Codex Desktop"));
+    assert!(!body.contains("Lark thread replies are Experimental"));
 }
 
 #[test]

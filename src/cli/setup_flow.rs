@@ -871,7 +871,7 @@ pub(super) fn run_feishu_lark_setup(
         i18n,
     } = context;
     println!();
-    let feishu_lark_mode = prompt_for_feishu_lark_mode(defaults.feishu_lark_mode, i18n)?;
+    let feishu_lark_mode = prompt_for_feishu_lark_mode(agent, defaults.feishu_lark_mode, i18n)?;
     let mut config = match feishu_lark_mode {
         FeishuLarkSetupMode::CustomBotWebhook => {
             println!();

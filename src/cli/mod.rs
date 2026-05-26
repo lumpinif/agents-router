@@ -15,8 +15,8 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use agents_router::agent_integration_catalog::{
-    HookCommandTemplate, RuntimePlatform, SetupIntegrationKind, SourceIngestFormat,
-    agent_integration_descriptor, agent_integration_for_source,
+    ContinuationReleaseStage, HookCommandTemplate, RuntimePlatform, SetupIntegrationKind,
+    SourceIngestFormat, agent_integration_descriptor, agent_integration_for_source,
     default_agent_integration_for_platform, setup_agent_integration_descriptors_for_platform,
 };
 use agents_router::config::{
@@ -44,10 +44,14 @@ use agents_router::paths::{
 #[cfg(target_os = "macos")]
 use agents_router::process::{StopOutcome, SystemProcessManager, stop_with_manager};
 use agents_router::provider_catalog::{
-    MessageLimitUnit, MessageSurface, ProviderMessageConstraint, default_setup_provider_type,
-    provider_descriptor, setup_provider_descriptors,
+    MessageLimitUnit, MessageSurface, ProviderMessageConstraint, ProviderMode,
+    default_setup_provider_type, provider_descriptor, provider_mode_capability,
+    setup_provider_descriptors,
 };
 use agents_router::providers::build_providers;
+use agents_router::response_surface_exposure::{
+    ResponseSurfaceExposureDecision, evaluate_response_surface_exposure,
+};
 use agents_router::runtime::{
     RuntimeState, ensure_sources_supported_on_current_platform, reload_config_on_change,
 };
@@ -889,7 +893,9 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
                         println!("{}", style(i18n.text(Text::SetupComplete)).green());
                         return Ok(());
                     }
-                    test_body = feishu_lark_app_bot_test_notification_body();
+                    test_body = feishu_lark_app_bot_test_notification_body(
+                        agent.descriptor().continuation_capability().release_stage(),
+                    );
                 }
             }
             print_source_integration_setup_note(agent, i18n);
@@ -950,7 +956,7 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
         }
     }
 
-    send_test_notification_with_body(test_body).await?;
+    send_test_notification_with_body(&test_body).await?;
 
     println!("{}", style(i18n.text(Text::TestSent)).green());
     if prompt_confirm(i18n.text(Text::DidItArrive), true)? {
@@ -1075,7 +1081,8 @@ async fn offer_test_notification(config: &RawConfig, i18n: I18n) -> anyhow::Resu
         return Ok(());
     }
 
-    send_test_notification_with_body(test_notification_body_for_config(config)).await?;
+    let test_body = test_notification_body_for_config(config);
+    send_test_notification_with_body(&test_body).await?;
     println!("{}", style(i18n.text(Text::TestSent)).green());
     if prompt_confirm(i18n.text(Text::DidItArrive), true)? {
         println!("{}", style(i18n.text(Text::Working)).green());
@@ -1193,7 +1200,7 @@ fn print_local_source_integration_report(report: &LocalSourceIntegrationReport, 
     }
 }
 
-async fn send_test_notification_with_body(body: &'static str) -> anyhow::Result<()> {
+async fn send_test_notification_with_body(body: &str) -> anyhow::Result<()> {
     let endpoint = ingress_endpoint()?;
     wait_for_service(&endpoint).await?;
 
@@ -1213,23 +1220,83 @@ async fn send_test_notification_with_body(body: &'static str) -> anyhow::Result<
     Ok(())
 }
 
-fn default_test_notification_body() -> &'static str {
-    "Test notification from your computer. If this arrived, Agents Router is working."
+fn default_test_notification_body() -> String {
+    "Test notification from your computer. If this arrived, Agents Router is working.".to_string()
 }
 
-fn test_notification_body_for_config(config: &RawConfig) -> &'static str {
+fn test_notification_body_for_config(config: &RawConfig) -> String {
     if config.providers.iter().any(|provider| {
         provider.provider_type == ProviderType::FeishuLark
             && provider.mode.as_deref() == Some("app_bot")
     }) {
-        feishu_lark_app_bot_test_notification_body()
+        feishu_lark_app_bot_test_notification_body(response_surface_release_stage_for_config(
+            config,
+        ))
     } else {
         default_test_notification_body()
     }
 }
 
-fn feishu_lark_app_bot_test_notification_body() -> &'static str {
-    "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nThread replies are experimental. To test them, wait for a new real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex."
+fn feishu_lark_app_bot_test_notification_body(
+    release_stage: Option<ContinuationReleaseStage>,
+) -> String {
+    match release_stage {
+        Some(stage) => format!(
+            "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nLark thread replies are {}; Feishu App Bot uses the same setup shape, but validate replies in your workspace before relying on them. To test replies, wait for a new real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex.",
+            release_stage_sentence_label(stage)
+        ),
+        None => "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nReplies are only available for Codex Desktop when continuation support is available.\n\nReplies to this test message will not continue Codex.".to_string(),
+    }
+}
+
+fn response_surface_release_stage_for_config(
+    config: &RawConfig,
+) -> Option<ContinuationReleaseStage> {
+    let provider_capability = provider_mode_capability(ProviderMode::FeishuLarkAppBot);
+    config
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider.provider_type == ProviderType::FeishuLark
+                && provider.mode.as_deref() == Some("app_bot")
+        })
+        .find_map(|provider| {
+            config
+                .routes
+                .iter()
+                .filter(|route| {
+                    route
+                        .providers
+                        .iter()
+                        .any(|candidate| candidate == &provider.id)
+                })
+                .find_map(|route| {
+                    config.sources.iter().find_map(|source| {
+                        if !route
+                            .sources
+                            .iter()
+                            .any(|candidate| candidate == &source.id)
+                        {
+                            return None;
+                        }
+                        let agent = agent_integration_for_source(&source.id, source.source_type)?;
+                        match evaluate_response_surface_exposure(agent, provider_capability, route)
+                        {
+                            ResponseSurfaceExposureDecision::Eligible(eligibility) => {
+                                Some(eligibility.release_stage)
+                            }
+                            ResponseSurfaceExposureDecision::Ineligible(_) => None,
+                        }
+                    })
+                })
+        })
+}
+
+fn release_stage_sentence_label(release_stage: ContinuationReleaseStage) -> &'static str {
+    match release_stage {
+        ContinuationReleaseStage::Experimental => "Experimental",
+        ContinuationReleaseStage::Stable => "stable",
+    }
 }
 
 async fn wait_for_service(endpoint: &agents_router::paths::IngressEndpoint) -> anyhow::Result<()> {
