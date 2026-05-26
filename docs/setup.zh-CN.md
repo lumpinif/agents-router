@@ -104,6 +104,20 @@ Provider 教程：
 - [WhatsApp](providers/whatsapp.zh-CN.md)
 - [微信](providers/wechat.zh-CN.md)
 
+选择 Feishu/Lark 时，setup 会继续询问 mode：
+
+```text
+Custom Bot Webhook — Stable
+  向群里发送一次性通知。最快 setup。不支持回复。
+
+App Bot — Experimental
+  通过应用机器人发送通知。使用 Codex Desktop 时，在新的 notification thread 下回复可以继续原 session。
+```
+
+Custom Bot Webhook 是默认选项，并且保留稳定的一次性通知路径。App Bot 需要 Bot 能力、消息权限、`im.message.receive_v1`、Long Connection / WebSocket，以及已发布的应用版本。setup 只显示短 checklist，并链接到完整的 [飞书/Lark App Bot 指南](providers/feishu-lark-app-bot.md)。
+
+如果你现在只想要稳定通知，请选择 Custom Bot Webhook。需要 Codex Desktop thread reply 时，选择 Lark App Bot Experimental 路径。Feishu App Bot 使用相同配置形态，但在依赖 replies 前应该先在自己的 workspace 做验证。
+
 ## Provider ID
 
 Setup 默认使用 provider type 作为 provider id。例如默认的 Slack provider 是：

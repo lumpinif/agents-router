@@ -1,6 +1,6 @@
 # agents-router
 
-Set it up in 2-3 minutes and get local coding agent updates in Slack, Discord, Telegram, Microsoft Teams, email, ntfy, Pushover, Feishu/Lark, webhook, WhatsApp, or WeChat.
+Set up local coding agent notifications in 2-3 minutes for Slack, Discord, Telegram, Microsoft Teams, email, ntfy, Pushover, Feishu/Lark, webhook, WhatsApp, or WeChat. Lark App Bot thread replies for Codex Desktop are available as an Experimental path.
 
 ---
 
@@ -49,7 +49,7 @@ Providers (Where do you want to get the notification?):
 - [ntfy](https://ntfy.sh/)
 - [Pushover](https://pushover.net/api)
 - Feishu/Lark Custom Bot ([Feishu](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot), [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot))
-- Feishu/Lark App Bot ([guide](docs/providers/feishu-lark-app-bot.md))
+- Feishu/Lark App Bot, experimental ([guide](docs/providers/feishu-lark-app-bot.md))
 - Webhook
 - [WhatsApp](https://developers.facebook.com/docs/whatsapp)
 - WeChat personal chat through iLink
@@ -144,6 +144,8 @@ Then it writes config, starts the service, and sends a test notification.
 
 For optional settings such as answer detail, prompt inclusion, and advanced project filters, see [Setup](docs/setup.md).
 
+Use Feishu/Lark Custom Bot for the fastest stable one-way setup. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
+
 ## 🎉 That's it
 
 The service runs locally:
@@ -164,7 +166,7 @@ Provider setup guides:
 - [ntfy](docs/providers/ntfy.md)
 - [Pushover](docs/providers/pushover.md)
 - [Feishu/Lark Custom Bot](docs/providers/feishu-lark-custom-bot.md)
-- [Feishu/Lark App Bot](docs/providers/feishu-lark-app-bot.md)
+- [Feishu/Lark App Bot, experimental](docs/providers/feishu-lark-app-bot.md)
 - [Webhook](docs/providers/webhook.md)
 - [WhatsApp](docs/providers/whatsapp.md)
 - [WeChat](docs/providers/wechat.md)

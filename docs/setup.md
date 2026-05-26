@@ -112,10 +112,12 @@ Custom Bot Webhook — Stable
   Send one-way notifications to a group. Fastest setup. No replies.
 
 App Bot — Experimental
-  Send notifications through an app bot. With Codex Desktop, replies in the message thread can continue the original session.
+  Send notifications through an app bot. With Codex Desktop, replies in a new notification thread can continue the original session.
 ```
 
 Custom Bot Webhook is the default and keeps the old one-way notification path. App Bot requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, and a published app version. Setup shows only a short checklist and links to the full [Feishu/Lark App Bot guide](providers/feishu-lark-app-bot.md).
+
+Use Custom Bot Webhook when you want the stable path today. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
 
 ## Provider IDs
 

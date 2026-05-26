@@ -642,7 +642,7 @@ fn app_bot_test_notification_body_explains_real_thread_reply_test() {
     let body = test_notification_body_for_config(&config);
 
     assert!(body.contains("confirms the App Bot can send messages"));
-    assert!(body.contains("wait for the next real Codex Desktop completion notification"));
+    assert!(body.contains("Thread replies are experimental"));
     assert!(body.contains("Replies to this test message will not continue Codex"));
 }
 

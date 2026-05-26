@@ -422,7 +422,7 @@ fn feishu_lark_mode_option_label(
                 .to_string()
         }
         FeishuLarkSetupMode::AppBot => {
-            "App Bot — Experimental\n  Send notifications through an app bot. With Codex Desktop, replies in the message thread can continue the original session."
+            "App Bot — Experimental\n  Send notifications through an app bot. With Codex Desktop, replies in a new notification thread can continue the original session."
                 .to_string()
         }
     };

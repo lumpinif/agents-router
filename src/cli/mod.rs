@@ -1229,7 +1229,7 @@ fn test_notification_body_for_config(config: &RawConfig) -> &'static str {
 }
 
 fn feishu_lark_app_bot_test_notification_body() -> &'static str {
-    "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nTo test thread replies, wait for the next real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex."
+    "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nThread replies are experimental. To test them, wait for a new real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex."
 }
 
 async fn wait_for_service(endpoint: &agents_router::paths::IngressEndpoint) -> anyhow::Result<()> {
