@@ -1419,7 +1419,7 @@ mod tests {
                 &enabled_config(),
                 &mut ledger,
                 ready.clone(),
-                None,
+                Some(planned_codex_desktop()),
                 Some(slack_app_capability()),
             )
             .await
@@ -2317,9 +2317,21 @@ mod tests {
         let target = descriptor
             .continuation_capability
             .target()
-            .expect("Codex Desktop planned continuation target should be cataloged");
+            .expect("Codex Desktop continuation target should be cataloged");
         AgentIntegrationDescriptor {
             continuation_capability: ContinuationCapability::available_experimental(target),
+            ..descriptor
+        }
+    }
+
+    fn planned_codex_desktop() -> AgentIntegrationDescriptor {
+        let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let target = descriptor
+            .continuation_capability
+            .target()
+            .expect("Codex Desktop continuation target should be cataloged");
+        AgentIntegrationDescriptor {
+            continuation_capability: ContinuationCapability::Planned(target),
             ..descriptor
         }
     }

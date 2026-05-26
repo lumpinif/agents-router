@@ -519,13 +519,15 @@ async fn hidden_lark_closed_loop_still_skips_planned_codex_catalog() {
     };
 
     let decision = long_connection
-        .continue_claimed_event_hidden(
+        .continue_claimed_event_hidden_with_test_policy_facts(
             &lark_hidden_e2e_config(),
             &mut ledger,
             ready.clone(),
             &controller_runtime,
             &provider,
             now + Duration::seconds(2),
+            Some(planned_codex_desktop()),
+            Some(provider_mode_capability(ProviderMode::FeishuLarkAppBot)),
         )
         .await
         .expect("hidden closed loop should not fail");
@@ -1377,9 +1379,21 @@ fn available_codex_desktop() -> AgentIntegrationDescriptor {
     let target = descriptor
         .continuation_capability
         .target()
-        .expect("Codex Desktop planned continuation target should be cataloged");
+        .expect("Codex Desktop continuation target should be cataloged");
     AgentIntegrationDescriptor {
         continuation_capability: ContinuationCapability::available_experimental(target),
+        ..descriptor
+    }
+}
+
+fn planned_codex_desktop() -> AgentIntegrationDescriptor {
+    let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+    let target = descriptor
+        .continuation_capability
+        .target()
+        .expect("Codex Desktop continuation target should be cataloged");
+    AgentIntegrationDescriptor {
+        continuation_capability: ContinuationCapability::Planned(target),
         ..descriptor
     }
 }
