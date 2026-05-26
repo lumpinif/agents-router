@@ -16,10 +16,7 @@ use crate::response_surface_ledger::{
     ResponseSurfaceLedger, ResponseSurfaceLedgerStore, ResponseSurfaceLookupQuery,
     ResponseSurfaceLookupResult,
 };
-use crate::response_surface_runtime::INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV;
 use crate::signal::{SignalLifecycle, SignalWorkspace};
-
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 struct TestProvider {
     id: String,
@@ -229,9 +226,7 @@ async fn duplicate_delivery_safety_suppresses_without_provider_failure() {
 }
 
 #[tokio::test]
-async fn app_bot_surface_ready_delivery_creates_response_surface_under_internal_gate() {
-    let _env_lock = ENV_MUTEX.lock().expect("env mutex should not be poisoned");
-    let _guard = EnvGuard::set(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV, "1");
+async fn app_bot_surface_ready_delivery_creates_response_surface() {
     let temp = tempdir().expect("temp dir should exist");
     let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("ledger.json"))
         .expect("ledger store should build");
@@ -284,8 +279,6 @@ async fn app_bot_surface_ready_delivery_creates_response_surface_under_internal_
 
 #[tokio::test]
 async fn candidate_delivery_receipt_does_not_create_response_surface() {
-    let _env_lock = ENV_MUTEX.lock().expect("env mutex should not be poisoned");
-    let _guard = EnvGuard::set(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV, "1");
     let temp = tempdir().expect("temp dir should exist");
     let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("ledger.json"))
         .expect("ledger store should build");
@@ -609,26 +602,4 @@ fn lark_app_bot_response_surface_config() -> ValidatedConfig {
     }
     .validate()
     .expect("test config should validate")
-}
-
-struct EnvGuard {
-    name: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(name: &'static str, value: &str) -> Self {
-        let previous = std::env::var(name).ok();
-        unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => unsafe { std::env::set_var(self.name, value) },
-            None => unsafe { std::env::remove_var(self.name) },
-        }
-    }
 }

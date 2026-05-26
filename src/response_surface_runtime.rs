@@ -2,11 +2,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::agent_integration_catalog::{
-    AgentIntegrationDescriptor, AgentIntegrationId, ContinuationCapability,
-    agent_integration_descriptor,
-};
-use crate::config::{RouteConfig, SourceType};
+use crate::agent_integration_catalog::AgentIntegrationDescriptor;
+use crate::config::RouteConfig;
 use crate::provider_catalog::ProviderModeCapability;
 use crate::response_surface_ledger::{
     NewResponseSurface, ResponseSurfaceLedger, ResponseSurfaceRecord,
@@ -17,8 +14,6 @@ use crate::response_surface_policy::{
     agent_integration_for_signal, evaluate_response_surface_policy,
 };
 use crate::signal::Signal;
-
-pub const INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV: &str = "AGENTS_ROUTER_INTERNAL_CODEX_DESKTOP_REPLIES";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSurfaceDeliveryFacts {
@@ -46,6 +41,7 @@ pub fn create_response_surface_after_delivery(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn create_response_surface_after_delivery_with_agent_integration_override(
     ledger: &mut ResponseSurfaceLedger,
     signal: &Signal,
@@ -143,41 +139,6 @@ pub fn response_surface_route_binding_hash(route: &RouteConfig) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn internal_codex_desktop_dogfood_enabled() -> bool {
-    std::env::var(INTERNAL_CODEX_DESKTOP_DOGFOOD_ENV)
-        .ok()
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-pub(crate) fn dogfood_agent_integration_for_signal(
-    signal: &Signal,
-) -> Option<AgentIntegrationDescriptor> {
-    let source_type = SourceType::from_signal_value(signal.source_type())?;
-    dogfood_agent_integration_for_source(signal.source_id(), source_type)
-}
-
-pub(crate) fn dogfood_agent_integration_for_source(
-    source_id: &str,
-    source_type: SourceType,
-) -> Option<AgentIntegrationDescriptor> {
-    if !internal_codex_desktop_dogfood_enabled()
-        || source_id != "codex_desktop"
-        || source_type != SourceType::CodexDesktop
-    {
-        return None;
-    }
-
-    let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
-    let target = descriptor.continuation_capability.target()?;
-    Some(AgentIntegrationDescriptor {
-        // This is a narrow internal dogfood override for call sites that still
-        // pass explicit integration facts while the runtime path is promoted.
-        continuation_capability: ContinuationCapability::available_experimental(target),
-        ..descriptor
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -197,13 +158,16 @@ mod tests {
     #[test]
     fn planned_agent_integration_does_not_create_surface() {
         let mut ledger = ResponseSurfaceLedger::in_memory();
-        let decision = create_response_surface_after_delivery(
+        let signal = codex_desktop_signal();
+        let route = route_with_replies_enabled();
+        let decision = create_response_surface_after_delivery_with_agent_integration_override(
             &mut ledger,
-            &codex_desktop_signal(),
-            &route_with_replies_enabled(),
+            &signal,
+            &route,
             provider_mode_capability(ProviderMode::SlackApp),
             delivery_facts(full_receipt()),
             test_time(),
+            Some(planned_codex_desktop()),
         )
         .expect("creation should not fail");
 
@@ -334,9 +298,21 @@ mod tests {
         let target = descriptor
             .continuation_capability
             .target()
-            .expect("Codex Desktop planned continuation target should be cataloged");
+            .expect("Codex Desktop continuation target should be cataloged");
         AgentIntegrationDescriptor {
             continuation_capability: ContinuationCapability::available_experimental(target),
+            ..descriptor
+        }
+    }
+
+    fn planned_codex_desktop() -> AgentIntegrationDescriptor {
+        let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let target = descriptor
+            .continuation_capability
+            .target()
+            .expect("Codex Desktop continuation target should be cataloged");
+        AgentIntegrationDescriptor {
+            continuation_capability: ContinuationCapability::Planned(target),
             ..descriptor
         }
     }

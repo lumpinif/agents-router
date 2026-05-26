@@ -21,8 +21,7 @@ use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
 use crate::response_surface_policy::ResponseSurfaceDeliveryReceipt;
 use crate::response_surface_runtime::{
     ResponseSurfaceCreationDecision, ResponseSurfaceDeliveryFacts,
-    create_response_surface_after_delivery_with_agent_integration_override,
-    dogfood_agent_integration_for_signal,
+    create_response_surface_after_delivery,
 };
 use crate::signal::Signal;
 
@@ -333,17 +332,15 @@ impl<'a> Router<'a> {
             provider_id: provider.id().to_string(),
             receipt: response_surface_delivery_receipt(receipt),
         };
-        let agent_integration_override = dogfood_agent_integration_for_signal(signal);
         let outcome = response_surface_ledger
             .update(|ledger| {
-                create_response_surface_after_delivery_with_agent_integration_override(
+                create_response_surface_after_delivery(
                     ledger,
                     signal,
                     route,
                     provider_capability,
                     delivery,
                     Utc::now(),
-                    agent_integration_override,
                 )
             })
             .await;
