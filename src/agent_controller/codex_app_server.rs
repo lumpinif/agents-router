@@ -436,12 +436,14 @@ async fn wait_for_final_answer(
                 turn.id = turn_state.turn_id.as_deref(),
                 elapsed.ms = controller_started_at.elapsed().as_millis(),
                 event.hash = %request.provider_event_id_hash,
-                event = "codex_app_server.turn_start.rejected",
+                event = "codex_app_server.turn_result.unconfirmed",
             );
             return Err(error_after_possible_submit(
                 request,
                 AgentControllerErrorKind::ControllerRejected,
-                format!("Codex App Server rejected turn/start: {message}"),
+                format!(
+                    "Codex App Server reported an error after turn/start was submitted: {message}"
+                ),
             ));
         }
         if let Some(final_answer) = turn_state.final_answer.take() {
@@ -594,7 +596,9 @@ async fn send_request(
                 return Err(error_after_possible_submit(
                     request,
                     AgentControllerErrorKind::ControllerRejected,
-                    format!("Codex App Server rejected turn/start: {message}"),
+                    format!(
+                        "Codex App Server reported an error after turn/start was submitted: {message}"
+                    ),
                 ));
             }
             if state.turn_completed && state.final_answer.is_none() {
@@ -1350,7 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_start_notification_error_is_after_possible_submit() {
+    async fn post_submit_notification_error_reports_unconfirmed_result() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
             thread_read_response(2, "idle"),
@@ -1378,6 +1382,13 @@ mod tests {
         assert_eq!(
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
+        );
+        assert!(
+            error
+                .message
+                .contains("Codex App Server reported an error after turn/start was submitted"),
+            "unexpected error message: {}",
+            error.message
         );
         assert_eq!(connection.sent_len(), 5);
     }
@@ -1488,6 +1499,10 @@ mod tests {
         assert_eq!(
             error.submit_boundary,
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
+        );
+        assert_eq!(
+            error.message,
+            "Codex App Server turn completed before final answer"
         );
     }
 

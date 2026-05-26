@@ -24,7 +24,7 @@ use crate::response_surface_runtime::response_surface_route_binding_hash;
 
 pub mod codex_app_server;
 
-const SUBMITTED_UNKNOWN_NOTICE_TEXT: &str = "Your reply may have reached Codex, but Agents Router could not confirm the final result. To avoid running it twice, it will not retry automatically. Please check Codex Desktop.";
+const SUBMITTED_UNKNOWN_NOTICE_TEXT: &str = "Codex received your reply, but Agents Router could not find a final answer to send back. To avoid running the same reply twice, it will not retry automatically. Please check Codex Desktop.";
 
 pub type AgentControllerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
