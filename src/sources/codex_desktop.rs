@@ -15,6 +15,7 @@ use crate::delivery_safety::DeliverySafetyGuard;
 use crate::paths::{
     codex_desktop_source_state_path, codex_session_index_path, codex_sessions_dir_path,
 };
+use crate::response_surface_ledger::ResponseSurfaceContinuationTurnIndex;
 use crate::router::{Provider, Router};
 use crate::runtime::RuntimeState;
 use crate::signal::Signal;
@@ -59,10 +60,17 @@ pub async fn watch(runtime: RuntimeState) -> anyhow::Result<()> {
                 let watcher = watcher
                     .as_mut()
                     .expect("Codex Desktop watcher should exist after start");
-                let batch = watcher.poll(&snapshot.config, source)?;
+                let response_surface_ledger = runtime.response_surface_ledger();
+                let response_surface_turns = response_surface_ledger
+                    .response_surface_continuation_turn_index()
+                    .await?;
+                let batch = watcher.poll_with_response_surface_turns(
+                    &snapshot.config,
+                    source,
+                    &response_surface_turns,
+                )?;
                 let providers = snapshot.provider_refs();
                 let delivery_safety = runtime.delivery_safety();
-                let response_surface_ledger = runtime.response_surface_ledger();
                 route_and_checkpoint_batch(
                     watcher,
                     &snapshot.config,
@@ -196,10 +204,24 @@ impl CodexDesktopSessionWatcher {
         Ok(watcher)
     }
 
+    #[cfg(test)]
     fn poll(
         &self,
         config: &ValidatedConfig,
         source: &SourceConfig,
+    ) -> anyhow::Result<CodexDesktopPollBatch> {
+        self.poll_with_response_surface_turns(
+            config,
+            source,
+            &ResponseSurfaceContinuationTurnIndex::default(),
+        )
+    }
+
+    fn poll_with_response_surface_turns(
+        &self,
+        config: &ValidatedConfig,
+        source: &SourceConfig,
+        response_surface_turns: &ResponseSurfaceContinuationTurnIndex,
     ) -> anyhow::Result<CodexDesktopPollBatch> {
         let prompt_detail = config.notification.prompt_detail;
         let titles = load_session_titles(&self.session_index_path)?;
@@ -280,6 +302,22 @@ impl CodexDesktopSessionWatcher {
                         };
                         let delivery_key = format!("{}:{}", session_id, task.turn_id);
                         if state.delivered_turns.contains(&delivery_key) {
+                            continue;
+                        }
+                        if response_surface_turns.contains(session_id, &task.turn_id) {
+                            if prompt_detail == PromptDetail::On {
+                                pending_prompts.remove(&path_key);
+                            }
+                            state.delivered_turns.insert(delivery_key);
+                            state.prune_delivered_turns();
+                            changed = true;
+                            info!(
+                                source.id = %source.id,
+                                source.type = %source.source_type.as_str(),
+                                source.session.id = %session_id,
+                                source.turn.id = %task.turn_id,
+                                event = "codex_desktop.watch.response_surface_turn_suppressed",
+                            );
                             continue;
                         }
                         let prompt = if prompt_detail == PromptDetail::On {

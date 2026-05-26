@@ -84,6 +84,106 @@ fn first_run_skips_existing_rollout_events_then_emits_new_events() {
 }
 
 #[test]
+fn response_surface_continuation_turn_is_suppressed_without_suppressing_session() {
+    let dir = tempdir().expect("tempdir should be created");
+    let sessions_dir = dir.path().join("sessions");
+    let day_dir = sessions_dir.join("2026").join("05").join("10");
+    fs::create_dir_all(&day_dir).expect("session dir should be created");
+    let rollout_path = day_dir.join("rollout-2026-05-10T01-00-00-session-1.jsonl");
+    let index_path = dir.path().join("session_index.jsonl");
+    let state_path = dir.path().join("source-state.json");
+
+    write_lines(&rollout_path, &[session_meta_line("session-1")]);
+    write_lines(
+        &index_path,
+        &[r#"{"id":"session-1","thread_name":"agents-router sync report","updated_at":"2026-05-09T17:00:00Z"}"#.to_string()],
+    );
+
+    let mut watcher = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher should start");
+    watcher
+        .poll(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+        )
+        .and_then(|batch| watcher.commit(batch))
+        .expect("initial poll should pass");
+
+    let mut ledger = crate::response_surface_ledger::ResponseSurfaceLedger::in_memory();
+    ledger
+        .record_response_surface_continuation_turn_at(
+            crate::response_surface_ledger::ResponseSurfaceContinuationTurnInput {
+                surface_id: "surface-1".to_string(),
+                source_session_id: "session-1".to_string(),
+                source_turn_id: "continuation-turn-1".to_string(),
+            },
+            chrono::Utc::now(),
+        )
+        .expect("continuation turn should record");
+    let continuation_turns = ledger.response_surface_continuation_turn_index();
+
+    append_line(
+        &rollout_path,
+        &task_complete_line(
+            "continuation-turn-1",
+            "2026-05-09T17:01:32.000Z",
+            "already returned to Lark thread",
+        ),
+    );
+    let suppressed = watcher
+        .poll_with_response_surface_turns(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+            &continuation_turns,
+        )
+        .expect("suppressed poll should pass");
+    assert!(
+        suppressed.signals.is_empty(),
+        "response-surface continuation turn must not create a normal completion notification"
+    );
+    watcher
+        .commit(suppressed)
+        .expect("suppressed turn checkpoint should commit");
+
+    append_line(
+        &rollout_path,
+        &task_complete_line(
+            "manual-turn-2",
+            "2026-05-09T17:02:32.000Z",
+            "manual desktop continuation result",
+        ),
+    );
+    let later_manual_turn = watcher
+        .poll_with_response_surface_turns(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+            &continuation_turns,
+        )
+        .expect("later manual turn should poll");
+
+    assert_eq!(later_manual_turn.signals.len(), 1);
+    assert_eq!(
+        later_manual_turn.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.turn_id.as_deref()),
+        Some("manual-turn-2")
+    );
+    assert_eq!(
+        later_manual_turn.signals[0]
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.answer.as_ref())
+            .map(|answer| answer.content.as_str()),
+        Some("manual desktop continuation result")
+    );
+}
+
+#[test]
 fn restart_skips_known_file_backlog_then_emits_runtime_append() {
     let dir = tempdir().expect("tempdir should be created");
     let sessions_dir = dir.path().join("sessions");

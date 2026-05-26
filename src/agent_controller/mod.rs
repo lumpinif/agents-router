@@ -13,7 +13,7 @@ use crate::provider_catalog::{ProviderModeCapability, provider_config_mode_capab
 use crate::provider_inbound::ProviderInboundReady;
 use crate::response_surface_ledger::{
     InboundEventDedupInput, InboundEventDedupStatus, InboundEventRecordDecision,
-    ResponseSurfaceLedger, ResponseSurfaceLedgerStore,
+    ResponseSurfaceContinuationTurnInput, ResponseSurfaceLedger, ResponseSurfaceLedgerStore,
 };
 use crate::response_surface_policy::{
     ResponseSurfaceDeliveryReceipt, ResponseSurfacePolicyDecision, ResponseSurfacePolicyInput,
@@ -56,7 +56,8 @@ pub trait AgentControllerAdapter: Send + Sync {
 }
 
 pub trait AgentControllerSubmitObserver: Send + Sync {
-    fn submitted_possible<'a>(&'a self) -> AgentControllerSubmitFuture<'a>;
+    fn submitted_possible<'a>(&'a self, source_turn_id: &'a str)
+    -> AgentControllerSubmitFuture<'a>;
 }
 
 pub trait ProviderThreadReplyAdapter: Send + Sync {
@@ -504,7 +505,7 @@ impl<'a> AgentControllerRuntime<'a> {
             }
         };
 
-        record_submitted_possible_with_store(ledger_store, &ready, now).await?;
+        record_submitted_possible_with_store(ledger_store, &ready, now, None).await?;
         send_reply_and_record_status_with_store(
             ledger_store,
             &ready,
@@ -805,9 +806,18 @@ struct StoreSubmittedPossibleObserver<'a> {
 }
 
 impl AgentControllerSubmitObserver for StoreSubmittedPossibleObserver<'_> {
-    fn submitted_possible<'a>(&'a self) -> AgentControllerSubmitFuture<'a> {
+    fn submitted_possible<'a>(
+        &'a self,
+        source_turn_id: &'a str,
+    ) -> AgentControllerSubmitFuture<'a> {
         Box::pin(async move {
-            record_submitted_possible_with_store(self.ledger_store, self.ready, self.now).await
+            record_submitted_possible_with_store(
+                self.ledger_store,
+                self.ready,
+                self.now,
+                Some(source_turn_id),
+            )
+            .await
         })
     }
 }
@@ -1060,7 +1070,7 @@ async fn send_submitted_unknown_notice_with_store(
     error: AgentControllerError,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
-    record_submitted_possible_with_store(ledger_store, ready, now).await?;
+    record_submitted_possible_with_store(ledger_store, ready, now, None).await?;
     send_explicit_text_reply_and_record_status_with_store(
         ledger_store,
         ready,
@@ -1297,20 +1307,41 @@ async fn record_submitted_possible_with_store(
     ledger_store: &ResponseSurfaceLedgerStore,
     ready: &ProviderInboundReady,
     now: DateTime<Utc>,
+    source_turn_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let decision = ledger_store
+    let (decision, continuation_turn_recorded) = ledger_store
         .update(|ledger| {
-            ledger
+            let continuation_turn_recorded = if let Some(source_turn_id) = source_turn_id {
+                Some(
+                    ledger
+                        .record_response_surface_continuation_turn_at(
+                            ResponseSurfaceContinuationTurnInput {
+                                surface_id: ready.surface.surface_id.clone(),
+                                source_session_id: ready.surface.source_session_id.clone(),
+                                source_turn_id: source_turn_id.to_string(),
+                            },
+                            now,
+                        )
+                        .context("failed to record response surface continuation turn")?,
+                )
+            } else {
+                None
+            };
+            let decision = ledger
                 .record_submitted_possible_inbound_event_at(inbound_event_input(ready), now)
-                .context("failed to record submitted possible inbound event")
+                .context("failed to record submitted possible inbound event")?;
+            Ok((decision, continuation_turn_recorded))
         })
         .await?;
     info!(
         surface.id = %ready.surface.surface_id,
+        source.session.id = %ready.surface.source_session_id,
+        source.turn.id = source_turn_id.unwrap_or(""),
         provider.id = %ready.reply.provider_id,
         provider.type = %ready.reply.provider_type,
         event.hash = %ready.provider_event_id_hash,
         decision = ?decision,
+        continuation_turn.recorded = ?continuation_turn_recorded,
         event = "response_surface.inbound_event.submitted_possible",
     );
     Ok(())
@@ -1800,6 +1831,12 @@ mod tests {
         let mut ledger = ResponseSurfaceLedger::load(ledger_store.state_path().to_path_buf())
             .expect("ledger should load");
         assert_event_is_submitted_possible(&mut ledger, ready);
+        assert!(
+            ledger
+                .response_surface_continuation_turn_index()
+                .contains("session-1", "continuation-turn-1"),
+            "submit observer should record the exact continuation turn for source suppression"
+        );
         assert_eq!(adapter.requests().len(), 1);
         assert!(provider_reply.requests().is_empty());
     }
@@ -2160,7 +2197,7 @@ mod tests {
                     .expect("requests mutex should not be poisoned")
                     .push(request);
                 submit_observer
-                    .submitted_possible()
+                    .submitted_possible("continuation-turn-1")
                     .await
                     .expect("submitted boundary should be recorded");
                 std::future::pending().await

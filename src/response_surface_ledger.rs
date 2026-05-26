@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,8 @@ struct ResponseSurfaceLedgerFile {
     schema_version: u32,
     surfaces: Vec<ResponseSurfaceRecord>,
     inbound_events: Vec<InboundEventDedupRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    continuation_turns: Vec<ResponseSurfaceContinuationTurnRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +182,41 @@ struct InboundEventDedupRecord {
     received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResponseSurfaceContinuationTurnRecord {
+    surface_id: String,
+    source_session_id: String,
+    source_turn_id: String,
+    recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseSurfaceContinuationTurnInput {
+    pub surface_id: String,
+    pub source_session_id: String,
+    pub source_turn_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseSurfaceContinuationTurnIndex {
+    turns: BTreeSet<ResponseSurfaceContinuationTurnKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResponseSurfaceContinuationTurnKey {
+    source_session_id: String,
+    source_turn_id: String,
+}
+
+impl ResponseSurfaceContinuationTurnIndex {
+    pub fn contains(&self, source_session_id: &str, source_turn_id: &str) -> bool {
+        self.turns.contains(&ResponseSurfaceContinuationTurnKey {
+            source_session_id: source_session_id.to_string(),
+            source_turn_id: source_turn_id.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundEventDedupStatus {
@@ -219,6 +257,7 @@ impl Default for ResponseSurfaceLedgerFile {
             schema_version: LEDGER_SCHEMA_VERSION,
             surfaces: Vec::new(),
             inbound_events: Vec::new(),
+            continuation_turns: Vec::new(),
         }
     }
 }
@@ -462,6 +501,52 @@ impl ResponseSurfaceLedger {
         Ok(true)
     }
 
+    pub fn record_response_surface_continuation_turn_at(
+        &mut self,
+        input: ResponseSurfaceContinuationTurnInput,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        input.validate()?;
+
+        if let Some(existing) = self
+            .state
+            .continuation_turns
+            .iter()
+            .find(|record| continuation_turn_matches(record, &input))
+        {
+            ensure!(
+                existing.surface_id == input.surface_id,
+                "response surface continuation turn is already associated with another surface"
+            );
+            return Ok(false);
+        }
+
+        self.state
+            .continuation_turns
+            .push(ResponseSurfaceContinuationTurnRecord {
+                surface_id: input.surface_id,
+                source_session_id: input.source_session_id,
+                source_turn_id: input.source_turn_id,
+                recorded_at: now,
+            });
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn response_surface_continuation_turn_index(&self) -> ResponseSurfaceContinuationTurnIndex {
+        ResponseSurfaceContinuationTurnIndex {
+            turns: self
+                .state
+                .continuation_turns
+                .iter()
+                .map(|record| ResponseSurfaceContinuationTurnKey {
+                    source_session_id: record.source_session_id.clone(),
+                    source_turn_id: record.source_turn_id.clone(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn unfinished_inbound_events(&self) -> Vec<InboundEventDiagnosticRecord> {
         self.state
             .inbound_events
@@ -595,6 +680,13 @@ impl ResponseSurfaceLedgerStore {
         self.update(|ledger| Ok(ledger.unfinished_inbound_events()))
             .await
     }
+
+    pub async fn response_surface_continuation_turn_index(
+        &self,
+    ) -> anyhow::Result<ResponseSurfaceContinuationTurnIndex> {
+        self.update(|ledger| Ok(ledger.response_surface_continuation_turn_index()))
+            .await
+    }
 }
 
 impl NewResponseSurface {
@@ -632,6 +724,15 @@ impl InboundEventDedupInput {
         ensure_present("provider_conversation_id", &self.provider_conversation_id)?;
         ensure_present("provider_event_id", &self.provider_event_id)?;
         ensure_present("surface_id", &self.surface_id)?;
+        Ok(())
+    }
+}
+
+impl ResponseSurfaceContinuationTurnInput {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure_present("surface_id", &self.surface_id)?;
+        ensure_present("source_session_id", &self.source_session_id)?;
+        ensure_present("source_turn_id", &self.source_turn_id)?;
         Ok(())
     }
 }
@@ -698,6 +799,14 @@ fn surface_create_is_idempotent(
 
 fn normalized_optional_value(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+fn continuation_turn_matches(
+    record: &ResponseSurfaceContinuationTurnRecord,
+    input: &ResponseSurfaceContinuationTurnInput,
+) -> bool {
+    record.source_session_id == input.source_session_id
+        && record.source_turn_id == input.source_turn_id
 }
 
 fn ensure_present(field: &'static str, value: &str) -> anyhow::Result<()> {
@@ -1107,6 +1216,85 @@ mod tests {
             }
         ));
         assert!(!released);
+    }
+
+    #[test]
+    fn records_response_surface_continuation_turn_index_without_content() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+
+        let recorded = ledger
+            .record_response_surface_continuation_turn_at(
+                ResponseSurfaceContinuationTurnInput {
+                    surface_id: "surface-1".to_string(),
+                    source_session_id: "session-1".to_string(),
+                    source_turn_id: "continuation-turn-1".to_string(),
+                },
+                now,
+            )
+            .expect("continuation turn should record");
+        let duplicate = ledger
+            .record_response_surface_continuation_turn_at(
+                ResponseSurfaceContinuationTurnInput {
+                    surface_id: "surface-1".to_string(),
+                    source_session_id: "session-1".to_string(),
+                    source_turn_id: "continuation-turn-1".to_string(),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("same continuation turn should be idempotent");
+        let index = ledger.response_surface_continuation_turn_index();
+
+        assert!(recorded);
+        assert!(!duplicate);
+        assert!(index.contains("session-1", "continuation-turn-1"));
+        assert!(!index.contains("session-1", "manual-turn-2"));
+        assert!(!index.contains("session-2", "continuation-turn-1"));
+
+        let raw = serde_json::to_string_pretty(&ledger.state).expect("state should serialize");
+        assert!(raw.contains("continuation_turns"));
+        for forbidden in [
+            "prompt",
+            "answer",
+            "reply_text",
+            "raw_payload",
+            "provider_message_body",
+            "message_body",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "continuation turn index must not contain `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_turn_cannot_point_to_two_surfaces() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        ledger
+            .record_response_surface_continuation_turn_at(
+                ResponseSurfaceContinuationTurnInput {
+                    surface_id: "surface-1".to_string(),
+                    source_session_id: "session-1".to_string(),
+                    source_turn_id: "continuation-turn-1".to_string(),
+                },
+                now,
+            )
+            .expect("first continuation turn should record");
+
+        let error = ledger
+            .record_response_surface_continuation_turn_at(
+                ResponseSurfaceContinuationTurnInput {
+                    surface_id: "surface-2".to_string(),
+                    source_session_id: "session-1".to_string(),
+                    source_turn_id: "continuation-turn-1".to_string(),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect_err("same continuation turn cannot point to another surface");
+
+        assert!(error.to_string().contains("another surface"));
     }
 
     #[test]

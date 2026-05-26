@@ -99,6 +99,7 @@ struct NoopSubmitObserver;
 impl AgentControllerSubmitObserver for NoopSubmitObserver {
     fn submitted_possible<'a>(
         &'a self,
+        _source_turn_id: &'a str,
     ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
         Box::pin(async { Ok(()) })
     }
@@ -392,8 +393,15 @@ async fn continue_session_with_connection(
         event.hash = %request.provider_event_id_hash,
         event = "codex_app_server.turn_start.accepted",
     );
+    let source_turn_id = turn_state.turn_id.as_deref().ok_or_else(|| {
+        error_after_possible_submit(
+            request,
+            AgentControllerErrorKind::Internal,
+            "Codex App Server accepted turn/start without turn id",
+        )
+    })?;
     submit_observer
-        .submitted_possible()
+        .submitted_possible(source_turn_id)
         .await
         .map_err(|error| {
             error_after_possible_submit(
