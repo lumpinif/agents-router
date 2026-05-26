@@ -192,7 +192,7 @@ pub fn evaluate_response_surface_policy(
                 ResponseSurfacePolicySkipReason::AgentContinuationPlanned,
             );
         }
-        ContinuationCapability::Available(target) => target,
+        ContinuationCapability::Available(availability) => availability.target,
     };
 
     let Some(source_session_id) =
@@ -488,11 +488,9 @@ mod tests {
     }
 
     #[test]
-    fn skips_planned_agent_continuation_from_production_catalog() {
+    fn skips_planned_agent_continuation() {
         let mut fixture = PolicyFixture::allowable();
-        fixture.agent_integration = Some(*agent_integration_descriptor(
-            AgentIntegrationId::CodexDesktop,
-        ));
+        fixture.agent_integration = Some(planned_codex_desktop());
 
         assert_skip(
             fixture.input(),
@@ -600,9 +598,21 @@ mod tests {
         let target = descriptor
             .continuation_capability
             .target()
-            .expect("Codex Desktop planned continuation target should be cataloged");
+            .expect("Codex Desktop continuation target should be cataloged");
         AgentIntegrationDescriptor {
-            continuation_capability: ContinuationCapability::Available(target),
+            continuation_capability: ContinuationCapability::available_experimental(target),
+            ..descriptor
+        }
+    }
+
+    fn planned_codex_desktop() -> AgentIntegrationDescriptor {
+        let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let target = descriptor
+            .continuation_capability
+            .target()
+            .expect("Codex Desktop continuation target should be cataloged");
+        AgentIntegrationDescriptor {
+            continuation_capability: ContinuationCapability::Planned(target),
             ..descriptor
         }
     }

@@ -2319,7 +2319,7 @@ mod tests {
             .target()
             .expect("Codex Desktop planned continuation target should be cataloged");
         AgentIntegrationDescriptor {
-            continuation_capability: ContinuationCapability::Available(target),
+            continuation_capability: ContinuationCapability::available_experimental(target),
             ..descriptor
         }
     }

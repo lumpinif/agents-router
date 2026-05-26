@@ -94,10 +94,17 @@ pub struct SourceCapability {
 pub enum ContinuationCapability {
     Unsupported,
     Planned(ContinuationTarget),
-    Available(ContinuationTarget),
+    Available(ContinuationAvailability),
 }
 
 impl ContinuationCapability {
+    pub const fn available_experimental(target: ContinuationTarget) -> Self {
+        Self::Available(ContinuationAvailability {
+            target,
+            release_stage: ContinuationReleaseStage::Experimental,
+        })
+    }
+
     pub fn status(self) -> ContinuationSupportStatus {
         match self {
             Self::Unsupported => ContinuationSupportStatus::Unsupported,
@@ -109,13 +116,27 @@ impl ContinuationCapability {
     pub fn target(self) -> Option<ContinuationTarget> {
         match self {
             Self::Unsupported => None,
-            Self::Planned(target) | Self::Available(target) => Some(target),
+            Self::Planned(target) => Some(target),
+            Self::Available(availability) => Some(availability.target),
         }
     }
 
     pub fn is_available(self) -> bool {
         self.status() == ContinuationSupportStatus::Available
     }
+
+    pub fn release_stage(self) -> Option<ContinuationReleaseStage> {
+        match self {
+            Self::Available(availability) => Some(availability.release_stage),
+            Self::Unsupported | Self::Planned(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinuationAvailability {
+    pub target: ContinuationTarget,
+    pub release_stage: ContinuationReleaseStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +152,12 @@ pub enum ContinuationSupportStatus {
     Unsupported,
     Planned,
     Available,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationReleaseStage {
+    Experimental,
+    Stable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,13 +338,15 @@ impl HookCommandTemplate {
     }
 }
 
+const CODEX_DESKTOP_CONTINUATION_TARGET: ContinuationTarget = ContinuationTarget {
+    controller_kind: AgentControllerKind::CodexAppServer,
+    session_binding: ContinuationSessionBinding::SignalConversationSessionId,
+    active_turn_control: ContinuationActiveTurnControl::RespectAgentSessionTurnLifecycle,
+    locality_requirement: ContinuationLocalityRequirement::LocalControllerOnly,
+};
+
 const CODEX_DESKTOP_CONTINUATION: ContinuationCapability =
-    ContinuationCapability::Planned(ContinuationTarget {
-        controller_kind: AgentControllerKind::CodexAppServer,
-        session_binding: ContinuationSessionBinding::SignalConversationSessionId,
-        active_turn_control: ContinuationActiveTurnControl::RespectAgentSessionTurnLifecycle,
-        locality_requirement: ContinuationLocalityRequirement::LocalControllerOnly,
-    });
+    ContinuationCapability::available_experimental(CODEX_DESKTOP_CONTINUATION_TARGET);
 
 const AGENT_INTEGRATION_DESCRIPTORS: &[AgentIntegrationDescriptor] = &[
     AgentIntegrationDescriptor {
@@ -832,18 +861,22 @@ mod tests {
     }
 
     #[test]
-    fn codex_desktop_continuation_is_planned_not_available() {
+    fn codex_desktop_continuation_is_available_experimental() {
         let descriptor = agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
         let target = descriptor
             .continuation_capability
             .target()
-            .expect("Codex Desktop planned continuation should expose target facts");
+            .expect("Codex Desktop available continuation should expose target facts");
 
         assert_eq!(
             descriptor.continuation_status(),
-            ContinuationSupportStatus::Planned
+            ContinuationSupportStatus::Available
         );
-        assert!(!descriptor.continuation_capability.is_available());
+        assert!(descriptor.continuation_capability.is_available());
+        assert_eq!(
+            descriptor.continuation_capability.release_stage(),
+            Some(ContinuationReleaseStage::Experimental)
+        );
         assert_eq!(target.controller_kind, AgentControllerKind::CodexAppServer);
         assert_eq!(
             target.session_binding,
@@ -860,14 +893,21 @@ mod tests {
     }
 
     #[test]
-    fn current_release_has_no_available_continuation_integrations() {
+    fn only_codex_desktop_continuation_is_available_before_release() {
         for descriptor in all_agent_integration_descriptors() {
-            assert_ne!(
-                descriptor.continuation_status(),
-                ContinuationSupportStatus::Available,
-                "{} must not expose user-available continuation during Step 1",
-                descriptor.source_capability.canonical_source_id
-            );
+            if descriptor.id == AgentIntegrationId::CodexDesktop {
+                assert_eq!(
+                    descriptor.continuation_status(),
+                    ContinuationSupportStatus::Available
+                );
+            } else {
+                assert_ne!(
+                    descriptor.continuation_status(),
+                    ContinuationSupportStatus::Available,
+                    "{} must not expose continuation until it is explicitly promoted",
+                    descriptor.source_capability.canonical_source_id
+                );
+            }
         }
     }
 

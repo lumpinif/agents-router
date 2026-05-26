@@ -104,11 +104,11 @@ mod tests {
 
     #[test]
     fn planned_agent_integration_is_not_user_visible_reply_capability() {
-        let agent = agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let agent = planned_codex_desktop();
         let mut route = route_with_replies_enabled();
 
         let decision = evaluate_response_surface_exposure(
-            agent,
+            &agent,
             provider_mode_capability(ProviderMode::SlackApp),
             &route,
         );
@@ -221,9 +221,21 @@ mod tests {
         let target = descriptor
             .continuation_capability
             .target()
-            .expect("Codex Desktop planned continuation target should be cataloged");
+            .expect("Codex Desktop continuation target should be cataloged");
         AgentIntegrationDescriptor {
-            continuation_capability: ContinuationCapability::Available(target),
+            continuation_capability: ContinuationCapability::available_experimental(target),
+            ..descriptor
+        }
+    }
+
+    fn planned_codex_desktop() -> AgentIntegrationDescriptor {
+        let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
+        let target = descriptor
+            .continuation_capability
+            .target()
+            .expect("Codex Desktop continuation target should be cataloged");
+        AgentIntegrationDescriptor {
+            continuation_capability: ContinuationCapability::Planned(target),
             ..descriptor
         }
     }

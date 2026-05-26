@@ -171,10 +171,9 @@ pub(crate) fn dogfood_agent_integration_for_source(
     let descriptor = *agent_integration_descriptor(AgentIntegrationId::CodexDesktop);
     let target = descriptor.continuation_capability.target()?;
     Some(AgentIntegrationDescriptor {
-        // This is a narrow internal dogfood override. The catalog remains the
-        // source of the target facts; only the planned/available status is
-        // lifted for this local hidden runtime path.
-        continuation_capability: ContinuationCapability::Available(target),
+        // This is a narrow internal dogfood override for call sites that still
+        // pass explicit integration facts while the runtime path is promoted.
+        continuation_capability: ContinuationCapability::available_experimental(target),
         ..descriptor
     })
 }
@@ -337,7 +336,7 @@ mod tests {
             .target()
             .expect("Codex Desktop planned continuation target should be cataloged");
         AgentIntegrationDescriptor {
-            continuation_capability: ContinuationCapability::Available(target),
+            continuation_capability: ContinuationCapability::available_experimental(target),
             ..descriptor
         }
     }
