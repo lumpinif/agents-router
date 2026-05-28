@@ -64,7 +64,14 @@ pub fn feishu_lark_app_bot_targets(config: &RawConfig) -> Vec<FeishuLarkAppBotTa
                 provider_id: provider.id.clone(),
                 domain: provider.domain.as_ref()?.clone(),
                 app_id: provider.app_id.as_ref()?.clone(),
-                app_secret_env: provider.app_secret_env.clone(),
+                app_secret_configured: provider
+                    .app_secret
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || provider
+                        .app_secret_env
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()),
                 tenant_key: provider.tenant_key.as_ref()?.clone(),
                 chat_id: provider.chat_id.as_ref()?.clone(),
             })

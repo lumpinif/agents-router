@@ -45,8 +45,8 @@ pub fn resolve_feishu_lark_app_id(input: &str) -> anyhow::Result<String> {
     resolve_non_empty_no_whitespace("Feishu/Lark App ID", input)
 }
 
-pub fn resolve_feishu_lark_app_secret_env(input: &str) -> anyhow::Result<String> {
-    resolve_non_empty_no_whitespace("Feishu/Lark App Secret env var name", input)
+pub fn resolve_feishu_lark_app_secret(input: &str) -> anyhow::Result<String> {
+    resolve_non_empty_no_whitespace("Feishu/Lark App Secret", input)
 }
 
 pub fn resolve_feishu_lark_tenant_key(input: &str) -> anyhow::Result<String> {

@@ -230,7 +230,7 @@ fn writes_parseable_feishu_lark_app_bot_config_with_codex_reply_route() {
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );
@@ -243,10 +243,8 @@ fn writes_parseable_feishu_lark_app_bot_config_with_codex_reply_route() {
         .expect("App Bot provider should be configured");
     assert_eq!(provider.mode.as_deref(), Some("app_bot"));
     assert_eq!(provider.domain.as_deref(), Some("lark"));
-    assert_eq!(
-        provider.app_secret_env.as_deref(),
-        Some("AGENTS_ROUTER_LARK_APP_SECRET")
-    );
+    assert_eq!(provider.app_secret.as_deref(), Some("test-app-secret"));
+    assert!(provider.app_secret_env.is_none());
     assert_eq!(provider.tenant_key.as_deref(), Some("2ca1d211f64f6438"));
     assert_eq!(
         provider.chat_id.as_deref(),
@@ -266,7 +264,7 @@ fn feishu_lark_app_bot_replies_are_not_enabled_for_non_codex_desktop_agents() {
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );
@@ -574,9 +572,8 @@ fn accepts_feishu_lark_app_bot_setup_fields() {
         "cli_9f5343c580712544"
     );
     assert_eq!(
-        resolve_feishu_lark_app_secret_env("AGENTS_ROUTER_LARK_APP_SECRET")
-            .expect("secret env var name should be valid"),
-        "AGENTS_ROUTER_LARK_APP_SECRET"
+        resolve_feishu_lark_app_secret("test-app-secret").expect("App Secret should be valid"),
+        "test-app-secret"
     );
     assert_eq!(
         resolve_feishu_lark_tenant_key("2ca1d211f64f6438").expect("tenant_key should be valid"),

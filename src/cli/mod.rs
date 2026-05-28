@@ -541,7 +541,7 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
             print_field("app id", &target.app_id);
             print_field(
                 "app secret",
-                if target.app_secret_env.is_some() {
+                if target.app_secret_configured {
                     style(i18n.text(Text::Configured)).green()
                 } else {
                     style(i18n.text(Text::NotConfigured)).yellow()

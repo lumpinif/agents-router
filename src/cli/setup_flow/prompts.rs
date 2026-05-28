@@ -412,30 +412,43 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
     Ok(options[selection])
 }
 
-fn feishu_lark_mode_option_label(
+pub(in crate::cli) fn feishu_lark_mode_option_label(
     mode: FeishuLarkSetupMode,
     agent: setup::AgentIntegrationId,
     default: Option<FeishuLarkSetupMode>,
     i18n: I18n,
 ) -> String {
     let mut label = match mode {
-        FeishuLarkSetupMode::CustomBotWebhook => {
-            "Custom Bot Webhook — Stable\n  Send one-way notifications to a group. Fastest setup. No replies."
-                .to_string()
-        }
+        FeishuLarkSetupMode::CustomBotWebhook => localized(
+            i18n,
+            "Custom Bot Webhook — Stable\n  Send one-way notifications to a group. Fastest setup. No replies.",
+            "Custom Bot Webhook — 稳定\n  单向发送通知到群。配置最快，不支持回复。",
+        )
+        .to_string(),
         FeishuLarkSetupMode::AppBot => {
             if let Some(release_stage) = agent
                 .descriptor()
                 .continuation_capability()
                 .release_stage()
             {
-                format!(
-                    "App Bot — {}\n  Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.",
-                    continuation_release_stage_label(release_stage)
+                localized_string(
+                    i18n,
+                    format!(
+                        "App Bot — {}\n  Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.",
+                        continuation_release_stage_label(release_stage, i18n)
+                    ),
+                    format!(
+                        "App Bot — {}\n  通过应用机器人发送通知。Lark thread 回复可以继续 Codex Desktop session；Feishu 使用前需要在你的 workspace 里验证。",
+                        continuation_release_stage_label(release_stage, i18n)
+                    ),
                 )
             } else {
-                "App Bot\n  Send notifications through an app bot. Replies are only available for Codex Desktop when continuation support is available."
-                    .to_string()
+                localized(
+                    i18n,
+                    "App Bot\n  Send notifications through an app bot. Replies are only available for Codex Desktop when continuation support is available.",
+                    "App Bot\n  通过应用机器人发送通知。只有 Codex Desktop continuation 可用时才支持回复。",
+                )
+                .to_string()
             }
         }
     };
@@ -449,10 +462,15 @@ fn feishu_lark_mode_option_label(
     label
 }
 
-fn continuation_release_stage_label(release_stage: ContinuationReleaseStage) -> &'static str {
-    match release_stage {
-        ContinuationReleaseStage::Experimental => "Experimental",
-        ContinuationReleaseStage::Stable => "Stable",
+fn continuation_release_stage_label(
+    release_stage: ContinuationReleaseStage,
+    i18n: I18n,
+) -> &'static str {
+    match (release_stage, i18n.language()) {
+        (ContinuationReleaseStage::Experimental, CliLanguage::English) => "Experimental",
+        (ContinuationReleaseStage::Experimental, CliLanguage::SimplifiedChinese) => "实验性",
+        (ContinuationReleaseStage::Stable, CliLanguage::English) => "Stable",
+        (ContinuationReleaseStage::Stable, CliLanguage::SimplifiedChinese) => "稳定",
     }
 }
 
@@ -497,33 +515,28 @@ pub(in crate::cli) fn prompt_for_feishu_lark_app_id(
     )
 }
 
-pub(in crate::cli) fn prompt_for_feishu_lark_app_secret_env(
-    current_env: Option<&str>,
-    domain: &str,
-) -> anyhow::Result<String> {
-    let default_env = match domain {
-        "feishu" => "AGENTS_ROUTER_FEISHU_APP_SECRET",
-        _ => "AGENTS_ROUTER_LARK_APP_SECRET",
-    };
-    let fallback = current_env.unwrap_or(default_env);
-    let prompt = if let Some(current_env) = current_env {
-        format!("App Secret env var name [{current_env}, press Enter to keep]")
+pub(in crate::cli) enum FeishuLarkAppSecretPromptResult {
+    Inline(String),
+    KeepExisting,
+}
+
+pub(in crate::cli) fn prompt_for_feishu_lark_app_secret(
+    has_current_secret: bool,
+) -> anyhow::Result<FeishuLarkAppSecretPromptResult> {
+    let prompt = if has_current_secret {
+        "App Secret [configured, press Enter to keep]".to_string()
     } else {
-        format!("App Secret env var name [{default_env}]")
+        "App Secret".to_string()
     };
     loop {
-        let input = prompt_text(
-            prompt.clone(),
-            "failed to read Feishu/Lark App Secret env var",
-        )?;
-        let candidate = if input.trim().is_empty() {
-            fallback
-        } else {
-            input.trim()
-        };
+        let input = prompt_secret(prompt.clone(), "failed to read Feishu/Lark App Secret")?;
+        let candidate = input.trim();
+        if candidate.is_empty() && has_current_secret {
+            return Ok(FeishuLarkAppSecretPromptResult::KeepExisting);
+        }
 
-        match setup::resolve_feishu_lark_app_secret_env(candidate) {
-            Ok(value) => return Ok(value),
+        match setup::resolve_feishu_lark_app_secret(candidate) {
+            Ok(value) => return Ok(FeishuLarkAppSecretPromptResult::Inline(value)),
             Err(error) => println!("{error}"),
         }
     }

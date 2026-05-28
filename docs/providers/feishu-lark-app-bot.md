@@ -19,11 +19,11 @@ This guide uses Long Connection / WebSocket. You do not need a public webhook UR
 - Bot capability enabled.
 - The bot added to the target group.
 - App ID.
-- App Secret stored in a local environment variable.
+- App Secret from the app console.
 - Tenant Key.
 - Chat ID for the target group.
 
-Do not paste App Secret into chat, docs, screenshots, or issue reports.
+Do not paste App Secret into chat, docs, screenshots, or issue reports. Setup stores it only in your local Agents Router config.
 
 ## 1. Create the App
 
@@ -41,11 +41,9 @@ Then open the app and copy:
 App ID
 ```
 
-Keep `App Secret` private. Put it in a local environment variable:
+Keep `App Secret` private. Setup stores it in your local Agents Router config and never prints it in summaries or logs.
 
-```bash
-export AGENTS_ROUTER_LARK_APP_SECRET="your-app-secret"
-```
+Advanced: if you prefer environment variables, you can hand-edit the config to use `app_secret_env` instead of `app_secret`.
 
 ## 2. Enable Bot
 
@@ -151,7 +149,7 @@ Enter:
 ```text
 domain: lark
 App ID: cli_...
-App Secret env var name: AGENTS_ROUTER_LARK_APP_SECRET
+App Secret: paste from the Lark console
 Tenant Key: ...
 Chat ID: oc_...
 ```
@@ -185,5 +183,5 @@ Check these first:
 - The app has `im:chat:readonly`.
 - Event subscription uses Long Connection / WebSocket.
 - `im.message.receive_v1` is subscribed.
-- App Secret is set in the local environment variable used by config.
+- App Secret is present in the local config, or `app_secret_env` is configured manually.
 - `tenant_key` and `chat_id` are from the same workspace and group.

@@ -114,7 +114,7 @@ pub(super) struct SetupDefaults {
     pub(super) feishu_lark_secret: Option<String>,
     pub(super) feishu_lark_app_domain: Option<String>,
     pub(super) feishu_lark_app_id: Option<String>,
-    pub(super) feishu_lark_app_secret_env: Option<String>,
+    pub(super) feishu_lark_app_secret: Option<String>,
     pub(super) feishu_lark_tenant_key: Option<String>,
     pub(super) feishu_lark_chat_id: Option<String>,
     pub(super) webhook_url: Option<String>,
@@ -177,8 +177,8 @@ impl SetupDefaults {
                 .and_then(|provider| provider.domain.clone()),
             feishu_lark_app_id: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(|provider| provider.app_id.clone()),
-            feishu_lark_app_secret_env: first_provider_of_type(config, ProviderType::FeishuLark)
-                .and_then(|provider| provider.app_secret_env.clone()),
+            feishu_lark_app_secret: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.app_secret.clone()),
             feishu_lark_tenant_key: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(|provider| provider.tenant_key.clone()),
             feishu_lark_chat_id: first_provider_of_type(config, ProviderType::FeishuLark)
@@ -901,23 +901,41 @@ pub(super) fn run_feishu_lark_setup(
                 i18n,
             )?;
             let app_id = prompt_for_feishu_lark_app_id(defaults.feishu_lark_app_id.as_deref())?;
-            let app_secret_env = prompt_for_feishu_lark_app_secret_env(
-                defaults.feishu_lark_app_secret_env.as_deref(),
-                &domain,
-            )?;
+            let app_secret =
+                prompt_for_feishu_lark_app_secret(defaults.feishu_lark_app_secret.is_some())?;
             let tenant_key =
                 prompt_for_feishu_lark_tenant_key(defaults.feishu_lark_tenant_key.as_deref())?;
             let chat_id = prompt_for_feishu_lark_chat_id(defaults.feishu_lark_chat_id.as_deref())?;
-            setup::build_feishu_lark_app_bot_config(
-                agent,
-                answer_detail,
-                prompt_detail,
-                &domain,
-                &app_id,
-                &app_secret_env,
-                &tenant_key,
-                &chat_id,
-            )
+            match app_secret {
+                FeishuLarkAppSecretPromptResult::Inline(app_secret) => {
+                    setup::build_feishu_lark_app_bot_config(
+                        agent,
+                        answer_detail,
+                        prompt_detail,
+                        &domain,
+                        &app_id,
+                        &app_secret,
+                        &tenant_key,
+                        &chat_id,
+                    )
+                }
+                FeishuLarkAppSecretPromptResult::KeepExisting => {
+                    if let Some(app_secret) = defaults.feishu_lark_app_secret.as_deref() {
+                        setup::build_feishu_lark_app_bot_config(
+                            agent,
+                            answer_detail,
+                            prompt_detail,
+                            &domain,
+                            &app_id,
+                            app_secret,
+                            &tenant_key,
+                            &chat_id,
+                        )
+                    } else {
+                        anyhow::bail!("Feishu/Lark App Secret is required");
+                    }
+                }
+            }
         }
     };
     write_setup_config_with_route_filters(
@@ -964,11 +982,11 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
                 "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"
             );
             println!(
-                "Keep App Secret in a local environment variable; setup only stores its env var name."
+                "Paste App Secret only into this local setup prompt; it is not printed later."
             );
         }
         CliLanguage::SimplifiedChinese => {
-            println!("App Bot checklist:");
+            println!("App Bot 检查清单:");
             println!("- 添加 Bot 能力。");
             println!(
                 "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly。"
@@ -978,7 +996,7 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!(
                 "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"
             );
-            println!("App Secret 只放在本机环境变量里；setup 只保存环境变量名。");
+            println!("App Secret 只粘贴到这个本机 setup 输入里；之后不会打印出来。");
         }
     }
     println!();

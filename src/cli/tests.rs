@@ -557,14 +557,14 @@ fn setup_provider_summary_reports_signature_without_exposing_secret() {
 }
 
 #[test]
-fn setup_provider_summary_reports_app_bot_without_exposing_secret_env_value() {
+fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
     let config = setup::build_feishu_lark_app_bot_config(
         setup::AgentIntegrationId::CodexDesktop,
         AnswerDetail::Preview,
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );
@@ -588,6 +588,8 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_env_value() {
             ],
         }
     );
+    let rendered = format!("{summary:?}");
+    assert!(!rendered.contains("test-app-secret"));
 }
 
 #[test]
@@ -598,7 +600,7 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );
@@ -613,8 +615,8 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
         Some("cli_9f5343c580712544")
     );
     assert_eq!(
-        defaults.feishu_lark_app_secret_env.as_deref(),
-        Some("AGENTS_ROUTER_LARK_APP_SECRET")
+        defaults.feishu_lark_app_secret.as_deref(),
+        Some("test-app-secret")
     );
     assert_eq!(
         defaults.feishu_lark_tenant_key.as_deref(),
@@ -627,6 +629,78 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
 }
 
 #[test]
+fn setup_defaults_do_not_treat_app_secret_env_as_inline_app_secret() {
+    let config = RawConfig::from_toml_str(
+        r#"
+schema_version = 1
+
+[notification]
+answer_detail = "preview"
+
+[[sources]]
+id = "codex_desktop"
+type = "codex_desktop"
+
+[[sources]]
+id = "agents_router"
+type = "agents_router"
+
+[[providers]]
+id = "feishu_lark"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret_env = "AGENTS_ROUTER_LARK_APP_SECRET"
+tenant_key = "2ca1d211f64f6438"
+chat_id = "oc_5ce6d572455d361153b7xx51da133945"
+
+[[routes]]
+sources = ["codex_desktop"]
+providers = ["feishu_lark"]
+"#,
+    )
+    .expect("test config should be valid");
+
+    let defaults = SetupDefaults::from_config(&config);
+
+    assert_eq!(defaults.feishu_lark_mode, Some(FeishuLarkSetupMode::AppBot));
+    assert_eq!(defaults.feishu_lark_app_secret, None);
+}
+
+#[test]
+fn feishu_lark_mode_options_are_localized() {
+    let chinese_custom_bot = feishu_lark_mode_option_label(
+        FeishuLarkSetupMode::CustomBotWebhook,
+        setup::AgentIntegrationId::CodexDesktop,
+        None,
+        I18n::new(CliLanguage::SimplifiedChinese),
+    );
+    assert!(chinese_custom_bot.contains("稳定"));
+    assert!(chinese_custom_bot.contains("单向发送通知到群"));
+    assert!(!chinese_custom_bot.contains("Fastest setup"));
+
+    let chinese_app_bot = feishu_lark_mode_option_label(
+        FeishuLarkSetupMode::AppBot,
+        setup::AgentIntegrationId::CodexDesktop,
+        Some(FeishuLarkSetupMode::AppBot),
+        I18n::new(CliLanguage::SimplifiedChinese),
+    );
+    assert!(chinese_app_bot.contains("实验性"));
+    assert!(chinese_app_bot.contains("通过应用机器人发送通知"));
+    assert!(!chinese_app_bot.contains("validate Feishu"));
+
+    let english_app_bot = feishu_lark_mode_option_label(
+        FeishuLarkSetupMode::AppBot,
+        setup::AgentIntegrationId::CodexDesktop,
+        None,
+        I18n::new(CliLanguage::English),
+    );
+    assert!(english_app_bot.contains("Experimental"));
+    assert!(english_app_bot.contains("validate Feishu before relying on replies"));
+}
+
+#[test]
 fn app_bot_test_notification_body_explains_real_thread_reply_test() {
     let config = setup::build_feishu_lark_app_bot_config(
         setup::AgentIntegrationId::CodexDesktop,
@@ -634,7 +708,7 @@ fn app_bot_test_notification_body_explains_real_thread_reply_test() {
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );
@@ -655,7 +729,7 @@ fn app_bot_test_notification_does_not_advertise_replies_for_unsupported_agents()
         PromptDetail::Off,
         "lark",
         "cli_9f5343c580712544",
-        "AGENTS_ROUTER_LARK_APP_SECRET",
+        "test-app-secret",
         "2ca1d211f64f6438",
         "oc_5ce6d572455d361153b7xx51da133945",
     );

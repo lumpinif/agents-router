@@ -61,7 +61,7 @@ pub struct FeishuLarkAppBotTarget {
     pub provider_id: String,
     pub domain: String,
     pub app_id: String,
-    pub app_secret_env: Option<String>,
+    pub app_secret_configured: bool,
     pub tenant_key: String,
     pub chat_id: String,
 }

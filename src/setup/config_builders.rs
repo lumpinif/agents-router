@@ -35,7 +35,34 @@ pub fn build_feishu_lark_app_bot_config(
     prompt_detail: PromptDetail,
     domain: &str,
     app_id: &str,
-    app_secret_env: &str,
+    app_secret: &str,
+    tenant_key: &str,
+    chat_id: &str,
+) -> RawConfig {
+    build_feishu_lark_app_bot_config_with_secret_source(
+        agent,
+        answer_detail,
+        prompt_detail,
+        domain,
+        app_id,
+        FeishuLarkAppBotSecretSource::Inline(app_secret.to_string()),
+        tenant_key,
+        chat_id,
+    )
+}
+
+enum FeishuLarkAppBotSecretSource {
+    Inline(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_feishu_lark_app_bot_config_with_secret_source(
+    agent: AgentIntegrationId,
+    answer_detail: AnswerDetail,
+    prompt_detail: PromptDetail,
+    domain: &str,
+    app_id: &str,
+    app_secret_source: FeishuLarkAppBotSecretSource,
     tenant_key: &str,
     chat_id: &str,
 ) -> RawConfig {
@@ -44,7 +71,11 @@ pub fn build_feishu_lark_app_bot_config(
     provider.mode = Some("app_bot".to_string());
     provider.domain = Some(domain.to_string());
     provider.app_id = Some(app_id.to_string());
-    provider.app_secret_env = Some(app_secret_env.to_string());
+    match app_secret_source {
+        FeishuLarkAppBotSecretSource::Inline(app_secret) => {
+            provider.app_secret = Some(app_secret);
+        }
+    }
     provider.tenant_key = Some(tenant_key.to_string());
     provider.chat_id = Some(chat_id.to_string());
 
