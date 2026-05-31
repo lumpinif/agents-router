@@ -75,8 +75,8 @@ pub(super) enum GuidedSetup {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum FeishuLarkSetupMode {
-    #[default]
     CustomBotWebhook,
+    #[default]
     AppBot,
 }
 

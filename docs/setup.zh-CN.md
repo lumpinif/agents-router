@@ -107,16 +107,16 @@ Provider 教程：
 选择 Feishu/Lark 时，setup 会继续询问 mode：
 
 ```text
-Custom Bot Webhook — Stable
-  向群里发送一次性通知。最快 setup。不支持回复。
-
 App Bot — Experimental
   通过应用机器人发送通知。Lark thread replies 可以继续 Codex Desktop session；依赖 Feishu replies 前请先在自己的 workspace 验证。
+
+Custom Bot Webhook — Fallback
+  单向发送通知到一个群。不支持回复或项目群。
 ```
 
-Custom Bot Webhook 是默认选项，并且保留稳定的一次性通知路径。App Bot 需要 Bot 能力、消息权限、`im.message.receive_v1`、Long Connection / WebSocket，以及已发布的应用版本。setup 只显示短 checklist，并链接到完整的 [飞书/Lark App Bot 指南](providers/feishu-lark-app-bot.md)。
+App Bot 是默认选项，因为它支持双向 bridge：thread replies、`/bind` 和项目群。App Bot 需要 Bot 能力、消息权限、`im.message.receive_v1`、Long Connection / WebSocket，以及已发布的应用版本。setup 只显示短 checklist，并链接到完整的 [飞书/Lark App Bot 指南](providers/feishu-lark-app-bot.md)。
 
-如果你现在只想要稳定通知，请选择 Custom Bot Webhook。需要 Codex Desktop thread reply 时，选择 Lark App Bot Experimental 路径。Feishu App Bot 使用相同配置形态，但在依赖 replies 前应该先在自己的 workspace 做验证。
+如果你只想要一个简单的单向 fallback，请选择 Custom Bot Webhook。需要 Codex Desktop thread reply 时，选择 Lark App Bot Experimental 路径。Feishu App Bot 使用相同配置形态，但在依赖 replies 前应该先在自己的 workspace 做验证。
 
 ## Provider ID
 

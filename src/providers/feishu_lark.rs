@@ -38,20 +38,20 @@ pub struct FeishuLarkProvider {
     client: reqwest::Client,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum FeishuLarkProviderRuntime {
     CustomBot(FeishuLarkCustomBotRuntime),
     AppBot(FeishuLarkAppBotRuntime),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FeishuLarkCustomBotRuntime {
     url: String,
     secret: Option<String>,
     computer_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FeishuLarkAppBotRuntime {
     api_base_url: String,
     app_id: String,
@@ -106,6 +106,23 @@ impl Provider for FeishuLarkProvider {
                 }
             }
         })
+    }
+
+    fn send_to_provider_conversation<'a>(
+        &'a self,
+        signal: &'a Signal,
+        provider_conversation_id: &'a str,
+    ) -> Option<ProviderFuture<'a>> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => None,
+            FeishuLarkProviderRuntime::AppBot(runtime) => {
+                let mut runtime = runtime.clone();
+                runtime.chat_id = provider_conversation_id.to_string();
+                Some(Box::pin(async move {
+                    self.send_app_bot(signal, &runtime).await
+                }))
+            }
+        }
     }
 }
 
@@ -1023,10 +1040,10 @@ fn validate_app_bot_thread_reply_request(
             "provider thread reply request tenant did not match App Bot config",
         ));
     }
-    if request.provider_conversation_id != runtime.chat_id {
+    if present(Some(request.provider_conversation_id.as_str())).is_none() {
         return Err(thread_reply_error(
             request,
-            "provider thread reply request chat did not match App Bot config",
+            "provider thread reply request did not include provider_conversation_id",
         ));
     }
     if present(Some(request.provider_thread_id.as_str())).is_none() {

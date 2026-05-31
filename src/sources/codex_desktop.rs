@@ -2,6 +2,7 @@ mod rollout;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -61,6 +62,7 @@ pub async fn watch(runtime: RuntimeState) -> anyhow::Result<()> {
                     .as_mut()
                     .expect("Codex Desktop watcher should exist after start");
                 let response_surface_ledger = runtime.response_surface_ledger();
+                let bridge_binding_ledger = runtime.bridge_binding_ledger();
                 let response_surface_turns = response_surface_ledger
                     .response_surface_continuation_turn_index()
                     .await?;
@@ -78,6 +80,7 @@ pub async fn watch(runtime: RuntimeState) -> anyhow::Result<()> {
                     batch,
                     Some(&delivery_safety),
                     Some(&response_surface_ledger),
+                    Some(&bridge_binding_ledger),
                 )
                 .await?;
             }
@@ -101,6 +104,7 @@ async fn route_and_checkpoint_batch(
     batch: CodexDesktopPollBatch,
     delivery_safety: Option<&DeliverySafetyGuard>,
     response_surface_ledger: Option<&crate::response_surface_ledger::ResponseSurfaceLedgerStore>,
+    bridge_binding_ledger: Option<&crate::bridge_binding_ledger::BridgeBindingLedgerStore>,
 ) -> anyhow::Result<()> {
     for signal in &batch.signals {
         info!(
@@ -116,6 +120,7 @@ async fn route_and_checkpoint_batch(
                 providers,
                 delivery_safety,
                 response_surface_ledger,
+                bridge_binding_ledger,
             )
             .await
         {
@@ -156,7 +161,14 @@ pub fn codex_session_origin(
     }
 
     for path in discover_rollout_paths(sessions_dir)? {
-        let session = read_session_info(&path)?;
+        let session = match read_session_info(&path) {
+            Ok(session) => session,
+            Err(error) if rollout_disappeared(&error) => {
+                warn_rollout_disappeared(&path, &error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if session.id.as_deref() != Some(session_id) {
             continue;
         }
@@ -223,6 +235,22 @@ impl CodexDesktopSessionWatcher {
         source: &SourceConfig,
         response_surface_turns: &ResponseSurfaceContinuationTurnIndex,
     ) -> anyhow::Result<CodexDesktopPollBatch> {
+        let paths = discover_rollout_paths(&self.sessions_dir)?;
+        self.poll_discovered_paths_with_response_surface_turns(
+            config,
+            source,
+            response_surface_turns,
+            paths,
+        )
+    }
+
+    fn poll_discovered_paths_with_response_surface_turns(
+        &self,
+        config: &ValidatedConfig,
+        source: &SourceConfig,
+        response_surface_turns: &ResponseSurfaceContinuationTurnIndex,
+        paths: Vec<PathBuf>,
+    ) -> anyhow::Result<CodexDesktopPollBatch> {
         let prompt_detail = config.notification.prompt_detail;
         let titles = load_session_titles(&self.session_index_path)?;
         let mut state = self.state.clone();
@@ -230,18 +258,26 @@ impl CodexDesktopSessionWatcher {
         let mut signals = Vec::new();
         let mut changed = false;
 
-        for path in discover_rollout_paths(&self.sessions_dir)? {
+        for path in paths {
             let path_key = path_key(&path);
+            let file_was_known = state.files.contains_key(&path_key);
             if !state.files.contains_key(&path_key) {
                 let offset = 0;
-                let session = read_session_info(&path)?;
+                let session = match read_session_info(&path) {
+                    Ok(session) => session,
+                    Err(error) if rollout_disappeared(&error) => {
+                        warn_rollout_disappeared(&path, &error);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 state
                     .files
                     .insert(path_key.clone(), FileWatchState { offset, session });
                 changed = true;
             }
 
-            let mut result = read_new_rollout_items(
+            let mut result = match read_new_rollout_items(
                 &path,
                 state
                     .files
@@ -249,7 +285,18 @@ impl CodexDesktopSessionWatcher {
                     .expect("file state should exist after insertion")
                     .offset,
                 prompt_detail == PromptDetail::On,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) if rollout_disappeared(&error) => {
+                    warn_rollout_disappeared(&path, &error);
+                    if !file_was_known {
+                        state.files.remove(&path_key);
+                        pending_prompts.remove(&path_key);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             if result.offset_changed {
                 let file_state = state
@@ -372,8 +419,22 @@ impl CodexDesktopSessionWatcher {
         for path in discover_rollout_paths(&self.sessions_dir)? {
             discovered_files += 1;
             let path_key = path_key(&path);
-            let offset = completed_rollout_offset(&path)?;
-            let session = read_session_info(&path)?;
+            let offset = match completed_rollout_offset(&path) {
+                Ok(offset) => offset,
+                Err(error) if rollout_disappeared(&error) => {
+                    warn_rollout_disappeared(&path, &error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let session = match read_session_info(&path) {
+                Ok(session) => session,
+                Err(error) if rollout_disappeared(&error) => {
+                    warn_rollout_disappeared(&path, &error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             if let Some(file_state) = self.state.files.get_mut(&path_key) {
                 if file_state.offset != offset {
@@ -410,6 +471,22 @@ impl CodexDesktopSessionWatcher {
     fn save_state(&self) -> anyhow::Result<()> {
         self.state.save(&self.state_path)
     }
+}
+
+fn rollout_disappeared(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::NotFound)
+    })
+}
+
+fn warn_rollout_disappeared(path: &Path, error: &anyhow::Error) {
+    warn!(
+        rollout.path = %path.display(),
+        error = %error,
+        event = "codex_desktop.watch.rollout_disappeared",
+    );
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

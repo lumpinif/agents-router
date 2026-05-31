@@ -1,8 +1,10 @@
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
+use crate::bridge_binding_ledger::{ThreadBindingQuery, ThreadSessionBindingRecord};
 use crate::provider_catalog::{
     InboundReplyMode, ProviderMode, ProviderModeCapability, RESPONSE_SURFACE_REPLY_SURFACES,
     StableEventIdCapability,
@@ -10,6 +12,7 @@ use crate::provider_catalog::{
 use crate::response_surface_ledger::{
     InboundEventClaimDecision, InboundEventDedupInput, ResponseSurfaceLedger,
     ResponseSurfaceLookupQuery, ResponseSurfaceLookupRecord, ResponseSurfaceLookupResult,
+    ResponseSurfaceStatus,
 };
 
 const SLACK_SOCKET_MODE_EVENTS_API_TYPE: &str = "events_api";
@@ -36,6 +39,40 @@ pub struct NormalizedProviderSurfaceReply {
 pub enum ProviderInboundNormalizeResult {
     SurfaceReply(NormalizedProviderSurfaceReply),
     Skip(ProviderInboundSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedProviderControlCommand {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_mode: ProviderMode,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+    pub provider_event_id: String,
+    pub command: ProviderControlCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderControlCommand {
+    BindProject { project_path: String },
+    Invalid { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderControlNormalizeResult {
+    ControlCommand(NormalizedProviderControlCommand),
+    Skip(ProviderControlSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderControlSkipReason {
+    UnsupportedEnvelopeType,
+    UnsupportedEventType,
+    NonUserMessage,
+    UnsupportedMessageType,
+    EmptyMessageText,
+    NotControlCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +277,98 @@ pub fn normalize_feishu_lark_long_connection_surface_reply(
     ))
 }
 
+pub fn normalize_feishu_lark_long_connection_control_command(
+    provider_id: &str,
+    raw_event: &[u8],
+) -> anyhow::Result<ProviderControlNormalizeResult> {
+    ensure_present("provider_id", provider_id)?;
+    let envelope: FeishuLarkEventEnvelope =
+        serde_json::from_slice(raw_event).context("failed to parse Feishu/Lark event")?;
+
+    if optional_field(envelope.schema.as_deref()) != Some(FEISHU_LARK_EVENT_SCHEMA) {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::UnsupportedEnvelopeType,
+        ));
+    }
+
+    let header = envelope
+        .header
+        .context("Feishu/Lark event is missing header")?;
+    if optional_field(header.event_type.as_deref()) != Some(FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE)
+    {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::UnsupportedEventType,
+        ));
+    }
+
+    let tenant_key = required_owned(
+        "feishu_lark header.tenant_key",
+        header.tenant_key.as_deref(),
+    )?;
+    let event = envelope
+        .event
+        .context("Feishu/Lark message event is missing event")?;
+    let sender = event
+        .sender
+        .context("Feishu/Lark message event is missing sender")?;
+    if optional_field(sender.sender_type.as_deref()) != Some("user") {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::NonUserMessage,
+        ));
+    }
+
+    let message = event
+        .message
+        .context("Feishu/Lark message event is missing message")?;
+    if optional_field(message.message_type.as_deref()) != Some(FEISHU_LARK_TEXT_MESSAGE_TYPE) {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::UnsupportedMessageType,
+        ));
+    }
+
+    let message_id = required_owned(
+        "feishu_lark message.message_id",
+        message.message_id.as_deref(),
+    )?;
+    let chat_id = required_owned("feishu_lark message.chat_id", message.chat_id.as_deref())?;
+    let content = required_trimmed("feishu_lark message.content", message.content.as_deref())?;
+    let text_content: FeishuLarkTextContent = serde_json::from_str(content)
+        .context("failed to parse Feishu/Lark text message content")?;
+    let Some(text) = normalized_reply_text(text_content.text.as_deref()) else {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::EmptyMessageText,
+        ));
+    };
+    let Some(command) = parse_provider_control_command(&text) else {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::NotControlCommand,
+        ));
+    };
+
+    let root_id = optional_field(message.root_id.as_deref());
+    let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
+    let command = if root_id.is_some() {
+        ProviderControlCommand::Invalid {
+            message: "Run `/bind` in the room, not inside a thread.".to_string(),
+        }
+    } else {
+        command
+    };
+
+    Ok(ProviderControlNormalizeResult::ControlCommand(
+        NormalizedProviderControlCommand {
+            provider_id: provider_id.to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_mode: ProviderMode::FeishuLarkAppBot,
+            provider_account_id: tenant_key,
+            provider_conversation_id: chat_id,
+            provider_thread_id,
+            provider_event_id: message_id,
+            command,
+        },
+    ))
+}
+
 pub fn lookup_and_claim_provider_surface_reply(
     ledger: &mut ResponseSurfaceLedger,
     provider: &ProviderModeCapability,
@@ -388,6 +517,132 @@ pub fn lookup_and_claim_provider_surface_reply(
     }
 }
 
+pub fn lookup_and_claim_provider_thread_session_reply(
+    ledger: &mut ResponseSurfaceLedger,
+    provider: &ProviderModeCapability,
+    binding: ThreadSessionBindingRecord,
+    reply: NormalizedProviderSurfaceReply,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ProviderInboundDecision> {
+    ensure!(
+        provider.mode == reply.provider_mode,
+        "provider inbound mode `{}` does not match normalized reply mode `{}`",
+        provider.mode.as_str(),
+        reply.provider_mode.as_str()
+    );
+    ensure!(
+        provider.provider_type.as_str() == reply.provider_type,
+        "provider inbound type `{}` does not match normalized reply type `{}`",
+        provider.provider_type.as_str(),
+        reply.provider_type
+    );
+    ensure!(
+        binding.provider_id == reply.provider_id
+            && binding.provider_type == reply.provider_type
+            && binding.provider_account_id == reply.provider_account_id
+            && binding.provider_conversation_id == reply.provider_conversation_id
+            && binding.provider_thread_id == reply.provider_thread_id,
+        "provider thread binding does not match normalized reply"
+    );
+
+    if !provider_mode_accepts_local_surface_replies(provider) {
+        return Ok(ProviderInboundDecision::Skip(
+            ProviderInboundSkipReason::UnsupportedProviderMode(provider.mode),
+        ));
+    }
+
+    let surface_id = bridge_thread_surface_id(&binding);
+    let claim = ledger.claim_inbound_event_at(
+        InboundEventDedupInput {
+            provider_id: reply.provider_id.clone(),
+            provider_type: reply.provider_type.clone(),
+            provider_account_id: reply.provider_account_id.clone(),
+            provider_conversation_id: reply.provider_conversation_id.clone(),
+            provider_event_id: reply.provider_event_id.clone(),
+            surface_id: surface_id.clone(),
+        },
+        now,
+    )?;
+
+    match claim {
+        InboundEventClaimDecision::Claimed {
+            provider_event_id_hash,
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                provider.conversation.id = %reply.provider_conversation_id,
+                provider.thread.id = %reply.provider_thread_id,
+                surface.id = %surface_id,
+                source.id = %binding.source_id,
+                source.type = %binding.source_type,
+                source.session.id = %binding.source_session_id,
+                event.hash = %provider_event_id_hash,
+                event = "provider_inbound.thread_binding.claim.succeeded",
+            );
+            Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
+                reply,
+                surface: ResponseSurfaceLookupRecord {
+                    surface_id,
+                    signal_id: "bridge-thread-binding".to_string(),
+                    delivery_id: "bridge-thread-binding".to_string(),
+                    source_id: binding.source_id,
+                    source_type: binding.source_type,
+                    source_session_id: binding.source_session_id,
+                    source_turn_id: None,
+                    provider_id: binding.provider_id,
+                    provider_type: binding.provider_type,
+                    provider_mode: provider.mode,
+                    provider_account_id: binding.provider_account_id,
+                    provider_conversation_id: binding.provider_conversation_id,
+                    provider_message_id: binding.provider_thread_id.clone(),
+                    provider_thread_id: binding.provider_thread_id,
+                    route_binding_hash: None,
+                    status: ResponseSurfaceStatus::Open,
+                },
+                provider_event_id_hash,
+            }))
+        }
+        InboundEventClaimDecision::AlreadyProcessing {
+            surface_id,
+            provider_event_id_hash,
+            status,
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                surface.id = %surface_id,
+                event.hash = %provider_event_id_hash,
+                inbound.status = %status.as_str(),
+                event = "provider_inbound.thread_binding.claim.already_processing",
+            );
+            Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::EventAlreadyProcessing { surface_id },
+            ))
+        }
+        InboundEventClaimDecision::DuplicateProcessed {
+            surface_id,
+            provider_event_id_hash,
+            status,
+        } => {
+            info!(
+                provider.id = %reply.provider_id,
+                provider.type = %reply.provider_type,
+                provider.mode = %reply.provider_mode.as_str(),
+                surface.id = %surface_id,
+                event.hash = %provider_event_id_hash,
+                inbound.status = %status.as_str(),
+                event = "provider_inbound.thread_binding.claim.duplicate_processed",
+            );
+            Ok(ProviderInboundDecision::Skip(
+                ProviderInboundSkipReason::DuplicateEvent { surface_id },
+            ))
+        }
+    }
+}
+
 fn provider_mode_accepts_local_surface_replies(provider: &ProviderModeCapability) -> bool {
     provider.inbound_reply.mode == InboundReplyMode::LocalConnection
         && !provider.inbound_reply.requires_public_endpoint
@@ -397,6 +652,42 @@ fn provider_mode_accepts_local_surface_replies(provider: &ProviderModeCapability
             .reply_surfaces
             .iter()
             .any(|surface| RESPONSE_SURFACE_REPLY_SURFACES.contains(surface))
+}
+
+pub fn thread_binding_query_for_reply(
+    reply: &NormalizedProviderSurfaceReply,
+) -> ThreadBindingQuery {
+    ThreadBindingQuery {
+        provider_id: reply.provider_id.clone(),
+        provider_type: reply.provider_type.clone(),
+        provider_account_id: reply.provider_account_id.clone(),
+        provider_conversation_id: reply.provider_conversation_id.clone(),
+        provider_thread_id: reply.provider_thread_id.clone(),
+    }
+}
+
+fn bridge_thread_surface_id(binding: &ThreadSessionBindingRecord) -> String {
+    format!(
+        "bridge-thread-{}",
+        stable_hash(&format!(
+            "v=1\nprovider.id={}\nprovider.type={}\nprovider.account.id={}\nprovider.conversation.id={}\nprovider.thread.id={}\nsource.id={}\nsource.type={}\nsource.session.id={}\n",
+            binding.provider_id,
+            binding.provider_type,
+            binding.provider_account_id,
+            binding.provider_conversation_id,
+            binding.provider_thread_id,
+            binding.source_id,
+            binding.source_type,
+            binding.source_session_id,
+        ))
+    )
+}
+
+fn stable_hash(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,6 +782,47 @@ fn normalized_reply_text(value: Option<&str>) -> Option<String> {
     value
         .and_then(optional_trimmed)
         .map(std::string::ToString::to_string)
+}
+
+fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> {
+    let text = trim_leading_lark_mentions(text);
+    let (command, rest) = split_command(text)?;
+    match command {
+        "/bind" => {
+            let project_path = rest.trim();
+            if project_path.is_empty() {
+                return Some(ProviderControlCommand::Invalid {
+                    message: "Use `/bind /absolute/project/path`.".to_string(),
+                });
+            }
+            Some(ProviderControlCommand::BindProject {
+                project_path: project_path.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn trim_leading_lark_mentions(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        let Some(after_at) = trimmed.strip_prefix('@') else {
+            return trimmed;
+        };
+        let Some((_, rest)) = after_at.split_once(char::is_whitespace) else {
+            return trimmed;
+        };
+        text = rest;
+    }
+}
+
+fn split_command(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if !text.starts_with('/') {
+        return None;
+    }
+    let command_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    Some((&text[..command_end], &text[command_end..]))
 }
 
 fn optional_trimmed(value: &str) -> Option<&str> {
@@ -677,6 +1009,48 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_feishu_lark_root_bind_command_after_bot_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_bind_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 /bind /Users/felix/Desktop/felix-projects/agents-router\"}"
+                }
+            }
+        }"#;
+
+        let normalized = normalize_feishu_lark_long_connection_control_command("lark-app", raw)
+            .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_bind_message_id".to_string(),
+                provider_event_id: "om_bind_message_id".to_string(),
+                command: ProviderControlCommand::BindProject {
+                    project_path: "/Users/felix/Desktop/felix-projects/agents-router".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
     fn feishu_lark_mention_without_root_id_is_not_a_trigger_even_with_parent_id() {
         let raw = br#"{
             "schema": "2.0",
@@ -789,6 +1163,44 @@ mod tests {
             .expect("event should not have been claimed on miss");
 
         assert!(matches!(claim, InboundEventClaimDecision::Claimed { .. }));
+    }
+
+    #[test]
+    fn thread_session_binding_can_create_ready_work_after_surface_miss() {
+        let now = test_time();
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_slack_socket_mode_surface_reply(
+                "slack-app",
+                include_bytes!(
+                    "../tests/fixtures/provider_inbound/slack_socket_surface_reply.json"
+                ),
+            )
+            .expect("Slack event should parse")
+        else {
+            panic!("event should be a surface reply");
+        };
+
+        let decision = lookup_and_claim_provider_thread_session_reply(
+            &mut ledger,
+            provider_mode_capability(ProviderMode::SlackApp),
+            slack_thread_session_binding(),
+            reply,
+            now,
+        )
+        .expect("thread binding should claim");
+
+        let ProviderInboundDecision::Ready(ready) = decision else {
+            panic!("thread binding should create ready work");
+        };
+        assert!(ready.surface.surface_id.starts_with("bridge-thread-"));
+        assert_eq!(ready.surface.source_id, "codex_desktop");
+        assert_eq!(ready.surface.source_session_id, "session-1");
+        assert_eq!(ready.surface.provider_thread_id, "1716200000.000100");
+        assert_eq!(
+            ready.reply.reply_text,
+            "Run the tests and fix the failing one."
+        );
     }
 
     #[test]
@@ -1040,6 +1452,21 @@ mod tests {
             provider_account_id: "T123ABC456".to_string(),
             provider_conversation_id: "C123ABC456".to_string(),
             provider_thread_id: "1716200000.000100".to_string(),
+        }
+    }
+
+    fn slack_thread_session_binding() -> ThreadSessionBindingRecord {
+        ThreadSessionBindingRecord {
+            provider_id: "slack-app".to_string(),
+            provider_type: "slack".to_string(),
+            provider_account_id: "T123ABC456".to_string(),
+            provider_conversation_id: "C123ABC456".to_string(),
+            provider_thread_id: "1716200000.000100".to_string(),
+            project_path: "/Users/tester/projects/agents-router".to_string(),
+            source_id: "codex_desktop".to_string(),
+            source_type: "codex_desktop".to_string(),
+            source_session_id: "session-1".to_string(),
+            created_at: test_time(),
         }
     }
 

@@ -1,8 +1,12 @@
 pub mod agent_controller;
 pub mod agent_integration_catalog;
+pub mod bridge_binding_ledger;
+pub(crate) mod bridge_control;
 pub mod config;
+pub(crate) mod continuation_dispatcher;
 pub mod delivery;
 pub mod delivery_safety;
+pub(crate) mod execution_scope_guard;
 pub mod i18n;
 pub mod legacy;
 pub mod local_ingress;

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use super::*;
 use tempfile::tempdir;
 
+use crate::bridge_binding_ledger::{BridgeBindingLedgerStore, RoomProjectBindingInput};
 use crate::config::{
     CliConfig, LogConfig, NotificationConfig, ProviderType, RawConfig, RawProviderConfig,
     RouteConfig, SourceConfig, SourceType, ValidatedConfig,
@@ -22,6 +23,7 @@ struct TestProvider {
     id: String,
     provider_type: String,
     calls: Arc<Mutex<Vec<String>>>,
+    dynamic_calls: Option<Arc<Mutex<Vec<String>>>>,
     result: Result<(), DeliveryErrorKind>,
     delivery_receipt: Option<ProviderDeliveryReceipt>,
 }
@@ -32,6 +34,22 @@ impl TestProvider {
             id: id.to_string(),
             provider_type: "test".to_string(),
             calls,
+            dynamic_calls: None,
+            result: Ok(()),
+            delivery_receipt: None,
+        }
+    }
+
+    fn succeeding_with_dynamic_target(
+        id: &str,
+        calls: Arc<Mutex<Vec<String>>>,
+        dynamic_calls: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            provider_type: "test".to_string(),
+            calls,
+            dynamic_calls: Some(dynamic_calls),
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -47,6 +65,7 @@ impl TestProvider {
             id: id.to_string(),
             provider_type: provider_type.to_string(),
             calls,
+            dynamic_calls: None,
             result: Ok(()),
             delivery_receipt: Some(delivery_receipt),
         }
@@ -57,6 +76,7 @@ impl TestProvider {
             id: id.to_string(),
             provider_type: "test".to_string(),
             calls,
+            dynamic_calls: None,
             result: Err(kind),
             delivery_receipt: None,
         }
@@ -91,6 +111,25 @@ impl Provider for TestProvider {
                 )),
             }
         })
+    }
+
+    fn send_to_provider_conversation<'a>(
+        &'a self,
+        signal: &'a Signal,
+        provider_conversation_id: &'a str,
+    ) -> Option<ProviderFuture<'a>> {
+        let dynamic_calls = self.dynamic_calls.as_ref()?;
+        Some(Box::pin(async move {
+            dynamic_calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", provider_conversation_id, signal.id));
+            Ok(ProviderSendResult::sent(
+                &self.id,
+                &self.provider_type,
+                signal,
+            ))
+        }))
     }
 }
 
@@ -250,6 +289,7 @@ async fn app_bot_surface_ready_delivery_creates_response_surface() {
             &[&provider],
             None,
             Some(&ledger_store),
+            None,
         )
         .await
         .expect("provider send should succeed");
@@ -278,6 +318,59 @@ async fn app_bot_surface_ready_delivery_creates_response_surface() {
 }
 
 #[tokio::test]
+async fn surface_ready_delivery_binds_provider_thread_to_source_session() {
+    let temp = tempdir().expect("temp dir should exist");
+    let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("surfaces.json"))
+        .expect("ledger store should build");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    let config = lark_app_bot_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_receipt(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        ProviderDeliveryReceipt::surface_ready(
+            Some("tenant-1".to_string()),
+            Some("chat-1".to_string()),
+            Some("message-root-1".to_string()),
+            Some("message-root-1".to_string()),
+        ),
+    );
+
+    Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &codex_desktop_signal_with_session_and_project_path(),
+            &[&provider],
+            None,
+            Some(&ledger_store),
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("provider send should succeed");
+
+    let binding = bridge_binding_ledger
+        .update(|ledger| {
+            Ok(
+                ledger.lookup_thread_session(&crate::bridge_binding_ledger::ThreadBindingQuery {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "chat-1".to_string(),
+                    provider_thread_id: "message-root-1".to_string(),
+                }),
+            )
+        })
+        .await
+        .expect("binding ledger should read")
+        .expect("thread should be bound");
+
+    assert_eq!(binding.project_path, "/Users/tester/projects/agents-router");
+    assert_eq!(binding.source_id, "codex_desktop");
+    assert_eq!(binding.source_session_id, "session-1");
+}
+
+#[tokio::test]
 async fn candidate_delivery_receipt_does_not_create_response_surface() {
     let temp = tempdir().expect("temp dir should exist");
     let ledger_store = ResponseSurfaceLedgerStore::new(temp.path().join("ledger.json"))
@@ -302,6 +395,7 @@ async fn candidate_delivery_receipt_does_not_create_response_surface() {
             &[&provider],
             None,
             Some(&ledger_store),
+            None,
         )
         .await
         .expect("provider send should succeed");
@@ -321,6 +415,62 @@ async fn candidate_delivery_receipt_does_not_create_response_surface() {
         .expect("surface lookup should succeed");
 
     assert_eq!(lookup, ResponseSurfaceLookupResult::Miss);
+}
+
+#[tokio::test]
+async fn project_binding_routes_to_bound_room_instead_of_static_provider_target() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    bridge_binding_ledger
+        .update(|ledger| {
+            ledger.connect_room_project_at(
+                RoomProjectBindingInput {
+                    provider_id: "debug".to_string(),
+                    provider_type: "test".to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                },
+                Utc::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("project room should bind");
+    let config = test_config(vec![RouteConfig::new(
+        vec!["codex_cli".to_string()],
+        vec!["debug".to_string()],
+    )]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let dynamic_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_dynamic_target(
+        "debug",
+        Arc::clone(&calls),
+        Arc::clone(&dynamic_calls),
+    );
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &test_signal_with_project_path(
+                "codex_cli",
+                "/Users/tester/projects/agents-router/crate",
+            ),
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("bound project should route to room");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *dynamic_calls.lock().unwrap(),
+        vec!["oc_agents_router_room:signal-1".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -535,6 +685,18 @@ fn codex_desktop_signal_with_session() -> Signal {
         prompt: None,
         answer: None,
         model: None,
+    });
+    signal
+}
+
+fn codex_desktop_signal_with_session_and_project_path() -> Signal {
+    let mut signal = codex_desktop_signal_with_session();
+    signal.workspace = Some(SignalWorkspace {
+        cwd: None,
+        project_name: Some("agents-router".to_string()),
+        project_path: Some("/Users/tester/projects/agents-router".to_string()),
+        branch: None,
+        worktree: None,
     });
     signal
 }

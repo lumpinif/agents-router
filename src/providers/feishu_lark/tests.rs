@@ -207,6 +207,56 @@ async fn app_bot_sends_message_and_returns_surface_ready_root_lookup_receipt() {
 }
 
 #[tokio::test]
+async fn app_bot_can_send_to_bound_project_room() {
+    let server = MockServer::start().await;
+    let mut send_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/provider_inbound/feishu_lark_app_bot_send_response.json"
+    ))
+    .expect("send response fixture should be valid JSON");
+    send_response["data"]["chat_id"] = json!("oc_bound_project_room");
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "receive_id": "oc_bound_project_room",
+            "msg_type": "interactive"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(send_response))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send_to_provider_conversation(&test_signal(), "oc_bound_project_room")
+        .expect("App Bot should support bound room delivery")
+        .await
+        .expect("bound room send should succeed");
+
+    let receipt = result
+        .delivery_receipt
+        .expect("App Bot should return a delivery receipt");
+    assert_eq!(
+        receipt.provider_conversation_id.as_deref(),
+        Some("oc_bound_project_room")
+    );
+}
+
+#[tokio::test]
 async fn app_bot_outbound_message_id_matches_inbound_reply_root_lookup_key() {
     let server = MockServer::start().await;
     let send_response: serde_json::Value = serde_json::from_str(include_str!(
@@ -1265,7 +1315,7 @@ fn thread_reply_request(text: &str) -> ProviderThreadReplyRequest {
         provider_id: "work_chat".to_string(),
         provider_type: "feishu_lark".to_string(),
         provider_account_id: "2ca1d211f64f6438".to_string(),
-        provider_conversation_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+        provider_conversation_id: "oc_project_room_from_inbound_event".to_string(),
         provider_thread_id: "om_root_message_id".to_string(),
         surface_id: "surface-1".to_string(),
         provider_event_id_hash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"

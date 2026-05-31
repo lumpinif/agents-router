@@ -79,6 +79,10 @@ pub fn response_surface_ledger_path() -> anyhow::Result<PathBuf> {
     Ok(response_surface_ledger_path_for_home(&home_dir()?))
 }
 
+pub fn bridge_binding_ledger_path() -> anyhow::Result<PathBuf> {
+    Ok(bridge_binding_ledger_path_for_home(&home_dir()?))
+}
+
 pub fn runtime_owner_lock_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_owner_lock_path_for_home(&home_dir()?))
 }
@@ -176,6 +180,10 @@ pub fn delivery_safety_state_path_for_home(home: &Path) -> PathBuf {
 
 pub fn response_surface_ledger_path_for_home(home: &Path) -> PathBuf {
     app_support_dir_path_for_home(home).join("response-surface-ledger.json")
+}
+
+pub fn bridge_binding_ledger_path_for_home(home: &Path) -> PathBuf {
+    app_support_dir_path_for_home(home).join("bridge-bindings.json")
 }
 
 pub fn runtime_owner_lock_path_for_home(home: &Path) -> PathBuf {

@@ -108,16 +108,16 @@ Provider guides:
 When you choose Feishu/Lark, setup asks for the mode:
 
 ```text
-Custom Bot Webhook — Stable
-  Send one-way notifications to a group. Fastest setup. No replies.
-
 App Bot — Experimental
   Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.
+
+Custom Bot Webhook — Fallback
+  Send one-way notifications to one group. No replies or project rooms.
 ```
 
-Custom Bot Webhook is the default and keeps the old one-way notification path. App Bot requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, and a published app version. Setup shows only a short checklist and links to the full [Feishu/Lark App Bot guide](providers/feishu-lark-app-bot.md).
+App Bot is the default because it supports the two-way bridge path: thread replies, `/bind`, and project rooms. It requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, and a published app version. Setup shows only a short checklist and links to the full [Feishu/Lark App Bot guide](providers/feishu-lark-app-bot.md).
 
-Use Custom Bot Webhook when you want the stable path today. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
+Use Custom Bot Webhook only when you want a simple one-way fallback. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
 
 ## Provider IDs
 

@@ -124,6 +124,14 @@ impl DeliverySafetyGuard {
         self.check_at(attempt, Utc::now())
     }
 
+    pub fn check_for_provider_target(
+        &self,
+        attempt: DeliveryAttempt<'_>,
+        provider_target_id: &str,
+    ) -> anyhow::Result<DeliverySafetyDecision> {
+        self.check_at_for_provider_target(attempt, provider_target_id, Utc::now())
+    }
+
     pub fn reset(&self) -> anyhow::Result<()> {
         let mut inner = self
             .inner
@@ -164,8 +172,35 @@ impl DeliverySafetyGuard {
         attempt: DeliveryAttempt<'_>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<DeliverySafetyDecision> {
+        self.check_at_inner(attempt, now, None)
+    }
+
+    fn check_at_for_provider_target(
+        &self,
+        attempt: DeliveryAttempt<'_>,
+        provider_target_id: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<DeliverySafetyDecision> {
+        anyhow::ensure!(
+            !provider_target_id.trim().is_empty()
+                && provider_target_id.trim() == provider_target_id,
+            "provider_target_id must be present and trimmed"
+        );
+        self.check_at_inner(attempt, now, Some(provider_target_id))
+    }
+
+    fn check_at_inner(
+        &self,
+        attempt: DeliveryAttempt<'_>,
+        now: DateTime<Utc>,
+        provider_target_id: Option<&str>,
+    ) -> anyhow::Result<DeliverySafetyDecision> {
         let message_fingerprint_hash = message_fingerprint_hash(attempt.signal);
-        let delivery_key_hash = delivery_key_hash(attempt.provider_id, &message_fingerprint_hash);
+        let delivery_key_hash = delivery_key_hash(
+            attempt.provider_id,
+            provider_target_id,
+            &message_fingerprint_hash,
+        );
         let mut inner = self
             .inner
             .lock()
@@ -366,9 +401,14 @@ fn message_fingerprint_hash(signal: &Signal) -> String {
     stable_hash(&canonical)
 }
 
-fn delivery_key_hash(provider_id: &str, message_fingerprint_hash: &str) -> String {
+fn delivery_key_hash(
+    provider_id: &str,
+    provider_target_id: Option<&str>,
+    message_fingerprint_hash: &str,
+) -> String {
     stable_hash(&format!(
-        "v=1\nprovider.id={provider_id}\nmessage.fingerprint={message_fingerprint_hash}\n"
+        "v=2\nprovider.id={provider_id}\nprovider.target_id={}\nmessage.fingerprint={message_fingerprint_hash}\n",
+        provider_target_id.unwrap_or("")
     ))
 }
 
@@ -497,6 +537,33 @@ mod tests {
                 now + Duration::seconds(4),
             )
             .expect("second provider should have a separate count");
+
+        assert!(matches!(decision, DeliverySafetyDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn provider_target_delivery_keys_are_counted_independently() {
+        let guard = DeliverySafetyGuard::in_memory();
+        let signal = test_signal("signal-1", "session-1", "turn-1");
+        let now = timestamp(0);
+
+        for second in 0..4 {
+            guard
+                .check_at_for_provider_target(
+                    DeliveryAttempt::new(&signal, "work_chat"),
+                    "oc_room_one",
+                    now + Duration::seconds(second),
+                )
+                .expect("first room should allow");
+        }
+
+        let decision = guard
+            .check_at_for_provider_target(
+                DeliveryAttempt::new(&signal, "work_chat"),
+                "oc_room_two",
+                now + Duration::seconds(4),
+            )
+            .expect("second room should have a separate count");
 
         assert!(matches!(decision, DeliverySafetyDecision::Allow { .. }));
     }

@@ -7,10 +7,12 @@ use anyhow::Context;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{info, warn};
 
+use crate::bridge_binding_ledger::BridgeBindingLedgerStore;
 #[cfg(target_os = "linux")]
 use crate::config::SourceType;
 use crate::config::{LoadedConfig, ValidatedConfig};
 use crate::delivery_safety::DeliverySafetyGuard;
+use crate::execution_scope_guard::ExecutionScopeGuard;
 use crate::local_integrations::{self, LocalSourceIntegrationPaths, LocalSourceIntegrationReport};
 use crate::providers::build_providers;
 use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
@@ -24,6 +26,8 @@ pub struct RuntimeState {
     current: Arc<RwLock<Arc<RuntimeSnapshot>>>,
     delivery_safety: DeliverySafetyGuard,
     response_surface_ledger: ResponseSurfaceLedgerStore,
+    bridge_binding_ledger: BridgeBindingLedgerStore,
+    execution_scope_guard: ExecutionScopeGuard,
 }
 
 pub struct RuntimeSnapshot {
@@ -44,6 +48,8 @@ impl RuntimeState {
             current: Arc::new(RwLock::new(Arc::new(RuntimeSnapshot::new(config)?))),
             delivery_safety,
             response_surface_ledger: ResponseSurfaceLedgerStore::load_default()?,
+            bridge_binding_ledger: BridgeBindingLedgerStore::load_default()?,
+            execution_scope_guard: ExecutionScopeGuard::default(),
         })
     }
 
@@ -60,6 +66,14 @@ impl RuntimeState {
 
     pub fn response_surface_ledger(&self) -> ResponseSurfaceLedgerStore {
         self.response_surface_ledger.clone()
+    }
+
+    pub fn bridge_binding_ledger(&self) -> BridgeBindingLedgerStore {
+        self.bridge_binding_ledger.clone()
+    }
+
+    pub(crate) fn execution_scope_guard(&self) -> ExecutionScopeGuard {
+        self.execution_scope_guard.clone()
     }
 
     pub fn reload_from_path(&self, path: &Path) -> anyhow::Result<()> {

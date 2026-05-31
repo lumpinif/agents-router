@@ -359,6 +359,41 @@ fn restart_skips_new_file_created_while_stopped_then_emits_runtime_append() {
 }
 
 #[test]
+fn disappeared_rollout_during_poll_does_not_stop_source() {
+    let dir = tempdir().expect("tempdir should be created");
+    let sessions_dir = dir.path().join("sessions");
+    let day_dir = sessions_dir.join("2026").join("05").join("10");
+    fs::create_dir_all(&day_dir).expect("session dir should be created");
+    let rollout_path = day_dir.join("rollout-2026-05-10T01-00-00-session-1.jsonl");
+    let index_path = dir.path().join("session_index.jsonl");
+    let state_path = dir.path().join("source-state.json");
+
+    write_lines(&rollout_path, &[session_meta_line("session-1")]);
+    let watcher = CodexDesktopSessionWatcher::new(
+        sessions_dir.clone(),
+        index_path.clone(),
+        state_path.clone(),
+    )
+    .expect("watcher should start");
+    fs::remove_file(&rollout_path).expect("rollout should be removed");
+
+    let batch = watcher
+        .poll_discovered_paths_with_response_surface_turns(
+            &watcher_config(AnswerDetail::Preview, PromptDetail::Off),
+            &source_config(),
+            &ResponseSurfaceContinuationTurnIndex::default(),
+            vec![rollout_path.clone()],
+        )
+        .expect("disappeared rollout should be skipped");
+
+    assert!(batch.signals.is_empty());
+    assert!(
+        batch.state.files.contains_key(&path_key(&rollout_path)),
+        "existing watch state should stay intact so a same-path reappearance cannot replay backlog"
+    );
+}
+
+#[test]
 fn prompt_detail_on_attaches_prompt_without_persisting_it() {
     let dir = tempdir().expect("tempdir should be created");
     let sessions_dir = dir.path().join("sessions");
@@ -664,6 +699,7 @@ async fn provider_failure_does_not_reopen_codex_desktop_rollout_events() {
         &routing_config(),
         &providers,
         batch,
+        None,
         None,
         None,
     )

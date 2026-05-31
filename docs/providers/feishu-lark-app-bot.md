@@ -1,8 +1,8 @@
 # Feishu/Lark App Bot
 
-Use this when you want Agents Router to send notifications through a Lark or Feishu app bot. Lark Codex Desktop thread replies are Experimental.
+Use this when you want the default Feishu/Lark two-way bridge path. Agents Router sends notifications through a Lark or Feishu app bot, can receive thread replies through Long Connection / WebSocket, and can connect project rooms with `/bind`. Lark Codex Desktop thread replies are Experimental.
 
-Lark App Bot thread replies for Codex Desktop are the verified Experimental path. Feishu App Bot uses the same setup shape, but validate it in your workspace before relying on replies. Use Feishu/Lark Custom Bot when you want the fastest stable one-way notification setup.
+Lark App Bot thread replies for Codex Desktop are the verified Experimental path. Feishu App Bot uses the same setup shape, but validate it in your workspace before relying on replies. Use Feishu/Lark Custom Bot only when you want a one-way fallback.
 
 This guide uses Long Connection / WebSocket. You do not need a public webhook URL.
 

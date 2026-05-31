@@ -390,8 +390,8 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
 ) -> anyhow::Result<FeishuLarkSetupMode> {
     let effective_default = default.unwrap_or_default();
     let options = [
-        FeishuLarkSetupMode::CustomBotWebhook,
         FeishuLarkSetupMode::AppBot,
+        FeishuLarkSetupMode::CustomBotWebhook,
     ];
     let default_index = options
         .iter()
@@ -421,8 +421,8 @@ pub(in crate::cli) fn feishu_lark_mode_option_label(
     let mut label = match mode {
         FeishuLarkSetupMode::CustomBotWebhook => localized(
             i18n,
-            "Custom Bot Webhook — Stable\n  Send one-way notifications to a group. Fastest setup. No replies.",
-            "Custom Bot Webhook — 稳定\n  单向发送通知到群。配置最快，不支持回复。",
+            "Custom Bot Webhook — Fallback\n  Send one-way notifications to one group. No replies or project rooms.",
+            "Custom Bot Webhook — 备用\n  单向发送通知到一个群。不支持回复或项目群。",
         )
         .to_string(),
         FeishuLarkSetupMode::AppBot => {
@@ -455,7 +455,7 @@ pub(in crate::cli) fn feishu_lark_mode_option_label(
 
     if Some(mode) == default {
         label.push_str(&format!(" ({})", i18n.text(Text::CurrentSuffix)));
-    } else if default.is_none() && mode == FeishuLarkSetupMode::CustomBotWebhook {
+    } else if default.is_none() && mode == FeishuLarkSetupMode::AppBot {
         label.push_str(&format!(" ({})", i18n.text(Text::RecommendedSuffix)));
     }
 

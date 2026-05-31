@@ -670,14 +670,16 @@ providers = ["feishu_lark"]
 
 #[test]
 fn feishu_lark_mode_options_are_localized() {
+    assert_eq!(FeishuLarkSetupMode::default(), FeishuLarkSetupMode::AppBot);
+
     let chinese_custom_bot = feishu_lark_mode_option_label(
         FeishuLarkSetupMode::CustomBotWebhook,
         setup::AgentIntegrationId::CodexDesktop,
         None,
         I18n::new(CliLanguage::SimplifiedChinese),
     );
-    assert!(chinese_custom_bot.contains("稳定"));
-    assert!(chinese_custom_bot.contains("单向发送通知到群"));
+    assert!(chinese_custom_bot.contains("备用"));
+    assert!(chinese_custom_bot.contains("单向发送通知到一个群"));
     assert!(!chinese_custom_bot.contains("Fastest setup"));
 
     let chinese_app_bot = feishu_lark_mode_option_label(
@@ -698,6 +700,7 @@ fn feishu_lark_mode_options_are_localized() {
     );
     assert!(english_app_bot.contains("Experimental"));
     assert!(english_app_bot.contains("validate Feishu before relying on replies"));
+    assert!(english_app_bot.contains("Recommended"));
 }
 
 #[test]

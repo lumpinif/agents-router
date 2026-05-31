@@ -519,6 +519,7 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety(
         codex_sessions_dir,
         delivery_safety,
         None,
+        None,
     )
     .await
 }
@@ -531,6 +532,7 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety_and_response_s
     codex_sessions_dir: Option<&Path>,
     delivery_safety: Option<&DeliverySafetyGuard>,
     response_surface_ledger: Option<&ResponseSurfaceLedgerStore>,
+    bridge_binding_ledger: Option<&crate::bridge_binding_ledger::BridgeBindingLedgerStore>,
 ) -> anyhow::Result<DeliveryReport> {
     info!(
         source.id = %event.source_id,
@@ -571,6 +573,7 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety_and_response_s
             providers,
             delivery_safety,
             response_surface_ledger,
+            bridge_binding_ledger,
         )
         .await
         .map_err(Into::into)
@@ -619,6 +622,7 @@ pub async fn route_event_with_runtime(
     let providers = snapshot.provider_refs();
     let delivery_safety = runtime.delivery_safety();
     let response_surface_ledger = runtime.response_surface_ledger();
+    let bridge_binding_ledger = runtime.bridge_binding_ledger();
     let codex_sessions_dir = codex_sessions_dir_path().ok();
     route_event_with_state_and_codex_sessions_dir_and_safety_and_response_surfaces(
         &snapshot.config,
@@ -628,6 +632,7 @@ pub async fn route_event_with_runtime(
         codex_sessions_dir.as_deref(),
         Some(&delivery_safety),
         Some(&response_surface_ledger),
+        Some(&bridge_binding_ledger),
     )
     .await
 }

@@ -817,7 +817,7 @@ fn ensure_present(field: &'static str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn provider_event_id_hash(
+pub(crate) fn provider_event_id_hash(
     provider_type: &str,
     provider_id: &str,
     provider_account_id: &str,
