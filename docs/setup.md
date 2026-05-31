@@ -2,7 +2,7 @@
 
 中文文档：[setup.zh-CN.md](setup.zh-CN.md)
 
-Use setup to create or replace the local config, start the service, and send a test notification.
+Use setup to create or replace the local config and start the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent uses project rooms, so setup finishes with room binding steps instead of sending a test message.
 
 ```bash
 agents-router setup
@@ -75,23 +75,24 @@ Code settings. Manual configs must use `id = "claude_code"` for this source. See
 Choose where notifications should go:
 
 ```text
-1. Slack
-2. Discord
-3. Telegram
-4. Microsoft Teams
-5. Email SMTP
-6. ntfy
-7. Pushover
-8. Feishu/Lark
+1. Feishu/Lark
+2. Slack
+3. Discord
+4. Telegram
+5. Microsoft Teams
+6. Email SMTP
+7. ntfy
+8. Pushover
 9. Webhook
 10. WhatsApp
 11. WeChat
 ```
 
-Slack is the recommended default when no provider is already configured.
+Feishu/Lark is the recommended default when no provider is already configured.
 
 Provider guides:
 
+- [Feishu/Lark Personal Agent](providers/feishu-lark-app-bot.md)
 - [Slack](providers/slack.md)
 - [Discord](providers/discord.md)
 - [Telegram](providers/telegram.md)
@@ -100,7 +101,6 @@ Provider guides:
 - [ntfy](providers/ntfy.md)
 - [Pushover](providers/pushover.md)
 - [Feishu/Lark Custom Bot](providers/feishu-lark-custom-bot.md)
-- [Feishu/Lark App Bot](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.md)
 - [WhatsApp](providers/whatsapp.md)
 - [WeChat](providers/wechat.md)
@@ -108,26 +108,31 @@ Provider guides:
 When you choose Feishu/Lark, setup asks for the mode:
 
 ```text
-App Bot — Experimental
-  Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.
+Personal Agent App — Experimental
+  Scan a QR code, add the Personal Agent to Lark or Feishu rooms, then mention it and send `/bind` to connect project rooms.
+
+Existing App Bot Credentials
+  Use an existing self-built app and a default room Chat ID. Lark thread replies can continue Codex Desktop sessions as an Experimental path.
 
 Custom Bot Webhook — Fallback
   Send one-way notifications to one group. No replies or project rooms.
 ```
 
-App Bot is the default because it supports the two-way bridge path: thread replies, `/bind`, and project rooms. It requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, and a published app version. Setup shows only a short checklist and links to the full [Feishu/Lark App Bot guide](providers/feishu-lark-app-bot.md).
+Personal Agent App is the recommended default for the two-way Codex Desktop setup. Setup shows a QR code, asks you to scan it and finish creating the Personal Agent app on the page that opens, stores the app credentials locally, and then tells you to add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`. Keep the setup terminal open after scanning; setup continues automatically after the app is created.
 
-Use Custom Bot Webhook only when you want a simple one-way fallback. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
+Use Existing App Bot Credentials only when you already manage a self-built app and want a fixed default room. It requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, Tenant Key, Chat ID, and a published app version. Setup links to the full [Feishu/Lark Personal Agent guide](providers/feishu-lark-app-bot.md).
+
+Use Custom Bot Webhook only when you want a simple one-way fallback.
 
 ## Provider IDs
 
 Setup uses the provider type as the default provider id. For example, the default
-Slack provider is:
+Feishu/Lark provider is:
 
 ```toml
 [[providers]]
-id = "slack"
-type = "slack"
+id = "feishu_lark"
+type = "feishu_lark"
 ```
 
 Routes reference provider ids:
@@ -135,7 +140,7 @@ Routes reference provider ids:
 ```toml
 [[routes]]
 sources = ["codex_desktop"]
-providers = ["slack"]
+providers = ["feishu_lark"]
 ```
 
 If you need two providers of the same type, give each provider a clear unique id:
@@ -200,6 +205,10 @@ are limited to long-running tasks.
 
 If a route has both `minimum_task_duration_minutes` and `only_forward_from_project_paths`, both
 filters must match before the notification is sent.
+
+Feishu/Lark Personal Agent project rooms do not use `only_forward_from_project_paths` during setup.
+For that mode, `/bind /absolute/project/path` is the project selector. This keeps project-room
+routing in one place: the local room binding ledger.
 
 ## Answer Detail
 
@@ -321,6 +330,7 @@ Default behavior:
 
 - If `only_forward_from_project_paths` is not set or is an empty array, notifications are not filtered by project path.
 - Setup does not ask for this option. Add it manually when you want a route to forward only selected projects.
+- Feishu/Lark Personal Agent setup clears this filter for the selected agent route. Use `/bind` in Lark or Feishu rooms to choose project destinations.
 - The value is an array, so one route can allow multiple project paths.
 - Paths must be absolute, non-empty, and must not contain `.` or `..` path components.
 - Matching uses path components, not string prefixes. For example, `/Users/me/app` matches `/Users/me/app/api`, but does not match `/Users/me/app-copy`.
@@ -344,5 +354,7 @@ Setup writes:
 ~/.config/agents-router/config.toml
 ```
 
-Then it starts the local service and sends a test notification through the same provider delivery path.
+Then it starts the local service. Providers with a fixed destination send a test notification through
+the same provider delivery path. Feishu/Lark Personal Agent uses project rooms, so setup ends with
+QR and `/bind` steps instead of sending a test message.
 On macOS this is a LaunchAgent. On Linux this is a systemd user service. On Windows this is a Task Scheduler task.

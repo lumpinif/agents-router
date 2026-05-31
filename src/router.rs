@@ -9,9 +9,13 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::bridge_binding_ledger::{
-    BridgeBindingLedgerStore, RoomProjectBindingRecord, ThreadSessionBindingInput,
+    BridgeBindingLedgerStore, RoomProjectBindingRecord, SourceSessionThreadBindingQuery,
+    ThreadSessionBindingInput,
 };
-use crate::config::{RouteConfig, ValidatedConfig, is_clean_absolute_project_path};
+use crate::config::{
+    FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail, RouteConfig, ValidatedConfig,
+    is_clean_absolute_project_path,
+};
 use crate::delivery::{
     DeliveryError, DeliveryErrorContext, DeliveryErrorKind, ProviderDeliveryReceipt,
     ProviderDeliveryReceiptStatus, ProviderSendResult,
@@ -40,6 +44,16 @@ pub trait Provider: Send + Sync {
         &'a self,
         _signal: &'a Signal,
         _provider_conversation_id: &'a str,
+    ) -> Option<ProviderFuture<'a>> {
+        None
+    }
+
+    fn send_to_provider_thread<'a>(
+        &'a self,
+        _signal: &'a Signal,
+        _provider_account_id: &'a str,
+        _provider_conversation_id: &'a str,
+        _provider_thread_id: &'a str,
     ) -> Option<ProviderFuture<'a>> {
         None
     }
@@ -373,28 +387,99 @@ impl<'a> Router<'a> {
             })?;
 
         let mut seen = HashSet::new();
-        let targets = rooms
-            .into_iter()
-            .filter(|room| {
-                room.provider_id == provider.id() && room.provider_type == provider.provider_type()
-            })
-            .filter_map(|room| {
-                let key = bridge_room_delivery_key(&room);
-                if seen.insert(key) {
-                    Some(ProviderDeliveryTarget::ProviderConversation {
-                        provider_conversation_id: room.provider_conversation_id,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut targets = Vec::new();
+        for room in rooms.into_iter().filter(|room| {
+            room.provider_id == provider.id() && room.provider_type == provider.provider_type()
+        }) {
+            let target = self
+                .delivery_target_for_bound_room(
+                    signal,
+                    provider,
+                    project_path,
+                    &room,
+                    bridge_binding_ledger,
+                )
+                .await?;
+            let key = target.bridge_delivery_key(&room);
+            if seen.insert(key) {
+                targets.push(target);
+            }
+        }
 
         if targets.is_empty() {
+            if let Some(config_provider) = self.config.provider(provider.id())
+                && !provider_has_static_delivery_target(config_provider)
+            {
+                info!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    event = "bridge_binding.delivery.skipped",
+                    reason = "no_bound_room_and_no_default_room",
+                );
+                return Ok(Vec::new());
+            }
             Ok(vec![ProviderDeliveryTarget::Static])
         } else {
             Ok(targets)
         }
+    }
+
+    async fn delivery_target_for_bound_room(
+        &self,
+        signal: &Signal,
+        provider: &dyn Provider,
+        project_path: &str,
+        room: &RoomProjectBindingRecord,
+        bridge_binding_ledger: &BridgeBindingLedgerStore,
+    ) -> Result<ProviderDeliveryTarget, ProviderFailure> {
+        let Some(source_session_id) = signal
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.session_id.as_deref())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(ProviderDeliveryTarget::ProviderConversation {
+                provider_conversation_id: room.provider_conversation_id.clone(),
+            });
+        };
+
+        let query = SourceSessionThreadBindingQuery {
+            provider_id: provider.id().to_string(),
+            provider_type: provider.provider_type().to_string(),
+            provider_account_id: room.provider_account_id.clone(),
+            provider_conversation_id: room.provider_conversation_id.clone(),
+            project_path: project_path.to_string(),
+            source_id: signal.source_id().to_string(),
+            source_type: signal.source_type().to_string(),
+            source_session_id: source_session_id.to_string(),
+        };
+        let binding = bridge_binding_ledger
+            .update(|ledger| ledger.lookup_thread_session_for_source_session(&query))
+            .await
+            .map_err(|error| ProviderFailure {
+                signal_id: signal.id.clone(),
+                source_id: signal.source_id().to_string(),
+                provider_id: provider.id().to_string(),
+                provider_type: provider.provider_type().to_string(),
+                kind: DeliveryErrorKind::Internal,
+                message: format!("bridge binding thread lookup failed: {error}"),
+                http_status: None,
+                provider_code: None,
+                retriable: false,
+            })?;
+
+        Ok(match binding {
+            Some(binding) => ProviderDeliveryTarget::ProviderThread {
+                provider_account_id: binding.provider_account_id,
+                provider_conversation_id: binding.provider_conversation_id,
+                provider_thread_id: binding.provider_thread_id,
+            },
+            None => ProviderDeliveryTarget::ProviderConversation {
+                provider_conversation_id: room.provider_conversation_id.clone(),
+            },
+        })
     }
 
     async fn create_response_surface_after_delivery(
@@ -594,7 +679,14 @@ impl<'a> Router<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderDeliveryTarget {
     Static,
-    ProviderConversation { provider_conversation_id: String },
+    ProviderConversation {
+        provider_conversation_id: String,
+    },
+    ProviderThread {
+        provider_account_id: String,
+        provider_conversation_id: String,
+        provider_thread_id: String,
+    },
 }
 
 impl ProviderDeliveryTarget {
@@ -604,6 +696,23 @@ impl ProviderDeliveryTarget {
             Self::ProviderConversation {
                 provider_conversation_id,
             } => Some(provider_conversation_id),
+            Self::ProviderThread {
+                provider_thread_id, ..
+            } => Some(provider_thread_id),
+        }
+    }
+
+    fn bridge_delivery_key(&self, room: &RoomProjectBindingRecord) -> String {
+        match self {
+            Self::Static => "static".to_string(),
+            Self::ProviderConversation {
+                provider_conversation_id,
+            } => bridge_room_delivery_key(room, provider_conversation_id, None),
+            Self::ProviderThread {
+                provider_conversation_id,
+                provider_thread_id,
+                ..
+            } => bridge_room_delivery_key(room, provider_conversation_id, Some(provider_thread_id)),
         }
     }
 }
@@ -636,16 +745,55 @@ async fn send_to_target(
             };
             send.await
         }
+        ProviderDeliveryTarget::ProviderThread {
+            provider_account_id,
+            provider_conversation_id,
+            provider_thread_id,
+        } => {
+            let Some(send) = provider.send_to_provider_thread(
+                signal,
+                provider_account_id,
+                provider_conversation_id,
+                provider_thread_id,
+            ) else {
+                return Err(DeliveryError::new(
+                    DeliveryErrorKind::Internal,
+                    DeliveryErrorContext::provider_send(
+                        signal,
+                        provider.id(),
+                        provider.provider_type(),
+                    ),
+                    format!(
+                        "provider `{}` does not support project-bound thread delivery",
+                        provider.id()
+                    ),
+                ));
+            };
+            send.await
+        }
     }
 }
 
-fn bridge_room_delivery_key(room: &RoomProjectBindingRecord) -> String {
+fn bridge_room_delivery_key(
+    room: &RoomProjectBindingRecord,
+    provider_conversation_id: &str,
+    provider_thread_id: Option<&str>,
+) -> String {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         room.provider_id,
         room.provider_type,
         room.provider_account_id,
-        room.provider_conversation_id
+        provider_conversation_id,
+        provider_thread_id.unwrap_or("")
+    )
+}
+
+fn provider_has_static_delivery_target(provider: &ProviderConfig) -> bool {
+    !matches!(
+        &provider.detail,
+        ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(detail))
+            if detail.chat_id.is_none()
     )
 }
 

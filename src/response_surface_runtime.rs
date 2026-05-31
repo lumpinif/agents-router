@@ -24,7 +24,7 @@ pub struct ResponseSurfaceDeliveryFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseSurfaceCreationDecision {
-    Created(ResponseSurfaceRecord),
+    Created(Box<ResponseSurfaceRecord>),
     Skipped(ResponseSurfacePolicySkipReason),
 }
 
@@ -123,7 +123,7 @@ fn create_response_surface_after_delivery_inner(
         now,
     )?;
 
-    Ok(ResponseSurfaceCreationDecision::Created(record))
+    Ok(ResponseSurfaceCreationDecision::Created(Box::new(record)))
 }
 
 pub fn response_surface_route_binding_hash(route: &RouteConfig) -> String {

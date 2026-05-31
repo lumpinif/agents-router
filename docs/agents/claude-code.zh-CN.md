@@ -45,13 +45,15 @@ Claude Code
 
 然后选择 provider。
 
-setup 会写好 Agents Router config、启动本机 service、发送测试通知，并确保 Claude Code hooks 写入：
+setup 会写好 Agents Router config、启动本机 service，并确保 Claude Code hooks 写入：
 
 ```text
 ~/.claude/settings.json
 ```
 
 它会保留已有 Claude Code settings 和 hooks。
+
+带固定目标的 provider 会发送 setup 测试通知。Feishu/Lark Personal Agent 使用 project rooms，所以 setup 会以 QR 和 `/bind` 步骤结束，不发送测试消息。
 
 ## 2. 手动 hook 参考
 

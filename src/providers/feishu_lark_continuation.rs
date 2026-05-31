@@ -2,8 +2,9 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
-    AgentControllerClosedLoopDecision, AgentControllerRuntime, ProviderThreadReplyAdapter,
-    ProviderThreadReplyRequest, codex_app_server::CodexAppServerController,
+    AgentControllerClosedLoopDecision, AgentControllerPolicyOverrides, AgentControllerRuntime,
+    ProviderThreadReplyAdapter, ProviderThreadReplyRequest,
+    codex_app_server::CodexAppServerController,
 };
 use crate::continuation_dispatcher::{ClaimedContinuationWork, ContinuationDispatcher};
 use crate::execution_scope_guard::{ExecutionScopeKey, ExecutionScopeLease};
@@ -134,8 +135,7 @@ async fn run_claimed_lark_continuation_worker(
             ready.clone(),
             &provider_reply,
             Utc::now(),
-            None,
-            None,
+            AgentControllerPolicyOverrides::default(),
         )
         .await?;
 

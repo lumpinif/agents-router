@@ -45,14 +45,16 @@ Claude Code
 
 Then choose a provider.
 
-Setup writes the Agents Router config, starts the local service, sends a test notification, and
-ensures the Claude Code hooks in:
+Setup writes the Agents Router config, starts the local service, and ensures the Claude Code hooks in:
 
 ```text
 ~/.claude/settings.json
 ```
 
 It preserves existing Claude Code settings and hooks.
+
+Providers with a fixed destination send a setup test notification. Feishu/Lark Personal Agent uses
+project rooms instead, so setup finishes with QR and `/bind` steps instead of sending a test message.
 
 ## 2. Manual Hook Reference
 

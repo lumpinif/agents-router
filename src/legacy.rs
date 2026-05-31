@@ -24,10 +24,7 @@ pub struct LegacyMigrationOutcome {
 
 impl LegacyMigrationOutcome {
     pub fn changed(&self) -> bool {
-        self.migrated_config
-            || self.removed_service
-            || self.removed_files > 0
-            || !self.retained_cargo_binaries.is_empty()
+        self.migrated_config || self.removed_service || self.removed_files > 0
     }
 }
 
@@ -762,6 +759,18 @@ fn run_systemctl(args: &[&str]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_cargo_binary_is_not_a_migration_change() {
+        let outcome = LegacyMigrationOutcome {
+            retained_cargo_binaries: vec![PathBuf::from(
+                "/Users/tester/.cargo/bin/agents-notifier",
+            )],
+            ..LegacyMigrationOutcome::default()
+        };
+
+        assert!(!outcome.changed());
+    }
 
     #[test]
     fn migrates_legacy_source_without_rewriting_env_names() {

@@ -8,6 +8,7 @@ pub mod delivery;
 pub mod delivery_safety;
 pub(crate) mod execution_scope_guard;
 pub mod i18n;
+pub mod lark_personal_agent_channel;
 pub mod legacy;
 pub mod local_ingress;
 pub mod local_integrations;

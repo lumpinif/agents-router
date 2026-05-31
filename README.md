@@ -1,6 +1,6 @@
 # agents-router
 
-Set up local coding agent notifications in 2-3 minutes for Slack, Discord, Telegram, Microsoft Teams, email, ntfy, Pushover, Feishu/Lark, webhook, WhatsApp, or WeChat. Lark App Bot thread replies for Codex Desktop are available as an Experimental path.
+Set up local coding agent notifications in 2-3 minutes for Feishu/Lark, Slack, Discord, Telegram, Microsoft Teams, email, ntfy, Pushover, webhook, WhatsApp, or WeChat. Feishu/Lark Personal Agent can also turn project rooms into a two-way Codex Desktop control surface; thread replies are Experimental.
 
 ---
 
@@ -41,6 +41,7 @@ Agents:
 
 Providers (Where do you want to get the notification?):
 
+- Feishu/Lark Personal Agent; QR setup, project rooms, and Experimental Codex Desktop thread replies ([guide](docs/providers/feishu-lark-app-bot.md))
 - [Slack](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
 - [Discord](https://docs.discord.com/developers/resources/webhook)
 - [Telegram](https://core.telegram.org/bots/api)
@@ -48,8 +49,7 @@ Providers (Where do you want to get the notification?):
 - [Email SMTP](https://www.rfc-editor.org/rfc/rfc6409)
 - [ntfy](https://ntfy.sh/)
 - [Pushover](https://pushover.net/api)
-- Feishu/Lark Custom Bot ([Feishu](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot), [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot))
-- Feishu/Lark App Bot; Lark replies experimental ([guide](docs/providers/feishu-lark-app-bot.md))
+- Feishu/Lark Custom Bot fallback ([Feishu](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot), [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot))
 - Webhook
 - [WhatsApp](https://developers.facebook.com/docs/whatsapp)
 - WeChat personal chat through iLink
@@ -140,11 +140,11 @@ Then setup asks for three choices:
 2. Where should notifications go?
 3. Which completed tasks should send notifications?
 
-Then it writes config, starts the service, and sends a test notification.
+Then it writes config and starts the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent uses project rooms instead: scan the QR code, add the Personal Agent to a room, then mention it and send `/bind /absolute/project/path` in that room.
 
 For optional settings such as answer detail, prompt inclusion, and advanced project filters, see [Setup](docs/setup.md).
 
-Use Feishu/Lark Custom Bot for the fastest stable one-way setup. Use Lark App Bot when you want the Experimental Codex Desktop thread reply path. Feishu App Bot uses the same setup shape but should be validated in your workspace before relying on replies.
+Use Feishu/Lark Personal Agent when you want the two-way project-room experience. Use Feishu/Lark Custom Bot only when you want a simple one-way fallback.
 
 ## 🎉 That's it
 
@@ -158,6 +158,7 @@ To stop using the service, run `agents-router stop`.
 
 Provider setup guides:
 
+- [Feishu/Lark Personal Agent](docs/providers/feishu-lark-app-bot.md)
 - [Slack](docs/providers/slack.md)
 - [Discord](docs/providers/discord.md)
 - [Telegram](docs/providers/telegram.md)
@@ -166,7 +167,6 @@ Provider setup guides:
 - [ntfy](docs/providers/ntfy.md)
 - [Pushover](docs/providers/pushover.md)
 - [Feishu/Lark Custom Bot](docs/providers/feishu-lark-custom-bot.md)
-- [Feishu/Lark App Bot; Lark replies experimental](docs/providers/feishu-lark-app-bot.md)
 - [Webhook](docs/providers/webhook.md)
 - [WhatsApp](docs/providers/whatsapp.md)
 - [WeChat](docs/providers/wechat.md)

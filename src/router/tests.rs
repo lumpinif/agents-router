@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use super::*;
 use tempfile::tempdir;
 
-use crate::bridge_binding_ledger::{BridgeBindingLedgerStore, RoomProjectBindingInput};
+use crate::bridge_binding_ledger::{
+    BridgeBindingLedgerStore, RoomProjectBindingInput, ThreadSessionBindingInput,
+};
 use crate::config::{
     CliConfig, LogConfig, NotificationConfig, ProviderType, RawConfig, RawProviderConfig,
     RouteConfig, SourceConfig, SourceType, ValidatedConfig,
@@ -24,6 +26,7 @@ struct TestProvider {
     provider_type: String,
     calls: Arc<Mutex<Vec<String>>>,
     dynamic_calls: Option<Arc<Mutex<Vec<String>>>>,
+    thread_calls: Option<Arc<Mutex<Vec<String>>>>,
     result: Result<(), DeliveryErrorKind>,
     delivery_receipt: Option<ProviderDeliveryReceipt>,
 }
@@ -35,6 +38,7 @@ impl TestProvider {
             provider_type: "test".to_string(),
             calls,
             dynamic_calls: None,
+            thread_calls: None,
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -50,6 +54,25 @@ impl TestProvider {
             provider_type: "test".to_string(),
             calls,
             dynamic_calls: Some(dynamic_calls),
+            thread_calls: None,
+            result: Ok(()),
+            delivery_receipt: None,
+        }
+    }
+
+    fn succeeding_with_dynamic_targets(
+        id: &str,
+        provider_type: &str,
+        calls: Arc<Mutex<Vec<String>>>,
+        dynamic_calls: Arc<Mutex<Vec<String>>>,
+        thread_calls: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            provider_type: provider_type.to_string(),
+            calls,
+            dynamic_calls: Some(dynamic_calls),
+            thread_calls: Some(thread_calls),
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -66,6 +89,7 @@ impl TestProvider {
             provider_type: provider_type.to_string(),
             calls,
             dynamic_calls: None,
+            thread_calls: None,
             result: Ok(()),
             delivery_receipt: Some(delivery_receipt),
         }
@@ -77,6 +101,7 @@ impl TestProvider {
             provider_type: "test".to_string(),
             calls,
             dynamic_calls: None,
+            thread_calls: None,
             result: Err(kind),
             delivery_receipt: None,
         }
@@ -124,6 +149,27 @@ impl Provider for TestProvider {
                 .lock()
                 .unwrap()
                 .push(format!("{}:{}", provider_conversation_id, signal.id));
+            Ok(ProviderSendResult::sent(
+                &self.id,
+                &self.provider_type,
+                signal,
+            ))
+        }))
+    }
+
+    fn send_to_provider_thread<'a>(
+        &'a self,
+        signal: &'a Signal,
+        provider_account_id: &'a str,
+        provider_conversation_id: &'a str,
+        provider_thread_id: &'a str,
+    ) -> Option<ProviderFuture<'a>> {
+        let thread_calls = self.thread_calls.as_ref()?;
+        Some(Box::pin(async move {
+            thread_calls.lock().unwrap().push(format!(
+                "{}:{}:{}:{}",
+                provider_account_id, provider_conversation_id, provider_thread_id, signal.id
+            ));
             Ok(ProviderSendResult::sent(
                 &self.id,
                 &self.provider_type,
@@ -474,6 +520,233 @@ async fn project_binding_routes_to_bound_room_instead_of_static_provider_target(
 }
 
 #[tokio::test]
+async fn personal_agent_without_default_room_waits_for_project_binding() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let dynamic_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_dynamic_target(
+        "work_chat",
+        Arc::clone(&calls),
+        Arc::clone(&dynamic_calls),
+    );
+    let signal = codex_desktop_signal_with_session_and_project_path();
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("missing project room should skip delivery instead of failing");
+
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.succeeded, 0);
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(dynamic_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn personal_agent_bound_project_routes_to_project_room() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    bridge_binding_ledger
+        .update(|ledger| {
+            ledger.connect_room_project_at(
+                RoomProjectBindingInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                },
+                Utc::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("project room should bind");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let dynamic_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider {
+        id: "work_chat".to_string(),
+        provider_type: ProviderType::FeishuLark.as_str().to_string(),
+        calls: Arc::clone(&calls),
+        dynamic_calls: Some(Arc::clone(&dynamic_calls)),
+        thread_calls: None,
+        result: Ok(()),
+        delivery_receipt: None,
+    };
+    let signal = codex_desktop_signal_with_session_and_project_path();
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("bound project should route to room");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *dynamic_calls.lock().unwrap(),
+        vec!["oc_agents_router_room:signal-1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn personal_agent_bound_project_reuses_existing_thread_for_same_source_session() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    bridge_binding_ledger
+        .update(|ledger| {
+            ledger.connect_room_project_at(
+                RoomProjectBindingInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                },
+                Utc::now(),
+            )?;
+            ledger.bind_thread_session_at(
+                ThreadSessionBindingInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    provider_thread_id: "om_existing_root_message".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                    source_id: "codex_desktop".to_string(),
+                    source_type: "codex_desktop".to_string(),
+                    source_session_id: "session-1".to_string(),
+                },
+                Utc::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("project room and source thread should bind");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let dynamic_calls = Arc::new(Mutex::new(Vec::new()));
+    let thread_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_dynamic_targets(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        Arc::clone(&dynamic_calls),
+        Arc::clone(&thread_calls),
+    );
+    let signal = codex_desktop_signal_with_session_and_project_path();
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("bound source session should route to existing thread");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(dynamic_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *thread_calls.lock().unwrap(),
+        vec!["tenant-1:oc_agents_router_room:om_existing_root_message:signal-1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn personal_agent_bound_project_reuses_existing_thread_for_descendant_project_path() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    bridge_binding_ledger
+        .update(|ledger| {
+            ledger.connect_room_project_at(
+                RoomProjectBindingInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                },
+                Utc::now(),
+            )?;
+            ledger.bind_thread_session_at(
+                ThreadSessionBindingInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_agents_router_room".to_string(),
+                    provider_thread_id: "om_existing_root_message".to_string(),
+                    project_path: "/Users/tester/projects/agents-router".to_string(),
+                    source_id: "codex_desktop".to_string(),
+                    source_type: "codex_desktop".to_string(),
+                    source_session_id: "session-1".to_string(),
+                },
+                Utc::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("project room and source thread should bind");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let dynamic_calls = Arc::new(Mutex::new(Vec::new()));
+    let thread_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_dynamic_targets(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        Arc::clone(&dynamic_calls),
+        Arc::clone(&thread_calls),
+    );
+    let mut signal = codex_desktop_signal_with_session_and_project_path();
+    signal.workspace.as_mut().unwrap().project_path =
+        Some("/Users/tester/projects/agents-router/crate".to_string());
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("descendant project update should route to existing source thread");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(dynamic_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *thread_calls.lock().unwrap(),
+        vec!["tenant-1:oc_agents_router_room:om_existing_root_message:signal-1".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn duration_filter_matches_tasks_at_or_above_threshold() {
     let mut route = RouteConfig::new(vec!["codex_cli".to_string()], vec!["phone".to_string()]);
     route.minimum_task_duration_minutes = Some(5);
@@ -743,6 +1016,35 @@ fn lark_app_bot_response_surface_config() -> ValidatedConfig {
     lark.app_secret = Some("test-secret".to_string());
     lark.tenant_key = Some("tenant-1".to_string());
     lark.chat_id = Some("chat-1".to_string());
+
+    let mut route = RouteConfig::new(
+        vec!["codex_desktop".to_string()],
+        vec!["work_chat".to_string()],
+    );
+    route.response_surface.enabled = true;
+
+    RawConfig {
+        schema_version: 1,
+        cli: CliConfig::default(),
+        log: LogConfig::default(),
+        notification: NotificationConfig::default(),
+        sources: vec![SourceConfig {
+            id: "codex_desktop".to_string(),
+            source_type: SourceType::CodexDesktop,
+        }],
+        providers: vec![lark],
+        routes: vec![route],
+    }
+    .validate()
+    .expect("test config should validate")
+}
+
+fn lark_personal_agent_response_surface_config() -> ValidatedConfig {
+    let mut lark = RawProviderConfig::new("work_chat", ProviderType::FeishuLark);
+    lark.mode = Some("app_bot".to_string());
+    lark.domain = Some("lark".to_string());
+    lark.app_id = Some("cli_test".to_string());
+    lark.app_secret = Some("test-secret".to_string());
 
     let mut route = RouteConfig::new(
         vec!["codex_desktop".to_string()],

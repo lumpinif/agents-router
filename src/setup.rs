@@ -32,12 +32,14 @@ pub const TEST_NOTIFICATION_SKIPPED_MESSAGE: &str =
 
 mod agents;
 mod config_builders;
+mod lark_personal_agent;
 mod resolve;
 mod targets;
 mod wechat_setup;
 
 pub use agents::*;
 pub use config_builders::*;
+pub use lark_personal_agent::*;
 pub use resolve::*;
 pub use targets::*;
 pub use wechat_setup::*;
@@ -62,8 +64,9 @@ pub struct FeishuLarkAppBotTarget {
     pub domain: String,
     pub app_id: String,
     pub app_secret_configured: bool,
-    pub tenant_key: String,
-    pub chat_id: String,
+    pub app_registration_source: Option<String>,
+    pub tenant_key: Option<String>,
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

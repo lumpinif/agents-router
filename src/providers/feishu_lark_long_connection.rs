@@ -7,9 +7,10 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep, sleep_until};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, info, warn};
@@ -30,6 +31,7 @@ use crate::config::{
     ProviderType, SourceType, ValidatedConfig,
 };
 use crate::continuation_dispatcher::{ClaimedContinuationWork, ContinuationDispatcher};
+use crate::lark_personal_agent_channel;
 #[cfg(test)]
 use crate::provider_catalog::ProviderModeCapability;
 use crate::provider_catalog::{
@@ -55,6 +57,7 @@ const HEADER_TYPE: &str = "type";
 const HEADER_MESSAGE_ID: &str = "message_id";
 const HEADER_SUM: &str = "sum";
 const HEADER_SEQ: &str = "seq";
+const HEADER_TRACE_ID: &str = "trace_id";
 const HEADER_BIZ_RT: &str = "biz_rt";
 const MESSAGE_TYPE_EVENT: &str = "event";
 const FRAME_METHOD_CONTROL: i32 = 0;
@@ -167,10 +170,10 @@ pub(crate) enum FeishuLarkPlatformAck {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FeishuLarkLongConnectionDecision {
-    AckReadyAfterLocalClaim(ProviderInboundReady),
-    AckControlReply(BridgeControlReply),
-    AckSkip(ProviderInboundSkipReason),
-    AckControlSkip(ProviderControlSkipReason),
+    ReadyAfterLocalClaim(Box<ProviderInboundReady>),
+    ControlReply(BridgeControlReply),
+    Skip(ProviderInboundSkipReason),
+    ControlSkip(ProviderControlSkipReason),
 }
 
 #[cfg(test)]
@@ -183,18 +186,128 @@ impl FeishuLarkLongConnectionDecision {
 #[derive(Debug, Clone)]
 pub(crate) struct FeishuLarkLongConnectionRuntime {
     config: FeishuLarkLongConnectionConfig,
+    bot_identity: Option<FeishuLarkLongConnectionBotIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkLongConnectionBotIdentity {
+    pub open_id: String,
+    pub name: String,
 }
 
 impl FeishuLarkLongConnectionRuntime {
     pub fn from_provider_config(provider: &ProviderConfig) -> anyhow::Result<Self> {
         Ok(Self {
             config: FeishuLarkLongConnectionConfig::from_provider_config(provider)?,
+            bot_identity: None,
         })
     }
 
     #[cfg(test)]
     pub fn connection_config(&self) -> &FeishuLarkLongConnectionConfig {
         &self.config
+    }
+
+    pub(crate) fn with_bot_identity(
+        mut self,
+        bot_identity: FeishuLarkLongConnectionBotIdentity,
+    ) -> Self {
+        self.bot_identity = Some(bot_identity);
+        self
+    }
+
+    fn bot_open_id(&self) -> anyhow::Result<&str> {
+        self.bot_identity
+            .as_ref()
+            .map(|identity| identity.open_id.as_str())
+            .context("Feishu/Lark long connection runtime must resolve bot identity before receiving events")
+    }
+
+    pub async fn fetch_bot_identity_hidden(
+        &self,
+    ) -> anyhow::Result<FeishuLarkLongConnectionBotIdentity> {
+        let token = self.fetch_tenant_access_token_hidden().await?;
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/open-apis/bot/v3/info",
+                long_connection_api_base_url(self.config.domain)
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("failed to request Feishu/Lark bot identity")?;
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .context("failed to read Feishu/Lark bot identity response")?;
+        ensure!(
+            status.is_success(),
+            "Feishu/Lark bot identity request returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkBotInfoResponse = serde_json::from_str(&response_body)
+            .context("Feishu/Lark bot identity response returned invalid JSON")?;
+        ensure!(
+            provider_response.code == 0,
+            "Feishu/Lark bot identity request returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        let bot = provider_response
+            .bot
+            .context("Feishu/Lark bot identity response did not include bot")?;
+        let open_id = present_owned(bot.open_id)
+            .context("Feishu/Lark bot identity response did not include bot.open_id")?;
+        let name = present_owned(bot.app_name).unwrap_or_else(|| "bot".to_string());
+
+        Ok(FeishuLarkLongConnectionBotIdentity { open_id, name })
+    }
+
+    async fn fetch_tenant_access_token_hidden(&self) -> anyhow::Result<String> {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                long_connection_api_base_url(self.config.domain)
+            ))
+            .json(&FeishuLarkTenantAccessTokenRequest {
+                app_id: &self.config.app_id,
+                app_secret: self.config.app_secret(),
+            })
+            .send()
+            .await
+            .context("failed to request Feishu/Lark tenant access token")?;
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .context("failed to read Feishu/Lark tenant access token response")?;
+        ensure!(
+            status.is_success(),
+            "Feishu/Lark tenant access token request returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse =
+            serde_json::from_str(&response_body)
+                .context("Feishu/Lark tenant access token response returned invalid JSON")?;
+        ensure!(
+            provider_response.code == 0,
+            "Feishu/Lark tenant access token request returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        ensure!(
+            provider_response.expire.unwrap_or_default() > 0,
+            "Feishu/Lark tenant access token response returned invalid expiry"
+        );
+        present_owned(provider_response.tenant_access_token)
+            .context("Feishu/Lark tenant access token response did not include token")
     }
 
     pub async fn discover_official_endpoint_hidden(
@@ -207,7 +320,8 @@ impl FeishuLarkLongConnectionRuntime {
         );
         let response = reqwest::Client::new()
             .post(endpoint_url)
-            .header("locale", "en")
+            .header("locale", "zh")
+            .header("User-Agent", lark_personal_agent_channel::USER_AGENT)
             .json(&FeishuLarkLongConnectionEndpointRequest {
                 app_id: &self.config.app_id,
                 app_secret: self.config.app_secret(),
@@ -254,8 +368,10 @@ impl FeishuLarkLongConnectionRuntime {
     pub async fn connect_official_transport_hidden(
         &self,
     ) -> anyhow::Result<FeishuLarkOfficialLongConnectionTransport> {
+        self.bot_open_id()?;
         let endpoint = self.discover_official_endpoint_hidden().await?;
-        FeishuLarkOfficialLongConnectionTransport::connect(endpoint.url).await
+        FeishuLarkOfficialLongConnectionTransport::connect(endpoint.url, endpoint.client_config)
+            .await
     }
 
     #[cfg(test)]
@@ -266,13 +382,14 @@ impl FeishuLarkLongConnectionRuntime {
     ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
         let normalized = normalize_feishu_lark_long_connection_surface_reply(
             &self.config.provider_id,
+            self.bot_open_id()?,
             event.raw_event,
         )?;
 
         let reply = match normalized {
             ProviderInboundNormalizeResult::SurfaceReply(reply) => reply,
             ProviderInboundNormalizeResult::Skip(reason) => {
-                return Ok(FeishuLarkLongConnectionDecision::AckSkip(reason));
+                return Ok(FeishuLarkLongConnectionDecision::Skip(reason));
             }
         };
 
@@ -287,11 +404,9 @@ impl FeishuLarkLongConnectionRuntime {
         // claimed the event. Agent execution can run longer and finishes later.
         Ok(match decision {
             ProviderInboundDecision::Ready(ready) => {
-                FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready)
+                FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready)
             }
-            ProviderInboundDecision::Skip(reason) => {
-                FeishuLarkLongConnectionDecision::AckSkip(reason)
-            }
+            ProviderInboundDecision::Skip(reason) => FeishuLarkLongConnectionDecision::Skip(reason),
         })
     }
 
@@ -303,6 +418,7 @@ impl FeishuLarkLongConnectionRuntime {
     ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
         match normalize_feishu_lark_long_connection_control_command(
             &self.config.provider_id,
+            self.bot_open_id()?,
             event.raw_event,
         )? {
             ProviderControlNormalizeResult::ControlCommand(command) => {
@@ -318,18 +434,19 @@ impl FeishuLarkLongConnectionRuntime {
             }
             ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotControlCommand) => {}
             ProviderControlNormalizeResult::Skip(reason) => {
-                return Ok(FeishuLarkLongConnectionDecision::AckControlSkip(reason));
+                return Ok(FeishuLarkLongConnectionDecision::ControlSkip(reason));
             }
         }
 
         let normalized = normalize_feishu_lark_long_connection_surface_reply(
             &self.config.provider_id,
+            self.bot_open_id()?,
             event.raw_event,
         )?;
         let reply = match normalized {
             ProviderInboundNormalizeResult::SurfaceReply(reply) => reply,
             ProviderInboundNormalizeResult::Skip(reason) => {
-                return Ok(FeishuLarkLongConnectionDecision::AckSkip(reason));
+                return Ok(FeishuLarkLongConnectionDecision::Skip(reason));
             }
         };
         let provider = provider_mode_capability(ProviderMode::FeishuLarkAppBot);
@@ -345,13 +462,13 @@ impl FeishuLarkLongConnectionRuntime {
             .await?;
         match surface_decision {
             ProviderInboundDecision::Ready(ready) => {
-                return Ok(FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(
+                return Ok(FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(
                     ready,
                 ));
             }
             ProviderInboundDecision::Skip(ProviderInboundSkipReason::SurfaceLookupMiss) => {}
             ProviderInboundDecision::Skip(reason) => {
-                return Ok(FeishuLarkLongConnectionDecision::AckSkip(reason));
+                return Ok(FeishuLarkLongConnectionDecision::Skip(reason));
             }
         }
 
@@ -361,7 +478,7 @@ impl FeishuLarkLongConnectionRuntime {
             })
             .await?;
         let Some(thread_binding) = thread_binding else {
-            return Ok(FeishuLarkLongConnectionDecision::AckSkip(
+            return Ok(FeishuLarkLongConnectionDecision::Skip(
                 ProviderInboundSkipReason::SurfaceLookupMiss,
             ));
         };
@@ -380,11 +497,9 @@ impl FeishuLarkLongConnectionRuntime {
 
         Ok(match thread_decision {
             ProviderInboundDecision::Ready(ready) => {
-                FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready)
+                FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready)
             }
-            ProviderInboundDecision::Skip(reason) => {
-                FeishuLarkLongConnectionDecision::AckSkip(reason)
-            }
+            ProviderInboundDecision::Skip(reason) => FeishuLarkLongConnectionDecision::Skip(reason),
         })
     }
 
@@ -406,7 +521,7 @@ impl FeishuLarkLongConnectionRuntime {
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
         let reply = handle_provider_control_command(ledger, command, received_at)?;
-        Ok(FeishuLarkLongConnectionDecision::AckControlReply(reply))
+        Ok(FeishuLarkLongConnectionDecision::ControlReply(reply))
     }
 
     #[cfg(test)]
@@ -431,6 +546,8 @@ impl FeishuLarkLongConnectionRuntime {
                 "Feishu/Lark long connection frame used unsupported method {}",
                 frame.method
             );
+
+            log_lark_data_frame_received(&self.config.provider_id, &frame);
 
             if header_value(&frame, HEADER_TYPE).as_deref() != Some(MESSAGE_TYPE_EVENT) {
                 continue;
@@ -488,6 +605,8 @@ impl FeishuLarkLongConnectionRuntime {
                 "Feishu/Lark long connection frame used unsupported method {}",
                 frame.method
             );
+
+            log_lark_data_frame_received(&self.config.provider_id, &frame);
 
             if header_value(&frame, HEADER_TYPE).as_deref() != Some(MESSAGE_TYPE_EVENT) {
                 continue;
@@ -607,6 +726,14 @@ async fn run_live_lark_long_connection_provider(
     provider: ProviderConfig,
 ) -> anyhow::Result<()> {
     let long_connection = FeishuLarkLongConnectionRuntime::from_provider_config(&provider)?;
+    let bot_identity = long_connection.fetch_bot_identity_hidden().await?;
+    info!(
+        provider.id = %provider.id,
+        bot.open_id = %bot_identity.open_id,
+        bot.name = %bot_identity.name,
+        event = "feishu_lark.long_connection.live.bot_identity.resolved",
+    );
+    let long_connection = long_connection.with_bot_identity(bot_identity);
     let mut transport = long_connection.connect_official_transport_hidden().await?;
     let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
     let dispatcher = FeishuLarkContinuationDispatcher::new(runtime_state.clone());
@@ -620,34 +747,41 @@ async fn run_live_lark_long_connection_provider(
     loop {
         let response_surface_ledger_store = runtime_state.response_surface_ledger();
         let bridge_binding_ledger_store = runtime_state.bridge_binding_ledger();
+        let dispatch_context = FeishuLarkLiveDispatchContext {
+            response_surface_ledger_store: &response_surface_ledger_store,
+            bridge_binding_ledger_store: &bridge_binding_ledger_store,
+            dispatcher: &dispatcher,
+            control_reply_dispatcher: &control_reply_dispatcher,
+        };
         receive_and_dispatch_live_lark_event_hidden(
             &long_connection,
-            &response_surface_ledger_store,
-            &bridge_binding_ledger_store,
             &mut transport,
             &mut payload_buffer,
-            &dispatcher,
-            &control_reply_dispatcher,
+            dispatch_context,
             Utc::now(),
         )
         .await?;
     }
 }
 
+struct FeishuLarkLiveDispatchContext<'a> {
+    response_surface_ledger_store: &'a ResponseSurfaceLedgerStore,
+    bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
+    dispatcher: &'a dyn ContinuationDispatcher,
+    control_reply_dispatcher: &'a dyn FeishuLarkControlReplyDispatcher,
+}
+
 async fn receive_and_dispatch_live_lark_event_hidden(
     long_connection: &FeishuLarkLongConnectionRuntime,
-    response_surface_ledger_store: &ResponseSurfaceLedgerStore,
-    bridge_binding_ledger_store: &BridgeBindingLedgerStore,
     transport: &mut dyn FeishuLarkLongConnectionTransport,
     payload_buffer: &mut FeishuLarkLongConnectionPayloadBuffer,
-    dispatcher: &dyn ContinuationDispatcher,
-    control_reply_dispatcher: &dyn FeishuLarkControlReplyDispatcher,
+    dispatch_context: FeishuLarkLiveDispatchContext<'_>,
     received_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let decision = long_connection
         .receive_event_before_platform_ack_with_stores_hidden(
-            response_surface_ledger_store,
-            bridge_binding_ledger_store,
+            dispatch_context.response_surface_ledger_store,
+            dispatch_context.bridge_binding_ledger_store,
             transport,
             payload_buffer,
             received_at,
@@ -655,25 +789,27 @@ async fn receive_and_dispatch_live_lark_event_hidden(
         .await?;
 
     match decision {
-        FeishuLarkLongConnectionDecision::AckSkip(reason) => {
+        FeishuLarkLongConnectionDecision::Skip(reason) => {
             log_lark_inbound_skip(&long_connection.config.provider_id, &reason);
         }
-        FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) => {
+        FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) => {
             info!(
                 provider.id = %long_connection.config.provider_id,
                 surface.id = %ready.surface.surface_id,
                 event.hash = %ready.provider_event_id_hash,
                 event = "feishu_lark.long_connection.live.event.claimed",
             );
-            dispatcher.dispatch(ClaimedContinuationWork {
-                ready,
-                dispatched_at: Utc::now(),
-            })?;
+            dispatch_context
+                .dispatcher
+                .dispatch(ClaimedContinuationWork {
+                    ready: *ready,
+                    dispatched_at: Utc::now(),
+                })?;
         }
-        FeishuLarkLongConnectionDecision::AckControlReply(reply) => {
-            control_reply_dispatcher.dispatch(reply)?;
+        FeishuLarkLongConnectionDecision::ControlReply(reply) => {
+            dispatch_context.control_reply_dispatcher.dispatch(reply)?;
         }
-        FeishuLarkLongConnectionDecision::AckControlSkip(reason) => {
+        FeishuLarkLongConnectionDecision::ControlSkip(reason) => {
             log_lark_control_skip(&long_connection.config.provider_id, &reason);
         }
     }
@@ -744,7 +880,7 @@ fn has_codex_desktop_response_surface_route(
 
 fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionDecision) {
     match decision {
-        FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) => {
+        FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) => {
             info!(
                 provider.id = %provider_id,
                 surface.id = %ready.surface.surface_id,
@@ -752,14 +888,14 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
-        FeishuLarkLongConnectionDecision::AckSkip(reason) => {
+        FeishuLarkLongConnectionDecision::Skip(reason) => {
             debug!(
                 provider.id = %provider_id,
                 reason = ?reason,
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
-        FeishuLarkLongConnectionDecision::AckControlReply(reply) => {
+        FeishuLarkLongConnectionDecision::ControlReply(reply) => {
             info!(
                 provider.id = %provider_id,
                 provider.conversation.id = %reply.provider_conversation_id,
@@ -768,7 +904,7 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
-        FeishuLarkLongConnectionDecision::AckControlSkip(reason) => {
+        FeishuLarkLongConnectionDecision::ControlSkip(reason) => {
             debug!(
                 provider.id = %provider_id,
                 reason = ?reason,
@@ -808,16 +944,91 @@ fn log_lark_control_skip(provider_id: &str, reason: &ProviderControlSkipReason) 
     );
 }
 
+fn log_lark_data_frame_received(provider_id: &str, frame: &FeishuLarkLongConnectionFrame) {
+    let payload_bytes = frame.payload.as_ref().map_or(0, Vec::len);
+    info!(
+        provider.id = %provider_id,
+        frame.method = frame.method,
+        frame.service = frame.service,
+        frame.type = ?header_value(frame, HEADER_TYPE),
+        frame.message_id = ?header_value(frame, HEADER_MESSAGE_ID),
+        frame.sum = ?header_value(frame, HEADER_SUM),
+        frame.seq = ?header_value(frame, HEADER_SEQ),
+        frame.trace_id = ?header_value(frame, HEADER_TRACE_ID),
+        payload.bytes = payload_bytes,
+        event = "feishu_lark.long_connection.live.data_frame.received",
+    );
+}
+
 pub(crate) struct FeishuLarkOfficialLongConnectionTransport {
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    service_id: i32,
+    protocol_ping_interval: Option<Duration>,
+    next_protocol_ping: Option<Instant>,
 }
 
 impl FeishuLarkOfficialLongConnectionTransport {
-    async fn connect(url: String) -> anyhow::Result<Self> {
+    async fn connect(
+        url: String,
+        client_config: Option<FeishuLarkLongConnectionClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let service_id = lark_long_connection_service_id(&url)?;
+        let protocol_ping_interval = client_config
+            .and_then(|config| config.ping_interval)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs);
         let (websocket, _) = connect_async(&url)
             .await
             .context("failed to connect Feishu/Lark official long connection WebSocket")?;
-        Ok(Self { websocket })
+        Ok(Self {
+            websocket,
+            service_id,
+            protocol_ping_interval,
+            next_protocol_ping: protocol_ping_interval.map(|_| Instant::now()),
+        })
+    }
+
+    async fn receive_websocket_message(
+        &mut self,
+        message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    ) -> anyhow::Result<FeishuLarkLongConnectionTransportMessage> {
+        let Some(message) = message else {
+            return Ok(FeishuLarkLongConnectionTransportMessage::Closed);
+        };
+        match message.context("Feishu/Lark long connection receive failed")? {
+            Message::Binary(bytes) => Ok(FeishuLarkLongConnectionTransportMessage::Binary(
+                bytes.to_vec(),
+            )),
+            Message::Text(text) => Ok(FeishuLarkLongConnectionTransportMessage::Text(
+                text.to_string(),
+            )),
+            Message::Close(_) => Ok(FeishuLarkLongConnectionTransportMessage::Closed),
+            Message::Ping(bytes) => {
+                self.websocket
+                    .send(Message::Pong(bytes))
+                    .await
+                    .context("failed to send Feishu/Lark WebSocket pong")?;
+                self.receive().await
+            }
+            Message::Pong(_) | Message::Frame(_) => self.receive().await,
+        }
+    }
+
+    async fn send_protocol_ping(&mut self) -> anyhow::Result<()> {
+        let frame = lark_protocol_ping_frame(self.service_id);
+        self.websocket
+            .send(Message::Binary(frame.encode_to_vec().into()))
+            .await
+            .context("failed to send Feishu/Lark protocol ping")?;
+        self.arm_next_protocol_ping();
+        Ok(())
+    }
+
+    fn arm_next_protocol_ping(&mut self) {
+        self.next_protocol_ping = self
+            .protocol_ping_interval
+            .map(|interval| Instant::now() + interval);
     }
 }
 
@@ -826,26 +1037,20 @@ impl FeishuLarkLongConnectionTransport for FeishuLarkOfficialLongConnectionTrans
         &'a mut self,
     ) -> FeishuLarkTransportFuture<'a, FeishuLarkLongConnectionTransportMessage> {
         Box::pin(async move {
-            let Some(message) = self.websocket.next().await else {
-                return Ok(FeishuLarkLongConnectionTransportMessage::Closed);
-            };
-            match message.context("Feishu/Lark long connection receive failed")? {
-                Message::Binary(bytes) => Ok(FeishuLarkLongConnectionTransportMessage::Binary(
-                    bytes.to_vec(),
-                )),
-                Message::Text(text) => Ok(FeishuLarkLongConnectionTransportMessage::Text(
-                    text.to_string(),
-                )),
-                Message::Close(_) => Ok(FeishuLarkLongConnectionTransportMessage::Closed),
-                Message::Ping(bytes) => {
-                    self.websocket
-                        .send(Message::Pong(bytes))
-                        .await
-                        .context("failed to send Feishu/Lark WebSocket pong")?;
-                    self.receive().await
+            loop {
+                if let Some(deadline) = self.next_protocol_ping {
+                    tokio::select! {
+                        _ = sleep_until(deadline) => {
+                            self.send_protocol_ping().await?;
+                        }
+                        message = self.websocket.next() => {
+                            return self.receive_websocket_message(message).await;
+                        }
+                    }
+                } else {
+                    let message = self.websocket.next().await;
+                    return self.receive_websocket_message(message).await;
                 }
-                Message::Pong(_) => self.receive().await,
-                Message::Frame(_) => self.receive().await,
             }
         })
     }
@@ -949,6 +1154,33 @@ pub(crate) struct FeishuLarkLongConnectionFrame {
 }
 
 #[derive(Debug, Serialize)]
+struct FeishuLarkTenantAccessTokenRequest<'a> {
+    app_id: &'a str,
+    app_secret: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkTenantAccessTokenResponse {
+    code: i64,
+    msg: Option<String>,
+    tenant_access_token: Option<String>,
+    expire: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkBotInfoResponse {
+    code: i64,
+    msg: Option<String>,
+    bot: Option<FeishuLarkBotInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkBotInfo {
+    open_id: Option<String>,
+    app_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct FeishuLarkLongConnectionEndpointRequest<'a> {
     #[serde(rename = "AppID")]
     app_id: &'a str,
@@ -1028,6 +1260,34 @@ fn required_header(frame: &FeishuLarkLongConnectionFrame, key: &str) -> anyhow::
         .with_context(|| format!("Feishu/Lark long connection frame was missing `{key}` header"))
 }
 
+fn lark_protocol_ping_frame(service_id: i32) -> FeishuLarkLongConnectionFrame {
+    FeishuLarkLongConnectionFrame {
+        seq_id: 0,
+        log_id: 0,
+        service: service_id,
+        method: FRAME_METHOD_CONTROL,
+        headers: vec![FeishuLarkLongConnectionFrameHeader {
+            key: HEADER_TYPE.to_string(),
+            value: "ping".to_string(),
+        }],
+        payload_encoding: None,
+        payload_type: None,
+        payload: None,
+        log_id_new: None,
+    }
+}
+
+fn lark_long_connection_service_id(connect_url: &str) -> anyhow::Result<i32> {
+    let url = Url::parse(connect_url).context("Feishu/Lark long connection URL was invalid")?;
+    let service_id = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "service_id").then_some(value.into_owned()))
+        .context("Feishu/Lark long connection URL did not include service_id")?;
+    service_id
+        .parse::<i32>()
+        .context("Feishu/Lark long connection service_id was not a number")
+}
+
 fn long_connection_api_base_url(domain: FeishuLarkAppDomain) -> &'static str {
     match domain {
         FeishuLarkAppDomain::Feishu => "https://open.feishu.cn",
@@ -1064,10 +1324,11 @@ mod tests {
     use crate::continuation_dispatcher::{ClaimedContinuationWork, ContinuationDispatcher};
     use crate::response_surface_ledger::NewResponseSurface;
 
+    const TEST_LARK_BOT_OPEN_ID: &str = "ou_test_bot";
+
     #[test]
     fn app_bot_runtime_uses_official_long_connection_credentials_only() {
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
 
         assert_eq!(runtime.connection_config().provider_id, "lark-app");
         assert_eq!(
@@ -1077,6 +1338,17 @@ mod tests {
         assert_eq!(runtime.connection_config().app_id, "cli_test_app");
         assert_eq!(runtime.connection_config().app_secret(), "test-secret");
         assert!(!format!("{:?}", runtime.connection_config()).contains("test-secret"));
+    }
+
+    #[test]
+    fn personal_agent_without_default_room_can_start_long_connection_runtime() {
+        let runtime =
+            FeishuLarkLongConnectionRuntime::from_provider_config(&personal_agent_provider())
+                .expect("Personal Agent should build long connection runtime without a room");
+
+        assert_eq!(runtime.connection_config().provider_id, "lark-app");
+        assert_eq!(runtime.connection_config().app_id, "cli_test_app");
+        assert_eq!(runtime.connection_config().app_secret(), "test-secret");
     }
 
     #[test]
@@ -1108,6 +1380,16 @@ mod tests {
     }
 
     #[test]
+    fn live_targets_include_personal_agent_without_default_room() {
+        let config = personal_agent_response_surface_config();
+
+        let targets = lark_app_bot_response_surface_targets(&config);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "lark-app");
+    }
+
+    #[test]
     fn live_targets_skip_when_route_replies_are_disabled() {
         let config = lark_response_surface_config(false, true);
 
@@ -1124,8 +1406,7 @@ mod tests {
     #[test]
     fn surface_reply_is_claimed_before_platform_ack_ready() {
         let now = test_time();
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut ledger = ledger_with_lark_surface(now);
 
         let decision = runtime
@@ -1133,13 +1414,13 @@ mod tests {
             .expect("event handling should succeed");
 
         assert_eq!(decision.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
-        let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = decision else {
+        let FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) = decision else {
             panic!("surface reply should be ready after local claim");
         };
         assert_eq!(ready.surface.source_session_id, "session-1");
         assert_eq!(ready.reply.provider_id, "lark-app");
         assert_eq!(ready.reply.provider_thread_id, "om_root_message_id");
-        assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
+        assert_eq!(ready.reply.reply_text, "continue with README");
 
         let duplicate = runtime
             .handle_event_before_platform_ack(&mut ledger, event_at(now + Duration::seconds(2)))
@@ -1147,7 +1428,7 @@ mod tests {
         assert_eq!(duplicate.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
         assert!(matches!(
             duplicate,
-            FeishuLarkLongConnectionDecision::AckSkip(
+            FeishuLarkLongConnectionDecision::Skip(
                 ProviderInboundSkipReason::EventAlreadyProcessing { .. }
             )
         ));
@@ -1156,8 +1437,7 @@ mod tests {
     #[test]
     fn lookup_miss_is_ack_skipped_without_claiming_event() {
         let now = test_time();
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut ledger = ResponseSurfaceLedger::in_memory();
 
         let decision = runtime
@@ -1167,7 +1447,7 @@ mod tests {
         assert_eq!(decision.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
         assert_eq!(
             decision,
-            FeishuLarkLongConnectionDecision::AckSkip(ProviderInboundSkipReason::SurfaceLookupMiss)
+            FeishuLarkLongConnectionDecision::Skip(ProviderInboundSkipReason::SurfaceLookupMiss)
         );
 
         ledger
@@ -1178,15 +1458,14 @@ mod tests {
             .expect("event should still be claimable after surface appears");
         assert!(matches!(
             later,
-            FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(_)
+            FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(_)
         ));
     }
 
     #[test]
     fn rootless_mention_is_ack_skipped_without_surface_trigger() {
         let now = test_time();
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut ledger = ledger_with_lark_surface(now);
 
         let decision = runtime
@@ -1219,15 +1498,14 @@ mod tests {
         assert_eq!(decision.platform_ack(), FeishuLarkPlatformAck::Acknowledge);
         assert_eq!(
             decision,
-            FeishuLarkLongConnectionDecision::AckSkip(ProviderInboundSkipReason::NotSurfaceReply)
+            FeishuLarkLongConnectionDecision::Skip(ProviderInboundSkipReason::NotSurfaceReply)
         );
     }
 
     #[tokio::test]
     async fn hidden_transport_receives_event_then_claims_and_acks_platform() {
         let now = test_time();
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut ledger = ledger_with_lark_surface(now);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
@@ -1249,11 +1527,11 @@ mod tests {
             .await
             .expect("hidden transport should receive and ack event");
 
-        let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = decision else {
+        let FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) = decision else {
             panic!("surface reply should be ready after local claim");
         };
         assert_eq!(ready.reply.provider_thread_id, "om_root_message_id");
-        assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
+        assert_eq!(ready.reply.reply_text, "continue with README");
 
         let sent = transport.sent_messages();
         assert_eq!(sent.len(), 1);
@@ -1280,8 +1558,7 @@ mod tests {
             })
             .await
             .expect("surface should be stored");
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
 
         let decision = runtime
             .handle_event_before_platform_ack_with_store_hidden(
@@ -1291,7 +1568,7 @@ mod tests {
             .await
             .expect("event should claim through shared ledger store");
 
-        let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = decision else {
+        let FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) = decision else {
             panic!("surface reply should be ready after local claim");
         };
         assert_eq!(ready.surface.source_session_id, "session-1");
@@ -1304,7 +1581,7 @@ mod tests {
             .expect("duplicate should be read from same store");
         assert!(matches!(
             duplicate,
-            FeishuLarkLongConnectionDecision::AckSkip(
+            FeishuLarkLongConnectionDecision::Skip(
                 ProviderInboundSkipReason::EventAlreadyProcessing { .. }
             )
         ));
@@ -1326,8 +1603,7 @@ mod tests {
             })
             .await
             .expect("surface should be stored");
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
                 "om_reply_message_id",
@@ -1344,12 +1620,14 @@ mod tests {
 
         receive_and_dispatch_live_lark_event_hidden(
             &runtime,
-            &ledger_store,
-            &bridge_binding_ledger_store,
             &mut transport,
             &mut payload_buffer,
-            &dispatcher,
-            &control_reply_dispatcher,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+            ),
             now + Duration::seconds(1),
         )
         .await
@@ -1359,12 +1637,14 @@ mod tests {
 
         receive_and_dispatch_live_lark_event_hidden(
             &runtime,
-            &ledger_store,
-            &bridge_binding_ledger_store,
             &mut transport,
             &mut payload_buffer,
-            &dispatcher,
-            &control_reply_dispatcher,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+            ),
             now + Duration::seconds(2),
         )
         .await
@@ -1373,14 +1653,8 @@ mod tests {
         let dispatched = dispatcher.dispatched();
         assert_eq!(transport.sent_messages().len(), 2);
         assert_eq!(dispatched.len(), 2);
-        assert_eq!(
-            dispatched[0].ready.reply.reply_text,
-            "@_user_1 continue with README"
-        );
-        assert_eq!(
-            dispatched[1].ready.reply.reply_text,
-            "@_user_1 also update the logs"
-        );
+        assert_eq!(dispatched[0].ready.reply.reply_text, "continue with README");
+        assert_eq!(dispatched[1].ready.reply.reply_text, "also update the logs");
     }
 
     #[tokio::test]
@@ -1394,8 +1668,7 @@ mod tests {
         let bridge_binding_ledger_store =
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_root_payload(
                 "om_bind_message_id",
@@ -1408,12 +1681,14 @@ mod tests {
 
         receive_and_dispatch_live_lark_event_hidden(
             &runtime,
-            &ledger_store,
-            &bridge_binding_ledger_store,
             &mut transport,
             &mut payload_buffer,
-            &dispatcher,
-            &control_reply_dispatcher,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+            ),
             now + Duration::seconds(1),
         )
         .await
@@ -1471,8 +1746,7 @@ mod tests {
             })
             .await
             .expect("thread binding should persist");
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
                 "om_reply_without_surface",
@@ -1485,12 +1759,14 @@ mod tests {
 
         receive_and_dispatch_live_lark_event_hidden(
             &runtime,
-            &ledger_store,
-            &bridge_binding_ledger_store,
             &mut transport,
             &mut payload_buffer,
-            &dispatcher,
-            &control_reply_dispatcher,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+            ),
             now + Duration::seconds(1),
         )
         .await
@@ -1502,7 +1778,7 @@ mod tests {
         assert_eq!(dispatched.len(), 1);
         assert_eq!(
             dispatched[0].ready.reply.reply_text,
-            "@_user_1 continue from binding"
+            "continue from binding"
         );
         assert_eq!(dispatched[0].ready.surface.source_session_id, "session-1");
         assert!(
@@ -1517,8 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn hidden_transport_ack_skips_non_surface_event_without_controller_trigger() {
         let now = test_time();
-        let runtime = FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
-            .expect("App Bot should build hidden long connection runtime");
+        let runtime = app_bot_runtime();
         let mut ledger = ledger_with_lark_surface(now);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
@@ -1557,7 +1832,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            FeishuLarkLongConnectionDecision::AckSkip(ProviderInboundSkipReason::NotSurfaceReply)
+            FeishuLarkLongConnectionDecision::Skip(ProviderInboundSkipReason::NotSurfaceReply)
         );
         assert_eq!(transport.sent_messages().len(), 1);
     }
@@ -1583,6 +1858,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_official_long_connection_service_id_from_url() {
+        let service_id = lark_long_connection_service_id(
+            "wss://example.invalid/ws?device_id=device-1&service_id=42",
+        )
+        .expect("service_id should parse");
+
+        assert_eq!(service_id, 42);
+    }
+
+    #[test]
+    fn protocol_ping_frame_matches_official_channel_shape() {
+        let frame = lark_protocol_ping_frame(42);
+
+        assert_eq!(frame.seq_id, 0);
+        assert_eq!(frame.log_id, 0);
+        assert_eq!(frame.service, 42);
+        assert_eq!(frame.method, FRAME_METHOD_CONTROL);
+        assert_eq!(header_value(&frame, HEADER_TYPE).as_deref(), Some("ping"));
+        assert!(frame.payload.is_none());
+    }
+
     fn app_bot_provider() -> ProviderConfig {
         ProviderConfig {
             id: "lark-app".to_string(),
@@ -1591,8 +1888,40 @@ mod tests {
                     domain: FeishuLarkAppDomain::Lark,
                     app_id: "cli_test_app".to_string(),
                     app_secret: SecretSource::Inline("test-secret".to_string()),
-                    tenant_key: "2ca1d211f64f6438".to_string(),
-                    chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                    app_registration_source: None,
+                    tenant_key: Some("2ca1d211f64f6438".to_string()),
+                    chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
+                },
+            )),
+        }
+    }
+
+    fn app_bot_runtime() -> FeishuLarkLongConnectionRuntime {
+        FeishuLarkLongConnectionRuntime::from_provider_config(&app_bot_provider())
+            .expect("App Bot should build hidden long connection runtime")
+            .with_bot_identity(test_bot_identity())
+    }
+
+    fn test_bot_identity() -> FeishuLarkLongConnectionBotIdentity {
+        FeishuLarkLongConnectionBotIdentity {
+            open_id: TEST_LARK_BOT_OPEN_ID.to_string(),
+            name: "Agents Router".to_string(),
+        }
+    }
+
+    fn personal_agent_provider() -> ProviderConfig {
+        ProviderConfig {
+            id: "lark-app".to_string(),
+            detail: ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(
+                FeishuLarkAppBotProviderConfig {
+                    domain: FeishuLarkAppDomain::Lark,
+                    app_id: "cli_test_app".to_string(),
+                    app_secret: SecretSource::Inline("test-secret".to_string()),
+                    app_registration_source: Some(
+                        lark_personal_agent_channel::REGISTRATION_SOURCE.to_string(),
+                    ),
+                    tenant_key: None,
+                    chat_id: None,
                 },
             )),
         }
@@ -1635,6 +1964,35 @@ mod tests {
         }
         .validate()
         .expect("test config should validate")
+    }
+
+    fn personal_agent_response_surface_config() -> ValidatedConfig {
+        let mut provider = RawProviderConfig::new("lark-app", ProviderType::FeishuLark);
+        provider.mode = Some("app_bot".to_string());
+        provider.domain = Some("lark".to_string());
+        provider.app_id = Some("cli_test_app".to_string());
+        provider.app_secret = Some("test-secret".to_string());
+
+        let mut route = RouteConfig::new(
+            vec!["codex_desktop".to_string()],
+            vec!["lark-app".to_string()],
+        );
+        route.response_surface.enabled = true;
+
+        RawConfig {
+            schema_version: crate::config::CONFIG_SCHEMA_VERSION,
+            cli: CliConfig::default(),
+            log: LogConfig::default(),
+            notification: NotificationConfig::default(),
+            sources: vec![SourceConfig {
+                id: "codex_desktop".to_string(),
+                source_type: SourceType::CodexDesktop,
+            }],
+            providers: vec![provider],
+            routes: vec![route],
+        }
+        .validate()
+        .expect("Personal Agent config should validate without a default room")
     }
 
     fn ledger_with_lark_surface(now: DateTime<Utc>) -> ResponseSurfaceLedger {
@@ -1747,6 +2105,20 @@ mod tests {
                 .expect("control dispatcher record lock should not be poisoned")
                 .push(reply);
             Ok(())
+        }
+    }
+
+    fn test_dispatch_context<'a>(
+        response_surface_ledger_store: &'a ResponseSurfaceLedgerStore,
+        bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
+        dispatcher: &'a RecordingContinuationDispatcher,
+        control_reply_dispatcher: &'a RecordingControlReplyDispatcher,
+    ) -> FeishuLarkLiveDispatchContext<'a> {
+        FeishuLarkLiveDispatchContext {
+            response_surface_ledger_store,
+            bridge_binding_ledger_store,
+            dispatcher,
+            control_reply_dispatcher,
         }
     }
 

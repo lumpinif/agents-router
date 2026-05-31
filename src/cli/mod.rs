@@ -19,13 +19,15 @@ use agents_router::agent_integration_catalog::{
     SourceIngestFormat, agent_integration_descriptor, agent_integration_for_source,
     default_agent_integration_for_platform, setup_agent_integration_descriptors_for_platform,
 };
+use agents_router::bridge_binding_ledger::BridgeBindingLedger;
 use agents_router::config::{
-    AnswerDetail, CliConfig, CliLanguage, ConfigError, EmailSmtpSecurity,
+    AnswerDetail, CliConfig, CliLanguage, ConfigError, EmailSmtpSecurity, FeishuLarkAppDomain,
     LoadedConfig as ParsedConfig, PromptDetail, ProviderType, RawConfig, RawProviderConfig,
     RouteConfig, SourceType, ValidatedConfig,
 };
 use agents_router::delivery_safety::DeliverySafetyGuard;
 use agents_router::i18n::{I18n, Text};
+use agents_router::lark_personal_agent_channel;
 use agents_router::legacy;
 use agents_router::local_ingress::{self, LocalSignalEvent};
 use agents_router::local_integrations::{
@@ -38,8 +40,8 @@ use agents_router::notification_detail_policy::{
 #[cfg(target_os = "macos")]
 use agents_router::paths::pid_file_path;
 use agents_router::paths::{
-    app_support_dir_path, codex_sessions_dir_path, default_config_file_path, ingress_endpoint,
-    log_file_path, service_metadata_path,
+    app_support_dir_path, bridge_binding_ledger_path, codex_sessions_dir_path,
+    default_config_file_path, ingress_endpoint, log_file_path, service_metadata_path,
 };
 #[cfg(target_os = "macos")]
 use agents_router::process::{StopOutcome, SystemProcessManager, stop_with_manager};
@@ -403,7 +405,7 @@ async fn run_start_service(
 }
 
 fn build_service_definition(config_path: &Path) -> anyhow::Result<ServiceDefinition> {
-    let binary_path = resolved_current_exe()?;
+    let binary_path = service_binary_path()?;
     let working_dir = std::env::current_dir().context("failed to detect working directory")?;
     let config_path = if config_path.is_absolute() {
         config_path.to_path_buf()
@@ -449,6 +451,123 @@ fn home_env_value() -> anyhow::Result<String> {
 fn resolved_current_exe() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     Ok(fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+fn service_binary_path() -> anyhow::Result<PathBuf> {
+    let current_binary = resolved_current_exe()?;
+
+    #[cfg(not(windows))]
+    {
+        let home = PathBuf::from(home_env_value()?);
+        install_stable_service_binary(&current_binary, &home)
+    }
+
+    #[cfg(windows)]
+    {
+        Ok(current_binary)
+    }
+}
+
+#[cfg(not(windows))]
+fn stable_service_binary_path_for_home(home: &Path) -> PathBuf {
+    home.join(".local").join("bin").join("agents-router")
+}
+
+#[cfg(not(windows))]
+fn install_stable_service_binary(current_binary: &Path, home: &Path) -> anyhow::Result<PathBuf> {
+    let stable_binary = stable_service_binary_path_for_home(home);
+    if stable_service_binary_is_current_regular_file(current_binary, &stable_binary)? {
+        return Ok(stable_binary);
+    }
+
+    let parent = stable_binary
+        .parent()
+        .context("stable service binary path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create service binary directory `{}`",
+            parent.display()
+        )
+    })?;
+
+    let temp_binary =
+        stable_binary.with_file_name(format!(".agents-router-service.{}.tmp", std::process::id()));
+
+    let install_result = (|| -> anyhow::Result<()> {
+        fs::copy(current_binary, &temp_binary).with_context(|| {
+            format!(
+                "failed to copy service binary from `{}` to `{}`",
+                current_binary.display(),
+                temp_binary.display()
+            )
+        })?;
+        let permissions = fs::metadata(current_binary)
+            .with_context(|| {
+                format!(
+                    "failed to read service binary permissions from `{}`",
+                    current_binary.display()
+                )
+            })?
+            .permissions();
+        fs::set_permissions(&temp_binary, permissions).with_context(|| {
+            format!(
+                "failed to set service binary permissions on `{}`",
+                temp_binary.display()
+            )
+        })?;
+        fs::rename(&temp_binary, &stable_binary).with_context(|| {
+            format!(
+                "failed to install service binary at `{}`",
+                stable_binary.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if install_result.is_err() {
+        let _ = fs::remove_file(&temp_binary);
+    }
+    install_result?;
+
+    Ok(stable_binary)
+}
+
+#[cfg(not(windows))]
+fn stable_service_binary_is_current_regular_file(
+    current_binary: &Path,
+    stable_binary: &Path,
+) -> anyhow::Result<bool> {
+    let stable_metadata = match fs::symlink_metadata(stable_binary) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read service binary metadata at `{}`",
+                    stable_binary.display()
+                )
+            });
+        }
+    };
+
+    if stable_metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    let current_canonical = fs::canonicalize(current_binary).with_context(|| {
+        format!(
+            "failed to resolve current binary `{}`",
+            current_binary.display()
+        )
+    })?;
+    let stable_canonical = fs::canonicalize(stable_binary).with_context(|| {
+        format!(
+            "failed to resolve stable service binary `{}`",
+            stable_binary.display()
+        )
+    })?;
+
+    Ok(current_canonical == stable_canonical)
 }
 
 fn print_service_start_outcome(
@@ -534,7 +653,15 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
     }
 
     if !feishu_lark_app_bot_targets.is_empty() {
-        print_section("Feishu/Lark app bot");
+        let section_title = if feishu_lark_app_bot_targets
+            .iter()
+            .all(|target| target.chat_id.is_none())
+        {
+            "Feishu/Lark Personal Agent"
+        } else {
+            "Feishu/Lark App Bot"
+        };
+        print_section(section_title);
         for target in &feishu_lark_app_bot_targets {
             print_field("provider", &target.provider_id);
             print_field("domain", &target.domain);
@@ -547,8 +674,25 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
                     style(i18n.text(Text::NotConfigured)).yellow()
                 },
             );
-            print_field("tenant key", &target.tenant_key);
-            print_field("chat id", &target.chat_id);
+            print_field(
+                "default room",
+                target
+                    .chat_id
+                    .as_deref()
+                    .map(|chat_id| style(chat_id).green().to_string())
+                    .unwrap_or_else(|| {
+                        "project rooms only; mention the agent and send `/bind` in Lark".to_string()
+                    }),
+            );
+            if target.chat_id.is_none() {
+                print_personal_agent_room_event_registration_status(
+                    target.app_registration_source.as_deref(),
+                );
+                print_personal_agent_project_rooms_status(&target.provider_id);
+            }
+            if let Some(tenant_key) = target.tenant_key.as_deref() {
+                print_field("tenant key", tenant_key);
+            }
         }
     }
 
@@ -747,6 +891,63 @@ fn print_status_notification_targets(config_path: &Path) {
     }
 }
 
+fn print_personal_agent_room_event_registration_status(source: Option<&str>) {
+    match lark_personal_agent_channel::registration_source_status(source) {
+        lark_personal_agent_channel::RegistrationSourceStatus::Current => {
+            print_field("room events", style("ready").green());
+        }
+        lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
+            print_field(
+                "room events",
+                style("configured; run a room smoke to verify `/bind`").yellow(),
+            );
+        }
+        lark_personal_agent_channel::RegistrationSourceStatus::Mismatch => {
+            print_field(
+                "room events",
+                style("configured; source marker differs from this build").yellow(),
+            );
+        }
+    }
+}
+
+fn print_personal_agent_project_rooms_status(provider_id: &str) {
+    let status = bridge_binding_ledger_path()
+        .and_then(BridgeBindingLedger::load)
+        .and_then(|ledger| {
+            ledger.connected_room_project_bindings_for_provider(
+                provider_id,
+                ProviderType::FeishuLark.as_str(),
+            )
+        });
+
+    match status {
+        Ok(mut bindings) => {
+            bindings.sort_by(|left, right| {
+                left.project_path.cmp(&right.project_path).then_with(|| {
+                    left.provider_conversation_id
+                        .cmp(&right.provider_conversation_id)
+                })
+            });
+            if bindings.is_empty() {
+                print_field(
+                    "project rooms",
+                    style("none yet; add the agent to a room, mention it, and send `/bind /absolute/project/path`").yellow(),
+                );
+                return;
+            }
+
+            print_field("project rooms", format!("{} connected", bindings.len()));
+            for binding in bindings {
+                print_field("bound project", binding.project_path);
+            }
+        }
+        Err(error) => {
+            print_field("project rooms", style(error.to_string()).red());
+        }
+    }
+}
+
 async fn run_status() -> anyhow::Result<()> {
     let manager = PlatformServiceManager::system()?;
     let service_file = manager.service_file_path()?;
@@ -881,10 +1082,17 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
             println!();
             println!("{}", i18n.text(Text::NextFeishuLark));
             match mode {
+                FeishuLarkSetupMode::PersonalAgentApp => {
+                    print_personal_agent_room_binding_next_steps(i18n);
+                    print_source_integration_setup_note(agent, i18n);
+                    println!("{}", setup::TEST_NOTIFICATION_SKIPPED_MESSAGE);
+                    println!("{}", style(i18n.text(Text::SetupComplete)).green());
+                    return Ok(());
+                }
                 FeishuLarkSetupMode::CustomBotWebhook => {
                     wait_for_enter(i18n.text(Text::SendTestPromptFeishuLark))?;
                 }
-                FeishuLarkSetupMode::AppBot => {
+                FeishuLarkSetupMode::AppBotCredentials => {
                     let prompt =
                         localized(i18n, "Send a test message now?", "现在发送一条测试消息？");
                     if !prompt_confirm(prompt, true)? {
@@ -1025,6 +1233,29 @@ fn print_source_integration_setup_note(source_integration: setup::AgentIntegrati
                     descriptor.source_capability.hook_command,
                 );
             }
+        }
+    }
+}
+
+fn print_personal_agent_room_binding_next_steps(i18n: I18n) {
+    match i18n.language() {
+        CliLanguage::English => {
+            println!("Next:");
+            println!("1. Add the Personal Agent to a Lark or Feishu room.");
+            println!(
+                "2. In that room, mention the Personal Agent and send `/bind /absolute/project/path`."
+            );
+            println!("3. Wait for a new Codex Desktop update from that project.");
+            println!(
+                "4. In the Lark thread, mention the Personal Agent to continue the same Codex thread."
+            );
+        }
+        CliLanguage::SimplifiedChinese => {
+            println!("下一步：");
+            println!("1. 把 Personal Agent 拉进一个 Lark 或飞书群。");
+            println!("2. 在这个群里 @ Personal Agent，并发送 `/bind /absolute/project/path`。");
+            println!("3. 等这个项目产生新的 Codex Desktop 更新。");
+            println!("4. 在对应 Lark thread 里 @ Personal Agent，就会继续同一个 Codex thread。");
         }
     }
 }
@@ -1242,7 +1473,7 @@ fn feishu_lark_app_bot_test_notification_body(
 ) -> String {
     match release_stage {
         Some(stage) => format!(
-            "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nLark thread replies are {}; Feishu App Bot uses the same setup shape, but validate replies in your workspace before relying on them. To test replies, wait for a new real Codex Desktop completion notification here. Reply in that notification's thread; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex.",
+            "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nLark thread replies are {}; Feishu App Bot uses the same setup shape, but validate replies in your workspace before relying on them. To test replies, wait for a new real Codex Desktop completion notification here. In that notification's thread, mention the bot; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex.",
             release_stage_sentence_label(stage)
         ),
         None => "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nReplies are only available for Codex Desktop when continuation support is available.\n\nReplies to this test message will not continue Codex.".to_string(),

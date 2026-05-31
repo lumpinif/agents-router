@@ -97,7 +97,7 @@ pub struct ResponseSurfaceLookupQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseSurfaceLookupResult {
-    Hit(ResponseSurfaceLookupRecord),
+    Hit(Box<ResponseSurfaceLookupRecord>),
     Miss,
     Closed { surface_id: String },
 }
@@ -355,7 +355,9 @@ impl ResponseSurfaceLedger {
 
         Ok(match record.status {
             ResponseSurfaceStatus::Open | ResponseSurfaceStatus::Expired => {
-                ResponseSurfaceLookupResult::Hit(ResponseSurfaceLookupRecord::from_surface(record))
+                ResponseSurfaceLookupResult::Hit(Box::new(
+                    ResponseSurfaceLookupRecord::from_surface(record),
+                ))
             }
             ResponseSurfaceStatus::Closed => ResponseSurfaceLookupResult::Closed {
                 surface_id: record.surface_id.clone(),
@@ -785,14 +787,11 @@ fn surface_create_is_idempotent(
     record: &ResponseSurfaceRecord,
     input: &NewResponseSurface,
 ) -> bool {
-    record.signal_id == input.signal_id
-        && record.source_id == input.source_id
+    record.source_id == input.source_id
         && record.source_type == input.source_type
         && record.source_session_id == input.source_session_id
-        && record.source_turn_id.as_deref() == normalized_optional_value(&input.source_turn_id)
         && record.provider_type == input.provider_type
         && record.provider_mode == input.provider_mode
-        && record.provider_message_id == input.provider_message_id
         && record.route_binding_hash.as_deref()
             == normalized_optional_value(&input.route_binding_hash)
 }
@@ -925,7 +924,7 @@ mod tests {
         assert!(is_opaque_uuid(&surface.surface_id));
         assert_eq!(
             lookup,
-            ResponseSurfaceLookupResult::Hit(ResponseSurfaceLookupRecord {
+            ResponseSurfaceLookupResult::Hit(Box::new(ResponseSurfaceLookupRecord {
                 surface_id: surface.surface_id,
                 signal_id: "signal-1".to_string(),
                 delivery_id: "delivery-1".to_string(),
@@ -942,7 +941,7 @@ mod tests {
                 provider_thread_id: "1716200000.000100".to_string(),
                 route_binding_hash: Some("route-hash-1".to_string()),
                 status: ResponseSurfaceStatus::Open,
-            })
+            }))
         );
     }
 
@@ -962,6 +961,28 @@ mod tests {
 
         assert_eq!(second.surface_id, first.surface_id);
         assert_eq!(second.delivery_id, "delivery-1");
+        assert_eq!(ledger.state.surfaces.len(), 1);
+    }
+
+    #[test]
+    fn later_delivery_for_same_provider_thread_and_source_session_reuses_existing_surface() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        let first = ledger
+            .create_surface_at(test_surface(now), now)
+            .expect("surface should be created");
+
+        let mut later = test_surface(now);
+        later.signal_id = "signal-2".to_string();
+        later.delivery_id = "delivery-2".to_string();
+        later.provider_message_id = "reply-message-2".to_string();
+        later.source_turn_id = Some("turn-2".to_string());
+        let second = ledger
+            .create_surface_at(later, now + Duration::seconds(1))
+            .expect("same source session should reuse existing provider thread surface");
+
+        assert_eq!(second.surface_id, first.surface_id);
+        assert_eq!(second.signal_id, "signal-1");
         assert_eq!(ledger.state.surfaces.len(), 1);
     }
 

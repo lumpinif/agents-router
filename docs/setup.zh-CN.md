@@ -2,7 +2,7 @@
 
 English documentation: [setup.md](setup.md)
 
-用 setup 创建或替换本机配置、启动 service，并发送一条测试通知。
+用 setup 创建或替换本机配置并启动 service。带固定目标群的 provider 会发送一条测试通知。Feishu/Lark Personal Agent 使用 project rooms，所以 setup 会以 room binding 指引结束，不发送测试消息。
 
 ```bash
 agents-router setup
@@ -87,10 +87,11 @@ hot reload 里确保 `~/.claude/settings.json` 有所需 hooks。它会添加 `S
 11. 微信
 ```
 
-如果还没有已配置 provider，setup 会默认推荐 Slack。
+如果还没有已配置 provider，setup 会默认推荐 Feishu/Lark。
 
 Provider 教程：
 
+- [飞书/Lark Personal Agent](providers/feishu-lark-app-bot.md)
 - [Slack](providers/slack.zh-CN.md)
 - [Discord](providers/discord.zh-CN.md)
 - [Telegram](providers/telegram.zh-CN.md)
@@ -99,7 +100,6 @@ Provider 教程：
 - [ntfy](providers/ntfy.zh-CN.md)
 - [Pushover](providers/pushover.zh-CN.md)
 - [飞书/Lark Custom Bot](providers/feishu-lark-custom-bot.zh-CN.md)
-- [飞书/Lark App Bot](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.zh-CN.md)
 - [WhatsApp](providers/whatsapp.zh-CN.md)
 - [微信](providers/wechat.zh-CN.md)
@@ -107,16 +107,19 @@ Provider 教程：
 选择 Feishu/Lark 时，setup 会继续询问 mode：
 
 ```text
-App Bot — Experimental
-  通过应用机器人发送通知。Lark thread replies 可以继续 Codex Desktop session；依赖 Feishu replies 前请先在自己的 workspace 验证。
+Personal Agent App — Experimental
+  扫码创建 Personal Agent，把它拉进 Lark 或飞书群，然后 @ 它并发送 `/bind` 连接项目群。
+
+Existing App Bot Credentials — Experimental
+  使用已有自建应用和默认群 Chat ID。Lark thread replies 可以继续 Codex Desktop session；依赖 Feishu replies 前请先在自己的 workspace 验证。
 
 Custom Bot Webhook — Fallback
   单向发送通知到一个群。不支持回复或项目群。
 ```
 
-App Bot 是默认选项，因为它支持双向 bridge：thread replies、`/bind` 和项目群。App Bot 需要 Bot 能力、消息权限、`im.message.receive_v1`、Long Connection / WebSocket，以及已发布的应用版本。setup 只显示短 checklist，并链接到完整的 [飞书/Lark App Bot 指南](providers/feishu-lark-app-bot.md)。
+Personal Agent App 是默认推荐选项，因为它支持双向 project room 体验：扫码 setup、`/bind`、一个 Codex thread 对应一个 Lark thread。setup 会显示 QR code，扫码创建 Personal Agent app，并在完成后提示你把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。
 
-如果你只想要一个简单的单向 fallback，请选择 Custom Bot Webhook。需要 Codex Desktop thread reply 时，选择 Lark App Bot Experimental 路径。Feishu App Bot 使用相同配置形态，但在依赖 replies 前应该先在自己的 workspace 做验证。
+如果你已经有自建应用并且明确想配置固定默认群，请选择 Existing App Bot Credentials。如果你只想要一个简单的单向 fallback，请选择 Custom Bot Webhook。
 
 ## Provider ID
 
@@ -197,6 +200,10 @@ agents-router emit \
 
 如果同一条 route 同时设置了 `minimum_task_duration_minutes` 和
 `only_forward_from_project_paths`，两个条件都满足后才会发送通知。
+
+Feishu/Lark Personal Agent 的 project room 不在 setup 里使用
+`only_forward_from_project_paths`。这个模式下，`/bind /absolute/project/path` 才是项目入口。
+这样 project-room routing 只有一个事实源：本机 room binding ledger。
 
 ## Answer Detail
 
@@ -313,6 +320,7 @@ Agents Router 才会转发。项目路径必须是干净的绝对路径。如果
 
 - 如果没有设置 `only_forward_from_project_paths`，或它是空数组，通知不会按项目路径过滤。
 - Setup 不会询问这个选项。需要只转发指定项目时，手动把它加到真实 agent 的 route 上。
+- Feishu/Lark Personal Agent setup 会清空所选 agent route 上的这个过滤。用 Lark 或飞书群里的 `/bind` 选择项目目标。
 - 这个值是数组，所以同一条 route 可以允许多个项目路径。
 - 路径必须是非空绝对路径，不能包含 `.` 或 `..` 路径组件。
 - 匹配使用路径组件语义，不是字符串前缀。例如 `/Users/me/app` 会匹配 `/Users/me/app/api`，但不会匹配 `/Users/me/app-copy`。
@@ -334,5 +342,5 @@ Setup 会写入：
 ~/.config/agents-router/config.toml
 ```
 
-然后它会启动本机 service，并通过同一条 provider 投递链路发送测试通知。
+然后它会启动本机 service。带固定目标的 provider 会通过同一条 provider 投递链路发送测试通知。Feishu/Lark Personal Agent 使用 project rooms，所以 setup 会以 QR 和 `/bind` 步骤结束，不发送测试消息。
 macOS 使用 LaunchAgent，Linux 使用 systemd user service，Windows 使用 Task Scheduler。

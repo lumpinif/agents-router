@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -29,6 +29,52 @@ fn uninstall_keeps_development_binary_paths_even_with_script_marker() {
         Path::new("/repo/target/release/agents-router"),
         Some("script")
     ));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn stable_service_binary_path_uses_user_local_bin() {
+    assert_eq!(
+        stable_service_binary_path_for_home(Path::new("/Users/tester")),
+        PathBuf::from("/Users/tester/.local/bin/agents-router")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stable_service_binary_install_replaces_symlink_with_real_file() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let home = dir.path().join("home");
+    let current_binary = dir
+        .path()
+        .join("repo")
+        .join("target")
+        .join("debug")
+        .join("agents-router");
+    std::fs::create_dir_all(current_binary.parent().unwrap())
+        .expect("current binary parent should be created");
+    std::fs::write(&current_binary, b"current-binary").expect("current binary should be written");
+
+    let stable_binary = stable_service_binary_path_for_home(&home);
+    std::fs::create_dir_all(stable_binary.parent().unwrap())
+        .expect("stable binary parent should be created");
+    std::os::unix::fs::symlink(&current_binary, &stable_binary)
+        .expect("stable binary symlink should be created");
+
+    let installed =
+        install_stable_service_binary(&current_binary, &home).expect("binary should install");
+
+    assert_eq!(installed, stable_binary);
+    assert!(
+        !std::fs::symlink_metadata(&stable_binary)
+            .expect("stable binary metadata should be readable")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&stable_binary).expect("stable binary should be readable"),
+        b"current-binary"
+    );
 }
 
 #[test]
@@ -574,7 +620,7 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
     assert_eq!(
         summary,
         SetupProviderSummary {
-            provider_name: "Feishu/Lark app bot",
+            provider_name: "Feishu/Lark App Bot",
             fields: vec![
                 plain_summary_field("domain", "lark".to_string()),
                 plain_summary_field("app id", "cli_9f5343c580712544".to_string()),
@@ -583,13 +629,113 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
                     value: "configured".to_string(),
                     tone: SetupProviderSummaryTone::Success,
                 },
+                plain_summary_field(
+                    "default room",
+                    "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                ),
                 plain_summary_field("tenant key", "2ca1d211f64f6438".to_string()),
-                plain_summary_field("chat id", "oc_5ce6d572455d361153b7xx51da133945".to_string()),
             ],
         }
     );
     let rendered = format!("{summary:?}");
     assert!(!rendered.contains("test-app-secret"));
+}
+
+#[test]
+fn setup_provider_summary_reports_personal_agent_without_default_room() {
+    let config = setup::build_feishu_lark_personal_agent_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "test-app-secret",
+    );
+
+    let summary = single_setup_provider_summary(&config);
+
+    assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
+    assert!(summary.fields.iter().any(|field| {
+        field.label == "default room"
+            && field.value == "project rooms only; mention the agent and send `/bind` in Lark"
+    }));
+    assert!(summary.fields.iter().any(|field| {
+        field.label == "room events"
+            && field.value == "configured"
+            && field.tone == SetupProviderSummaryTone::Success
+    }));
+    let rendered = format!("{summary:?}");
+    assert!(!rendered.contains("test-app-secret"));
+}
+
+#[test]
+fn setup_provider_summary_reports_personal_agent_room_events_need_smoke() {
+    let config = RawConfig::from_toml_str(
+        r#"
+schema_version = 1
+
+[notification]
+answer_detail = "preview"
+
+[[providers]]
+id = "feishu_lark"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret = "test-app-secret"
+
+[[sources]]
+id = "codex_desktop"
+type = "codex_desktop"
+
+[[routes]]
+sources = ["codex_desktop"]
+providers = ["feishu_lark"]
+"#,
+    )
+    .expect("old Personal Agent config should parse");
+
+    let summary = single_setup_provider_summary(&config);
+
+    assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
+    assert!(summary.fields.iter().any(|field| {
+        field.label == "room events"
+            && field.value == "configured; run a room smoke to verify `/bind`"
+            && field.tone == SetupProviderSummaryTone::Warning
+    }));
+    let rendered = format!("{summary:?}");
+    assert!(!rendered.contains("test-app-secret"));
+}
+
+#[test]
+fn personal_agent_setup_uses_bind_as_the_project_filter() {
+    let route_filters = SetupRouteFilters {
+        minimum_task_duration_minutes: Some(5),
+        only_forward_from_project_paths: vec![
+            "/Users/tester/projects/old-project".to_string(),
+            "/Users/tester/projects/another-old-project".to_string(),
+        ],
+    };
+
+    let personal_agent_filters =
+        feishu_lark_route_filters_for_mode(FeishuLarkSetupMode::PersonalAgentApp, &route_filters);
+    let app_bot_filters =
+        feishu_lark_route_filters_for_mode(FeishuLarkSetupMode::AppBotCredentials, &route_filters);
+
+    assert_eq!(
+        personal_agent_filters.minimum_task_duration_minutes,
+        Some(5)
+    );
+    assert!(
+        personal_agent_filters
+            .only_forward_from_project_paths
+            .is_empty()
+    );
+    assert_eq!(
+        app_bot_filters.only_forward_from_project_paths,
+        route_filters.only_forward_from_project_paths
+    );
 }
 
 #[test]
@@ -608,7 +754,10 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
 
     let defaults = SetupDefaults::from_config(&config);
 
-    assert_eq!(defaults.feishu_lark_mode, Some(FeishuLarkSetupMode::AppBot));
+    assert_eq!(
+        defaults.feishu_lark_mode,
+        Some(FeishuLarkSetupMode::AppBotCredentials)
+    );
     assert_eq!(defaults.feishu_lark_app_domain.as_deref(), Some("lark"));
     assert_eq!(
         defaults.feishu_lark_app_id.as_deref(),
@@ -626,6 +775,75 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
         defaults.feishu_lark_chat_id.as_deref(),
         Some("oc_5ce6d572455d361153b7xx51da133945")
     );
+}
+
+#[test]
+fn setup_defaults_reuse_personal_agent_without_source_marker() {
+    let config = RawConfig::from_toml_str(
+        r#"
+schema_version = 1
+
+[notification]
+answer_detail = "preview"
+
+[[sources]]
+id = "codex_desktop"
+type = "codex_desktop"
+
+[[providers]]
+id = "feishu_lark"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret = "test-app-secret"
+
+[[routes]]
+sources = ["codex_desktop"]
+providers = ["feishu_lark"]
+"#,
+    )
+    .expect("old Personal Agent config should parse");
+
+    let defaults = SetupDefaults::from_config(&config);
+
+    assert_eq!(
+        defaults.feishu_lark_mode,
+        Some(FeishuLarkSetupMode::PersonalAgentApp)
+    );
+    assert_eq!(
+        existing_personal_agent_credentials(&defaults).map(|credentials| (
+            credentials.domain,
+            credentials.app_id,
+            credentials.app_secret
+        )),
+        Some(("lark", "cli_9f5343c580712544", "test-app-secret"))
+    );
+}
+
+#[test]
+fn setup_defaults_accept_current_personal_agent_room_event_registration() {
+    let config = setup::build_feishu_lark_personal_agent_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "test-app-secret",
+    );
+
+    let defaults = SetupDefaults::from_config(&config);
+
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.provider_type == ProviderType::FeishuLark)
+        .expect("Personal Agent provider should exist");
+    assert_eq!(
+        provider.app_registration_source.as_deref(),
+        Some(lark_personal_agent_channel::REGISTRATION_SOURCE)
+    );
+    assert!(existing_personal_agent_credentials(&defaults).is_some());
 }
 
 #[test]
@@ -664,13 +882,19 @@ providers = ["feishu_lark"]
 
     let defaults = SetupDefaults::from_config(&config);
 
-    assert_eq!(defaults.feishu_lark_mode, Some(FeishuLarkSetupMode::AppBot));
+    assert_eq!(
+        defaults.feishu_lark_mode,
+        Some(FeishuLarkSetupMode::AppBotCredentials)
+    );
     assert_eq!(defaults.feishu_lark_app_secret, None);
 }
 
 #[test]
 fn feishu_lark_mode_options_are_localized() {
-    assert_eq!(FeishuLarkSetupMode::default(), FeishuLarkSetupMode::AppBot);
+    assert_eq!(
+        FeishuLarkSetupMode::default(),
+        FeishuLarkSetupMode::PersonalAgentApp
+    );
 
     let chinese_custom_bot = feishu_lark_mode_option_label(
         FeishuLarkSetupMode::CustomBotWebhook,
@@ -679,28 +903,52 @@ fn feishu_lark_mode_options_are_localized() {
         I18n::new(CliLanguage::SimplifiedChinese),
     );
     assert!(chinese_custom_bot.contains("备用"));
-    assert!(chinese_custom_bot.contains("单向发送通知到一个群"));
+    assert!(!chinese_custom_bot.contains('\n'));
     assert!(!chinese_custom_bot.contains("Fastest setup"));
+    assert!(
+        feishu_lark_mode_option_description(
+            FeishuLarkSetupMode::CustomBotWebhook,
+            setup::AgentIntegrationId::CodexDesktop,
+            I18n::new(CliLanguage::SimplifiedChinese),
+        )
+        .contains("单向发送通知到一个群")
+    );
 
-    let chinese_app_bot = feishu_lark_mode_option_label(
-        FeishuLarkSetupMode::AppBot,
+    let chinese_personal_agent = feishu_lark_mode_option_label(
+        FeishuLarkSetupMode::PersonalAgentApp,
         setup::AgentIntegrationId::CodexDesktop,
-        Some(FeishuLarkSetupMode::AppBot),
+        Some(FeishuLarkSetupMode::PersonalAgentApp),
         I18n::new(CliLanguage::SimplifiedChinese),
     );
-    assert!(chinese_app_bot.contains("实验性"));
-    assert!(chinese_app_bot.contains("通过应用机器人发送通知"));
-    assert!(!chinese_app_bot.contains("validate Feishu"));
+    assert!(chinese_personal_agent.contains("实验性"));
+    assert!(!chinese_personal_agent.contains('\n'));
+    assert!(!chinese_personal_agent.contains("validate Feishu"));
+    assert!(
+        feishu_lark_mode_option_description(
+            FeishuLarkSetupMode::PersonalAgentApp,
+            setup::AgentIntegrationId::CodexDesktop,
+            I18n::new(CliLanguage::SimplifiedChinese),
+        )
+        .contains("扫码创建 agent")
+    );
 
-    let english_app_bot = feishu_lark_mode_option_label(
-        FeishuLarkSetupMode::AppBot,
+    let english_personal_agent = feishu_lark_mode_option_label(
+        FeishuLarkSetupMode::PersonalAgentApp,
         setup::AgentIntegrationId::CodexDesktop,
         None,
         I18n::new(CliLanguage::English),
     );
-    assert!(english_app_bot.contains("Experimental"));
-    assert!(english_app_bot.contains("validate Feishu before relying on replies"));
-    assert!(english_app_bot.contains("Recommended"));
+    assert!(english_personal_agent.contains("Experimental"));
+    assert!(!english_personal_agent.contains('\n'));
+    assert!(english_personal_agent.contains("Recommended"));
+    assert!(
+        feishu_lark_mode_option_description(
+            FeishuLarkSetupMode::PersonalAgentApp,
+            setup::AgentIntegrationId::CodexDesktop,
+            I18n::new(CliLanguage::English),
+        )
+        .contains("mention it and send `/bind`")
+    );
 }
 
 #[test]

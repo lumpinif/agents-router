@@ -17,6 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
+use crate::bridge_binding_ledger::BridgeBindingLedgerStore;
 use crate::config::{SourceType, ValidatedConfig};
 use crate::delivery_safety::DeliverySafetyGuard;
 use crate::paths::{IngressEndpoint, codex_sessions_dir_path};
@@ -31,6 +32,13 @@ use crate::signal_builder::{SignalBuilder, SignalConversationDraft, SignalDraft}
 use crate::sources::codex_cli;
 
 const READINESS_PING_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Default)]
+struct LocalIngressRoutingStores<'a> {
+    delivery_safety: Option<&'a DeliverySafetyGuard>,
+    response_surface_ledger: Option<&'a ResponseSurfaceLedgerStore>,
+    bridge_binding_ledger: Option<&'a BridgeBindingLedgerStore>,
+}
 
 /// Cross-process local ingress payload.
 ///
@@ -517,9 +525,10 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety(
         state,
         event,
         codex_sessions_dir,
-        delivery_safety,
-        None,
-        None,
+        LocalIngressRoutingStores {
+            delivery_safety,
+            ..LocalIngressRoutingStores::default()
+        },
     )
     .await
 }
@@ -530,9 +539,7 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety_and_response_s
     state: &LocalIngressState,
     event: LocalSignalEvent,
     codex_sessions_dir: Option<&Path>,
-    delivery_safety: Option<&DeliverySafetyGuard>,
-    response_surface_ledger: Option<&ResponseSurfaceLedgerStore>,
-    bridge_binding_ledger: Option<&crate::bridge_binding_ledger::BridgeBindingLedgerStore>,
+    routing_stores: LocalIngressRoutingStores<'_>,
 ) -> anyhow::Result<DeliveryReport> {
     info!(
         source.id = %event.source_id,
@@ -571,9 +578,9 @@ async fn route_event_with_state_and_codex_sessions_dir_and_safety_and_response_s
         .route_with_safety_and_response_surfaces(
             &signal,
             providers,
-            delivery_safety,
-            response_surface_ledger,
-            bridge_binding_ledger,
+            routing_stores.delivery_safety,
+            routing_stores.response_surface_ledger,
+            routing_stores.bridge_binding_ledger,
         )
         .await
         .map_err(Into::into)
@@ -630,9 +637,11 @@ pub async fn route_event_with_runtime(
         state,
         event,
         codex_sessions_dir.as_deref(),
-        Some(&delivery_safety),
-        Some(&response_surface_ledger),
-        Some(&bridge_binding_ledger),
+        LocalIngressRoutingStores {
+            delivery_safety: Some(&delivery_safety),
+            response_surface_ledger: Some(&response_surface_ledger),
+            bridge_binding_ledger: Some(&bridge_binding_ledger),
+        },
     )
     .await
 }

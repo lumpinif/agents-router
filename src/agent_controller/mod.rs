@@ -132,12 +132,12 @@ pub struct AgentControllerError {
     pub kind: AgentControllerErrorKind,
     pub submit_boundary: AgentControllerFailureSubmitBoundary,
     pub controller_kind: AgentControllerKind,
-    pub surface_id: String,
-    pub source_id: String,
+    pub surface_id: Box<str>,
+    pub source_id: Box<str>,
     pub source_type: SourceType,
-    pub source_session_id: String,
-    pub provider_event_id_hash: String,
-    pub message: String,
+    pub source_session_id: Box<str>,
+    pub provider_event_id_hash: Box<str>,
+    pub message: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +234,12 @@ enum PreparedInboundContinuation<'a> {
 
 pub struct AgentControllerRuntime<'a> {
     adapters: Vec<&'a dyn AgentControllerAdapter>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AgentControllerPolicyOverrides {
+    agent_integration: Option<AgentIntegrationDescriptor>,
+    provider_capability: Option<&'static ProviderModeCapability>,
 }
 
 impl<'a> AgentControllerRuntime<'a> {
@@ -389,14 +395,13 @@ impl<'a> AgentControllerRuntime<'a> {
         ready: ProviderInboundReady,
         provider_reply: &dyn ProviderThreadReplyAdapter,
         now: DateTime<Utc>,
-        agent_integration_override: Option<AgentIntegrationDescriptor>,
-        provider_capability_override: Option<&'static ProviderModeCapability>,
+        policy_overrides: AgentControllerPolicyOverrides,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
         let prepared = self.prepare_inbound_continuation(
             config,
             &ready,
-            agent_integration_override,
-            provider_capability_override,
+            policy_overrides.agent_integration,
+            policy_overrides.provider_capability,
         );
 
         let (request, adapter) = match prepared {
@@ -531,8 +536,7 @@ impl<'a> AgentControllerRuntime<'a> {
             ready,
             provider_reply,
             now,
-            None,
-            None,
+            AgentControllerPolicyOverrides::default(),
         )
         .await
     }
@@ -554,8 +558,10 @@ impl<'a> AgentControllerRuntime<'a> {
             ready,
             provider_reply,
             now,
-            agent_integration_override,
-            provider_capability_override,
+            AgentControllerPolicyOverrides {
+                agent_integration: agent_integration_override,
+                provider_capability: provider_capability_override,
+            },
         )
         .await
     }
@@ -567,14 +573,13 @@ impl<'a> AgentControllerRuntime<'a> {
         ready: ProviderInboundReady,
         provider_reply: &dyn ProviderThreadReplyAdapter,
         now: DateTime<Utc>,
-        agent_integration_override: Option<AgentIntegrationDescriptor>,
-        provider_capability_override: Option<&'static ProviderModeCapability>,
+        policy_overrides: AgentControllerPolicyOverrides,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
         let prepared = self.prepare_inbound_continuation(
             config,
             &ready,
-            agent_integration_override,
-            provider_capability_override,
+            policy_overrides.agent_integration,
+            policy_overrides.provider_capability,
         );
 
         let (request, adapter) = match prepared {
@@ -777,12 +782,12 @@ impl AgentControllerError {
             kind,
             submit_boundary,
             controller_kind: request.controller_kind,
-            surface_id: request.surface_id.clone(),
-            source_id: request.source_id.clone(),
+            surface_id: request.surface_id.clone().into_boxed_str(),
+            source_id: request.source_id.clone().into_boxed_str(),
             source_type: request.source_type,
-            source_session_id: request.source_session_id.clone(),
-            provider_event_id_hash: request.provider_event_id_hash.clone(),
-            message: message.into(),
+            source_session_id: request.source_session_id.clone().into_boxed_str(),
+            provider_event_id_hash: request.provider_event_id_hash.clone().into_boxed_str(),
+            message: message.into().into_boxed_str(),
         }
     }
 }
@@ -1220,11 +1225,11 @@ fn resolve_inbound_route<'a>(
         if route.response_surface.is_disabled() {
             continue;
         }
-        if let Some(route_binding_hash) = ready.surface.route_binding_hash.as_deref() {
-            if response_surface_route_binding_hash(route) != route_binding_hash {
-                saw_route_binding_mismatch = true;
-                continue;
-            }
+        if let Some(route_binding_hash) = ready.surface.route_binding_hash.as_deref()
+            && response_surface_route_binding_hash(route) != route_binding_hash
+        {
+            saw_route_binding_mismatch = true;
+            continue;
         }
         if route_has_unverifiable_inbound_filters(route) {
             if ready.surface.route_binding_hash.is_some() {
@@ -1821,8 +1826,10 @@ mod tests {
                 ready.clone(),
                 &provider_reply,
                 test_time() + Duration::seconds(2),
-                Some(available_codex_desktop()),
-                Some(slack_app_capability()),
+                AgentControllerPolicyOverrides {
+                    agent_integration: Some(available_codex_desktop()),
+                    provider_capability: Some(slack_app_capability()),
+                },
             ),
         )
         .await;
@@ -2353,7 +2360,7 @@ mod tests {
             ResponseSurfaceLookupResult::Hit(surface) => surface,
             other => panic!("surface should be hit, got {other:?}"),
         };
-        let ready = ready_for_surface(surface);
+        let ready = ready_for_surface(*surface);
         assert!(matches!(
             ledger
                 .claim_inbound_event_at(
@@ -2389,7 +2396,7 @@ mod tests {
                         ResponseSurfaceLookupResult::Hit(surface) => surface,
                         other => panic!("surface should be hit, got {other:?}"),
                     };
-                let claimed_ready = ready_for_surface(surface);
+                let claimed_ready = ready_for_surface(*surface);
                 assert!(matches!(
                     ledger.claim_inbound_event_at(
                         inbound_event_input(&claimed_ready),

@@ -104,6 +104,18 @@ pub struct ThreadBindingQuery {
     pub provider_thread_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSessionThreadBindingQuery {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub project_path: String,
+    pub source_id: String,
+    pub source_type: String,
+    pub source_session_id: String,
+}
+
 impl BridgeBindingLedger {
     pub fn in_memory() -> Self {
         Self {
@@ -222,6 +234,26 @@ impl BridgeBindingLedger {
             .collect()
     }
 
+    pub fn connected_room_project_bindings_for_provider(
+        &self,
+        provider_id: &str,
+        provider_type: &str,
+    ) -> anyhow::Result<Vec<RoomProjectBindingRecord>> {
+        validate_present("provider_id", provider_id)?;
+        validate_present("provider_type", provider_type)?;
+        Ok(self
+            .state
+            .room_project_bindings
+            .iter()
+            .filter(|record| {
+                record.provider_id == provider_id
+                    && record.provider_type == provider_type
+                    && record.status == RoomProjectBindingStatus::Connected
+            })
+            .cloned()
+            .collect())
+    }
+
     pub fn connected_rooms_for_project(&self, project_path: &str) -> Vec<RoomProjectBindingRecord> {
         self.state
             .room_project_bindings
@@ -294,6 +326,20 @@ impl BridgeBindingLedger {
             .iter()
             .find(|record| thread_binding_matches(record, query))
             .cloned()
+    }
+
+    pub fn lookup_thread_session_for_source_session(
+        &self,
+        query: &SourceSessionThreadBindingQuery,
+    ) -> anyhow::Result<Option<ThreadSessionBindingRecord>> {
+        validate_source_session_thread_binding_query(query)?;
+        Ok(self
+            .state
+            .thread_session_bindings
+            .iter()
+            .rev()
+            .find(|record| source_session_thread_binding_matches(record, query))
+            .cloned())
     }
 }
 
@@ -378,6 +424,21 @@ fn validate_thread_session_binding_input(input: &ThreadSessionBindingInput) -> a
     validate_present("source_session_id", &input.source_session_id)
 }
 
+fn validate_source_session_thread_binding_query(
+    query: &SourceSessionThreadBindingQuery,
+) -> anyhow::Result<()> {
+    validate_provider_binding_parts(
+        &query.provider_id,
+        &query.provider_type,
+        &query.provider_account_id,
+        &query.provider_conversation_id,
+    )?;
+    validate_project_path(&query.project_path)?;
+    validate_present("source_id", &query.source_id)?;
+    validate_present("source_type", &query.source_type)?;
+    validate_present("source_session_id", &query.source_session_id)
+}
+
 fn validate_provider_binding_parts(
     provider_id: &str,
     provider_type: &str,
@@ -437,10 +498,30 @@ fn thread_session_binding_matches(
     record: &ThreadSessionBindingRecord,
     input: &ThreadSessionBindingInput,
 ) -> bool {
-    record.project_path == input.project_path
+    project_paths_share_tree(&record.project_path, &input.project_path)
         && record.source_id == input.source_id
         && record.source_type == input.source_type
         && record.source_session_id == input.source_session_id
+}
+
+fn source_session_thread_binding_matches(
+    record: &ThreadSessionBindingRecord,
+    query: &SourceSessionThreadBindingQuery,
+) -> bool {
+    record.provider_id == query.provider_id
+        && record.provider_type == query.provider_type
+        && record.provider_account_id == query.provider_account_id
+        && record.provider_conversation_id == query.provider_conversation_id
+        && project_paths_share_tree(&record.project_path, &query.project_path)
+        && record.source_id == query.source_id
+        && record.source_type == query.source_type
+        && record.source_session_id == query.source_session_id
+}
+
+fn project_paths_share_tree(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn save_state(path: &Path, state: &BridgeBindingLedgerFile) -> anyhow::Result<()> {
@@ -527,6 +608,52 @@ mod tests {
             .expect("thread binding should still exist");
         assert_eq!(binding.project_path, "/repo/agents-router");
         assert_eq!(binding.source_session_id, "session-1");
+    }
+
+    #[test]
+    fn thread_binding_is_idempotent_for_same_session_inside_project_tree() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let now = test_time();
+        ledger
+            .bind_thread_session_at(
+                thread_session("thread-1", "/repo/agents-router", "session-1"),
+                now,
+            )
+            .expect("thread should bind source session");
+
+        let rebound = ledger
+            .bind_thread_session_at(
+                thread_session("thread-1", "/repo/agents-router/crate", "session-1"),
+                now,
+            )
+            .expect("same source session inside the project tree should be idempotent");
+
+        assert_eq!(rebound.project_path, "/repo/agents-router");
+        assert_eq!(rebound.source_session_id, "session-1");
+        assert_eq!(ledger.state.thread_session_bindings.len(), 1);
+    }
+
+    #[test]
+    fn provider_project_room_status_lists_only_connected_bindings() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let now = test_time();
+        ledger
+            .connect_room_project_at(room_project("room-1", "/repo/agents-router"), now)
+            .expect("room should bind project");
+        ledger
+            .connect_room_project_at(room_project("room-2", "/repo/agent-transport-system"), now)
+            .expect("second room should bind project");
+        ledger
+            .disconnect_room_project_at(room_project("room-2", "/repo/agent-transport-system"), now)
+            .expect("second room should disconnect");
+
+        let bindings = ledger
+            .connected_room_project_bindings_for_provider("lark-personal-agent", "feishu_lark")
+            .expect("provider binding status should load");
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].provider_conversation_id, "room-1");
+        assert_eq!(bindings[0].project_path, "/repo/agents-router");
     }
 
     #[tokio::test]

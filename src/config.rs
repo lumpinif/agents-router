@@ -246,6 +246,8 @@ pub struct RawProviderConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_secret_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_registration_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_token: Option<String>,
@@ -380,8 +382,9 @@ pub struct FeishuLarkAppBotProviderConfig {
     pub domain: FeishuLarkAppDomain,
     pub app_id: String,
     pub app_secret: SecretSource,
-    pub tenant_key: String,
-    pub chat_id: String,
+    pub app_registration_source: Option<String>,
+    pub tenant_key: Option<String>,
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -994,6 +997,7 @@ impl RawProviderConfig {
             app_id: None,
             app_secret: None,
             app_secret_env: None,
+            app_registration_source: None,
             tenant_key: None,
             app_token: None,
             app_token_env: None,
@@ -1248,9 +1252,11 @@ impl RawProviderConfig {
                                 provider_id: self.id.clone(),
                             },
                         )?,
-                        tenant_key: self
-                            .required_exact_string("tenant_key", self.tenant_key.as_deref())?,
-                        chat_id: self.required_exact_string("chat_id", self.chat_id.as_deref())?,
+                        app_registration_source: present_exact_owned(
+                            self.app_registration_source.as_deref(),
+                        ),
+                        tenant_key: present_exact_owned(self.tenant_key.as_deref()),
+                        chat_id: present_exact_owned(self.chat_id.as_deref()),
                     },
                 ))
             }
@@ -1313,6 +1319,7 @@ impl RawProviderConfig {
             self.app_id.as_deref(),
             self.app_secret.as_deref(),
             self.app_secret_env.as_deref(),
+            self.app_registration_source.as_deref(),
             self.tenant_key.as_deref(),
             self.chat_id.as_deref(),
         ]

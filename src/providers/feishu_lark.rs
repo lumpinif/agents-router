@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Local, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::agent_controller::{
     ProviderThreadReplyAdapter, ProviderThreadReplyError, ProviderThreadReplyFuture,
@@ -56,8 +56,8 @@ struct FeishuLarkAppBotRuntime {
     api_base_url: String,
     app_id: String,
     app_secret: String,
-    tenant_key: String,
-    chat_id: String,
+    tenant_key: Option<String>,
+    chat_id: Option<String>,
     computer_name: String,
 }
 
@@ -117,9 +117,35 @@ impl Provider for FeishuLarkProvider {
             FeishuLarkProviderRuntime::CustomBot(_) => None,
             FeishuLarkProviderRuntime::AppBot(runtime) => {
                 let mut runtime = runtime.clone();
-                runtime.chat_id = provider_conversation_id.to_string();
+                runtime.chat_id = Some(provider_conversation_id.to_string());
                 Some(Box::pin(async move {
                     self.send_app_bot(signal, &runtime).await
+                }))
+            }
+        }
+    }
+
+    fn send_to_provider_thread<'a>(
+        &'a self,
+        signal: &'a Signal,
+        provider_account_id: &'a str,
+        provider_conversation_id: &'a str,
+        provider_thread_id: &'a str,
+    ) -> Option<ProviderFuture<'a>> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => None,
+            FeishuLarkProviderRuntime::AppBot(runtime) => {
+                let mut runtime = runtime.clone();
+                runtime.chat_id = Some(provider_conversation_id.to_string());
+                Some(Box::pin(async move {
+                    self.send_app_bot_thread_notification(
+                        signal,
+                        &runtime,
+                        provider_account_id,
+                        provider_conversation_id,
+                        provider_thread_id,
+                    )
+                    .await
                 }))
             }
         }
@@ -250,6 +276,16 @@ impl FeishuLarkProvider {
     ) -> Result<ProviderSendResult, DeliveryError> {
         let provider_type = ProviderType::FeishuLark.as_str();
         let token = self.fetch_tenant_access_token(signal, runtime).await?;
+        let chat_id = runtime.chat_id.as_deref().ok_or_else(|| {
+            DeliveryError::new(
+                DeliveryErrorKind::Config,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` has no default room; add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`, or set `chat_id` in config",
+                    self.id
+                ),
+            )
+        })?;
         let content =
             serde_json::to_string(&FeishuLarkCard::from_signal(signal, &runtime.computer_name))
                 .map_err(|error| {
@@ -264,7 +300,7 @@ impl FeishuLarkProvider {
                     .with_source(error)
                 })?;
         let request = FeishuLarkAppBotSendMessageRequest {
-            receive_id: &runtime.chat_id,
+            receive_id: chat_id,
             msg_type: "interactive",
             content,
         };
@@ -362,7 +398,150 @@ impl FeishuLarkProvider {
             .with_http_status(status_code)
         })?;
         let receipt = app_bot_surface_ready_receipt(signal, &self.id, provider_type, runtime, data)
-            .map_err(|error| error.with_http_status(status_code))?;
+            .map_err(|error| (*error).with_http_status(status_code))?;
+        let provider_message_id = receipt.provider_message_id.clone();
+        let mut result = ProviderSendResult::sent(&self.id, provider_type, signal)
+            .with_http_status(status_code)
+            .with_delivery_receipt(receipt);
+        if let Some(provider_message_id) = provider_message_id {
+            result = result.with_provider_message_id(provider_message_id);
+        }
+
+        Ok(result)
+    }
+
+    async fn send_app_bot_thread_notification(
+        &self,
+        signal: &Signal,
+        runtime: &FeishuLarkAppBotRuntime,
+        provider_account_id: &str,
+        provider_conversation_id: &str,
+        provider_thread_id: &str,
+    ) -> Result<ProviderSendResult, DeliveryError> {
+        let provider_type = ProviderType::FeishuLark.as_str();
+        let token = self.fetch_tenant_access_token(signal, runtime).await?;
+        let card = FeishuLarkCard::from_signal(signal, &runtime.computer_name);
+        let content = serde_json::to_string(&card).map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Internal,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` failed to serialize App Bot thread message content",
+                    self.id
+                ),
+            )
+            .with_source(error)
+        })?;
+        let body = FeishuLarkAppBotReplyMessageRequest {
+            content,
+            msg_type: "interactive",
+            reply_in_thread: true,
+            uuid: thread_notification_uuid(&signal.id, provider_thread_id),
+        };
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{}/reply",
+                runtime.api_base_url, provider_thread_id
+            ))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                let is_timeout = error.is_timeout();
+                provider_request_error(
+                    signal,
+                    &self.id,
+                    provider_type,
+                    "feishu_lark",
+                    is_timeout,
+                    error.without_url(),
+                )
+            })?;
+
+        let status = response.status();
+        let status_code = status.as_u16();
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` failed to read App Bot thread message response",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned HTTP status {} while sending App Bot thread message",
+                    self.id, status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkAppBotReplyMessageResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                DeliveryError::new(
+                    DeliveryErrorKind::ProviderResponse,
+                    DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                    format!(
+                        "feishu_lark provider `{}` returned invalid App Bot thread message response JSON",
+                        self.id
+                    ),
+                )
+                .with_http_status(status_code)
+                .with_source(error)
+            })?;
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned code {} while sending App Bot thread message: {}",
+                    self.id,
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+
+        let data = provider_response.data.ok_or_else(|| {
+            DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` App Bot thread message response did not include message data",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+        })?;
+        let receipt = app_bot_thread_surface_ready_receipt(
+            signal,
+            &self.id,
+            provider_type,
+            provider_account_id,
+            provider_conversation_id,
+            provider_thread_id,
+            data,
+        )
+        .map_err(|error| (*error).with_http_status(status_code))?;
         let provider_message_id = receipt.provider_message_id.clone();
         let mut result = ProviderSendResult::sent(&self.id, provider_type, signal)
             .with_http_status(status_code)
@@ -928,7 +1107,7 @@ fn app_bot_surface_ready_receipt(
     provider_type: &str,
     runtime: &FeishuLarkAppBotRuntime,
     data: FeishuLarkAppBotMessageData,
-) -> Result<ProviderDeliveryReceipt, DeliveryError> {
+) -> Result<ProviderDeliveryReceipt, Box<DeliveryError>> {
     let message_id = required_app_bot_response_field(
         signal,
         provider_id,
@@ -943,7 +1122,11 @@ fn app_bot_surface_ready_receipt(
         "chat_id",
         data.chat_id,
     )?;
-    if chat_id != runtime.chat_id {
+    if runtime
+        .chat_id
+        .as_deref()
+        .is_some_and(|configured_chat_id| configured_chat_id != chat_id)
+    {
         return Err(app_bot_response_error(
             signal,
             provider_id,
@@ -967,7 +1150,11 @@ fn app_bot_surface_ready_receipt(
         "sender.tenant_key",
         sender.tenant_key,
     )?;
-    if tenant_key != runtime.tenant_key {
+    if runtime
+        .tenant_key
+        .as_deref()
+        .is_some_and(|configured_tenant_key| configured_tenant_key != tenant_key)
+    {
         return Err(app_bot_response_error(
             signal,
             provider_id,
@@ -984,13 +1171,53 @@ fn app_bot_surface_ready_receipt(
     ))
 }
 
+fn app_bot_thread_surface_ready_receipt(
+    signal: &Signal,
+    provider_id: &str,
+    provider_type: &str,
+    provider_account_id: &str,
+    provider_conversation_id: &str,
+    provider_thread_id: &str,
+    data: FeishuLarkAppBotReplyMessageData,
+) -> Result<ProviderDeliveryReceipt, Box<DeliveryError>> {
+    let message_id = required_app_bot_response_field(
+        signal,
+        provider_id,
+        provider_type,
+        "message_id",
+        data.message_id,
+    )?;
+    let root_id = required_app_bot_response_field(
+        signal,
+        provider_id,
+        provider_type,
+        "root_id",
+        data.root_id,
+    )?;
+    if root_id != provider_thread_id {
+        return Err(app_bot_response_error(
+            signal,
+            provider_id,
+            provider_type,
+            "App Bot thread message response root_id did not match target thread",
+        ));
+    }
+
+    Ok(ProviderDeliveryReceipt::surface_ready(
+        Some(provider_account_id.to_string()),
+        Some(provider_conversation_id.to_string()),
+        Some(message_id),
+        Some(root_id),
+    ))
+}
+
 fn required_app_bot_response_field(
     signal: &Signal,
     provider_id: &str,
     provider_type: &str,
     field: &'static str,
     value: Option<String>,
-) -> Result<String, DeliveryError> {
+) -> Result<String, Box<DeliveryError>> {
     present_owned(value).ok_or_else(|| {
         app_bot_response_error(
             signal,
@@ -1006,15 +1233,15 @@ fn app_bot_response_error(
     provider_id: &str,
     provider_type: &str,
     message: impl Into<String>,
-) -> DeliveryError {
-    DeliveryError::new(
+) -> Box<DeliveryError> {
+    Box::new(DeliveryError::new(
         DeliveryErrorKind::ProviderResponse,
         DeliveryErrorContext::provider_send(signal, provider_id, provider_type),
         format!(
             "feishu_lark provider `{provider_id}` returned invalid App Bot send response: {}",
             message.into()
         ),
-    )
+    ))
 }
 
 fn validate_app_bot_thread_reply_request(
@@ -1034,7 +1261,11 @@ fn validate_app_bot_thread_reply_request(
             "provider thread reply request provider_type did not match adapter",
         ));
     }
-    if request.provider_account_id != runtime.tenant_key {
+    if runtime
+        .tenant_key
+        .as_deref()
+        .is_some_and(|configured_tenant_key| request.provider_account_id != configured_tenant_key)
+    {
         return Err(thread_reply_error(
             request,
             "provider thread reply request tenant did not match App Bot config",
@@ -1098,6 +1329,19 @@ fn thread_reply_uuid(provider_event_id_hash: &str) -> String {
             &provider_event_id_hash[..index]
         });
     format!("{prefix}{hash_prefix}")
+}
+
+fn thread_notification_uuid(signal_id: &str, provider_thread_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(signal_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(provider_thread_id.as_bytes());
+    let digest = hasher.finalize();
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    thread_reply_uuid(&hash)
 }
 
 fn app_bot_api_base_url(domain: FeishuLarkAppDomain) -> &'static str {

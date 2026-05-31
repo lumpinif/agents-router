@@ -1501,7 +1501,7 @@ mod tests {
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedAfterPossibleSubmit
         );
         assert_eq!(
-            error.message,
+            error.message.as_ref(),
             "Codex App Server turn completed before final answer"
         );
     }

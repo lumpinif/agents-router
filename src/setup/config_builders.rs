@@ -1,4 +1,5 @@
 use super::*;
+use crate::lark_personal_agent_channel;
 
 pub fn build_ntfy_config(
     agent: AgentIntegrationId,
@@ -51,6 +52,35 @@ pub fn build_feishu_lark_app_bot_config(
     )
 }
 
+pub fn build_feishu_lark_personal_agent_config(
+    agent: AgentIntegrationId,
+    answer_detail: AnswerDetail,
+    prompt_detail: PromptDetail,
+    domain: &str,
+    app_id: &str,
+    app_secret: &str,
+) -> RawConfig {
+    let mut config = build_feishu_lark_app_bot_config_with_optional_room(
+        agent,
+        answer_detail,
+        prompt_detail,
+        domain,
+        app_id,
+        FeishuLarkAppBotSecretSource::Inline(app_secret.to_string()),
+        None,
+        None,
+    );
+    if let Some(provider) = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.provider_type == ProviderType::FeishuLark)
+    {
+        provider.app_registration_source =
+            Some(lark_personal_agent_channel::REGISTRATION_SOURCE.to_string());
+    }
+    config
+}
+
 enum FeishuLarkAppBotSecretSource {
     Inline(String),
 }
@@ -66,6 +96,29 @@ fn build_feishu_lark_app_bot_config_with_secret_source(
     tenant_key: &str,
     chat_id: &str,
 ) -> RawConfig {
+    build_feishu_lark_app_bot_config_with_optional_room(
+        agent,
+        answer_detail,
+        prompt_detail,
+        domain,
+        app_id,
+        app_secret_source,
+        Some(tenant_key),
+        Some(chat_id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_feishu_lark_app_bot_config_with_optional_room(
+    agent: AgentIntegrationId,
+    answer_detail: AnswerDetail,
+    prompt_detail: PromptDetail,
+    domain: &str,
+    app_id: &str,
+    app_secret_source: FeishuLarkAppBotSecretSource,
+    tenant_key: Option<&str>,
+    chat_id: Option<&str>,
+) -> RawConfig {
     let mut provider =
         RawProviderConfig::new(ProviderType::FeishuLark.as_str(), ProviderType::FeishuLark);
     provider.mode = Some("app_bot".to_string());
@@ -76,8 +129,8 @@ fn build_feishu_lark_app_bot_config_with_secret_source(
             provider.app_secret = Some(app_secret);
         }
     }
-    provider.tenant_key = Some(tenant_key.to_string());
-    provider.chat_id = Some(chat_id.to_string());
+    provider.tenant_key = tenant_key.map(ToOwned::to_owned);
+    provider.chat_id = chat_id.map(ToOwned::to_owned);
 
     let mut config = build_config(agent, answer_detail, prompt_detail, vec![provider]);
     enable_codex_desktop_reply_route_for_app_bot(&mut config, agent);

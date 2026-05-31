@@ -70,6 +70,7 @@ pub enum ProviderControlSkipReason {
     UnsupportedEnvelopeType,
     UnsupportedEventType,
     NonUserMessage,
+    NotAddressedToBot,
     UnsupportedMessageType,
     EmptyMessageText,
     NotControlCommand,
@@ -84,7 +85,7 @@ pub struct ProviderInboundReady {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderInboundDecision {
-    Ready(ProviderInboundReady),
+    Ready(Box<ProviderInboundReady>),
     Skip(ProviderInboundSkipReason),
 }
 
@@ -95,6 +96,7 @@ pub enum ProviderInboundSkipReason {
     UnsupportedEventType,
     IgnoredMessageSubtype,
     NonUserMessage,
+    NotAddressedToBot,
     NotSurfaceReply,
     UnsupportedMessageType,
     EmptyReplyText,
@@ -192,9 +194,11 @@ pub fn normalize_slack_socket_mode_surface_reply(
 
 pub fn normalize_feishu_lark_long_connection_surface_reply(
     provider_id: &str,
+    bot_open_id: &str,
     raw_event: &[u8],
 ) -> anyhow::Result<ProviderInboundNormalizeResult> {
     ensure_present("provider_id", provider_id)?;
+    ensure_present("bot_open_id", bot_open_id)?;
     let envelope: FeishuLarkEventEnvelope =
         serde_json::from_slice(raw_event).context("failed to parse Feishu/Lark event")?;
 
@@ -256,11 +260,22 @@ pub fn normalize_feishu_lark_long_connection_surface_reply(
     let content = required_trimmed("feishu_lark message.content", message.content.as_deref())?;
     let text_content: FeishuLarkTextContent = serde_json::from_str(content)
         .context("failed to parse Feishu/Lark text message content")?;
-    let Some(reply_text) = normalized_reply_text(text_content.text.as_deref()) else {
+    let Some(raw_reply_text) = normalized_reply_text(text_content.text.as_deref()) else {
         return Ok(ProviderInboundNormalizeResult::Skip(
             ProviderInboundSkipReason::EmptyReplyText,
         ));
     };
+    let Some(reply_text) = addressed_feishu_lark_text(&message, &raw_reply_text, bot_open_id)
+    else {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::NotAddressedToBot,
+        ));
+    };
+    if reply_text.is_empty() {
+        return Ok(ProviderInboundNormalizeResult::Skip(
+            ProviderInboundSkipReason::EmptyReplyText,
+        ));
+    }
 
     Ok(ProviderInboundNormalizeResult::SurfaceReply(
         NormalizedProviderSurfaceReply {
@@ -279,9 +294,11 @@ pub fn normalize_feishu_lark_long_connection_surface_reply(
 
 pub fn normalize_feishu_lark_long_connection_control_command(
     provider_id: &str,
+    bot_open_id: &str,
     raw_event: &[u8],
 ) -> anyhow::Result<ProviderControlNormalizeResult> {
     ensure_present("provider_id", provider_id)?;
+    ensure_present("bot_open_id", bot_open_id)?;
     let envelope: FeishuLarkEventEnvelope =
         serde_json::from_slice(raw_event).context("failed to parse Feishu/Lark event")?;
 
@@ -334,11 +351,21 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     let content = required_trimmed("feishu_lark message.content", message.content.as_deref())?;
     let text_content: FeishuLarkTextContent = serde_json::from_str(content)
         .context("failed to parse Feishu/Lark text message content")?;
-    let Some(text) = normalized_reply_text(text_content.text.as_deref()) else {
+    let Some(raw_text) = normalized_reply_text(text_content.text.as_deref()) else {
         return Ok(ProviderControlNormalizeResult::Skip(
             ProviderControlSkipReason::EmptyMessageText,
         ));
     };
+    let Some(text) = addressed_feishu_lark_text(&message, &raw_text, bot_open_id) else {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::NotAddressedToBot,
+        ));
+    };
+    if text.is_empty() {
+        return Ok(ProviderControlNormalizeResult::Skip(
+            ProviderControlSkipReason::EmptyMessageText,
+        ));
+    }
     let Some(command) = parse_provider_control_command(&text) else {
         return Ok(ProviderControlNormalizeResult::Skip(
             ProviderControlSkipReason::NotControlCommand,
@@ -350,6 +377,12 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     let command = if root_id.is_some() {
         ProviderControlCommand::Invalid {
             message: "Run `/bind` in the room, not inside a thread.".to_string(),
+        }
+    } else if matches!(command, ProviderControlCommand::BindProject { .. })
+        && feishu_lark_message_is_direct_chat(&message)
+    {
+        ProviderControlCommand::Invalid {
+            message: "Use `/bind` in a Lark or Feishu room, not in a direct chat.".to_string(),
         }
     } else {
         command
@@ -472,11 +505,13 @@ pub fn lookup_and_claim_provider_surface_reply(
                 event.hash = %provider_event_id_hash,
                 event = "provider_inbound.event_claim.succeeded",
             );
-            Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
-                reply,
-                surface,
-                provider_event_id_hash,
-            }))
+            Ok(ProviderInboundDecision::Ready(Box::new(
+                ProviderInboundReady {
+                    reply,
+                    surface: *surface,
+                    provider_event_id_hash,
+                },
+            )))
         }
         InboundEventClaimDecision::AlreadyProcessing {
             surface_id,
@@ -581,28 +616,30 @@ pub fn lookup_and_claim_provider_thread_session_reply(
                 event.hash = %provider_event_id_hash,
                 event = "provider_inbound.thread_binding.claim.succeeded",
             );
-            Ok(ProviderInboundDecision::Ready(ProviderInboundReady {
-                reply,
-                surface: ResponseSurfaceLookupRecord {
-                    surface_id,
-                    signal_id: "bridge-thread-binding".to_string(),
-                    delivery_id: "bridge-thread-binding".to_string(),
-                    source_id: binding.source_id,
-                    source_type: binding.source_type,
-                    source_session_id: binding.source_session_id,
-                    source_turn_id: None,
-                    provider_id: binding.provider_id,
-                    provider_type: binding.provider_type,
-                    provider_mode: provider.mode,
-                    provider_account_id: binding.provider_account_id,
-                    provider_conversation_id: binding.provider_conversation_id,
-                    provider_message_id: binding.provider_thread_id.clone(),
-                    provider_thread_id: binding.provider_thread_id,
-                    route_binding_hash: None,
-                    status: ResponseSurfaceStatus::Open,
+            Ok(ProviderInboundDecision::Ready(Box::new(
+                ProviderInboundReady {
+                    reply,
+                    surface: ResponseSurfaceLookupRecord {
+                        surface_id,
+                        signal_id: "bridge-thread-binding".to_string(),
+                        delivery_id: "bridge-thread-binding".to_string(),
+                        source_id: binding.source_id,
+                        source_type: binding.source_type,
+                        source_session_id: binding.source_session_id,
+                        source_turn_id: None,
+                        provider_id: binding.provider_id,
+                        provider_type: binding.provider_type,
+                        provider_mode: provider.mode,
+                        provider_account_id: binding.provider_account_id,
+                        provider_conversation_id: binding.provider_conversation_id,
+                        provider_message_id: binding.provider_thread_id.clone(),
+                        provider_thread_id: binding.provider_thread_id,
+                        route_binding_hash: None,
+                        status: ResponseSurfaceStatus::Open,
+                    },
+                    provider_event_id_hash,
                 },
-                provider_event_id_hash,
-            }))
+            )))
         }
         InboundEventClaimDecision::AlreadyProcessing {
             surface_id,
@@ -750,8 +787,21 @@ struct FeishuLarkEventMessage {
     message_id: Option<String>,
     root_id: Option<String>,
     chat_id: Option<String>,
+    chat_type: Option<String>,
     message_type: Option<String>,
     content: Option<String>,
+    mentions: Option<Vec<FeishuLarkEventMention>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventMention {
+    key: Option<String>,
+    id: Option<FeishuLarkEventMentionId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkEventMentionId {
+    open_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -785,7 +835,6 @@ fn normalized_reply_text(value: Option<&str>) -> Option<String> {
 }
 
 fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> {
-    let text = trim_leading_lark_mentions(text);
     let (command, rest) = split_command(text)?;
     match command {
         "/bind" => {
@@ -801,6 +850,61 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
         }
         _ => None,
     }
+}
+
+fn addressed_feishu_lark_text(
+    message: &FeishuLarkEventMessage,
+    text: &str,
+    bot_open_id: &str,
+) -> Option<String> {
+    if feishu_lark_message_requires_mention(message)
+        && !has_structured_leading_lark_bot_mention(message, text, bot_open_id)
+    {
+        return None;
+    }
+
+    Some(trim_leading_lark_mentions(text).trim().to_string())
+}
+
+fn feishu_lark_message_requires_mention(message: &FeishuLarkEventMessage) -> bool {
+    !feishu_lark_message_is_direct_chat(message)
+}
+
+fn feishu_lark_message_is_direct_chat(message: &FeishuLarkEventMessage) -> bool {
+    optional_field(message.chat_type.as_deref()) == Some("p2p")
+}
+
+fn has_structured_leading_lark_bot_mention(
+    message: &FeishuLarkEventMessage,
+    text: &str,
+    bot_open_id: &str,
+) -> bool {
+    let Some(token) = leading_lark_mention_token(text) else {
+        return false;
+    };
+
+    message
+        .mentions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|mention| {
+            optional_field(mention.key.as_deref()) == Some(token)
+                && mention
+                    .id
+                    .as_ref()
+                    .and_then(|id| optional_field(id.open_id.as_deref()))
+                    == Some(bot_open_id)
+        })
+}
+
+fn leading_lark_mention_token(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    trimmed
+        .strip_prefix('@')
+        .and_then(|after_at| after_at.split_whitespace().next())
+        .filter(|token| !token.is_empty())
+        .map(|token| &trimmed[..1 + token.len()])
 }
 
 fn trim_leading_lark_mentions(mut text: &str) -> &str {
@@ -845,6 +949,8 @@ mod tests {
     use super::*;
     use crate::provider_catalog::{ProviderMode, provider_mode_capability};
     use crate::response_surface_ledger::{InboundEventRecordDecision, NewResponseSurface};
+
+    const TEST_LARK_BOT_OPEN_ID: &str = "ou_test_bot";
 
     #[test]
     fn normalizes_slack_socket_mode_surface_reply_using_thread_ts_as_lookup_key() {
@@ -972,6 +1078,7 @@ mod tests {
     fn normalizes_feishu_lark_surface_reply_using_root_id_as_lookup_key() {
         let normalized = normalize_feishu_lark_long_connection_surface_reply(
             "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
             include_bytes!("../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"),
         )
         .expect("Feishu/Lark event should parse");
@@ -987,7 +1094,7 @@ mod tests {
                 provider_thread_id: "om_root_message_id".to_string(),
                 provider_event_id: "om_reply_message_id".to_string(),
                 provider_reply_message_id: Some("om_reply_message_id".to_string()),
-                reply_text: "@_user_1 continue with README".to_string(),
+                reply_text: "continue with README".to_string(),
             })
         );
     }
@@ -997,6 +1104,7 @@ mod tests {
         let ProviderInboundNormalizeResult::SurfaceReply(reply) =
             normalize_feishu_lark_long_connection_surface_reply(
                 "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
                 include_bytes!("../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"),
             )
             .expect("Feishu/Lark event should parse")
@@ -1025,13 +1133,25 @@ mod tests {
                     "chat_id": "oc_project_room",
                     "chat_type": "group",
                     "message_type": "text",
-                    "content": "{\"text\":\"@_user_1 /bind /Users/felix/Desktop/felix-projects/agents-router\"}"
+                    "content": "{\"text\":\"@_user_1 /bind /Users/felix/Desktop/felix-projects/agents-router\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
                 }
             }
         }"#;
 
-        let normalized = normalize_feishu_lark_long_connection_control_command("lark-app", raw)
-            .expect("Feishu/Lark event should parse");
+        let normalized = normalize_feishu_lark_long_connection_control_command(
+            "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
+            raw,
+        )
+        .expect("Feishu/Lark event should parse");
 
         assert_eq!(
             normalized,
@@ -1074,9 +1194,234 @@ mod tests {
         }"#;
 
         assert_eq!(
-            normalize_feishu_lark_long_connection_surface_reply("lark-app", raw)
-                .expect("Feishu/Lark event should parse"),
+            normalize_feishu_lark_long_connection_surface_reply(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
             ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotSurfaceReply)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_shared_thread_reply_without_mention_is_ignored() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_reply_message_id",
+                    "root_id": "om_root_message_id",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"continue without waking the agent\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_surface_reply(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotAddressedToBot)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_shared_thread_reply_mentioning_another_user_is_ignored() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_reply_message_id",
+                    "root_id": "om_root_message_id",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 continue without waking the agent\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_other_user" },
+                            "name": "Another User",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_surface_reply(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderInboundNormalizeResult::Skip(ProviderInboundSkipReason::NotAddressedToBot)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_dm_reply_does_not_require_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_reply_message_id",
+                    "root_id": "om_root_message_id",
+                    "chat_id": "oc_dm",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"continue without a mention\"}"
+                }
+            }
+        }"#;
+
+        let ProviderInboundNormalizeResult::SurfaceReply(reply) =
+            normalize_feishu_lark_long_connection_surface_reply(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse")
+        else {
+            panic!("p2p reply should normalize without a mention");
+        };
+
+        assert_eq!(reply.reply_text, "continue without a mention");
+    }
+
+    #[test]
+    fn feishu_lark_shared_root_bind_without_mention_is_ignored() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_bind_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/bind /Users/felix/Desktop/felix-projects/agents-router\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotAddressedToBot)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_shared_root_bind_plain_at_without_structured_mention_is_ignored() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_bind_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@AgentsRouter /bind /Users/felix/Desktop/felix-projects/agents-router\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotAddressedToBot)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_direct_chat_bind_reports_room_required() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_bind_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_direct_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/bind /Users/felix/Desktop/felix-projects/agents-router\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_direct_chat".to_string(),
+                provider_thread_id: "om_bind_message_id".to_string(),
+                provider_event_id: "om_bind_message_id".to_string(),
+                command: ProviderControlCommand::Invalid {
+                    message: "Use `/bind` in a Lark or Feishu room, not in a direct chat."
+                        .to_string(),
+                },
+            })
         );
     }
 

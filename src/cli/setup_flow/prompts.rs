@@ -390,7 +390,8 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
 ) -> anyhow::Result<FeishuLarkSetupMode> {
     let effective_default = default.unwrap_or_default();
     let options = [
-        FeishuLarkSetupMode::AppBot,
+        FeishuLarkSetupMode::PersonalAgentApp,
+        FeishuLarkSetupMode::AppBotCredentials,
         FeishuLarkSetupMode::CustomBotWebhook,
     ];
     let default_index = options
@@ -409,7 +410,13 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
         .interact()
         .context("failed to read Feishu/Lark mode")?;
 
-    Ok(options[selection])
+    let selected = options[selection];
+    println!(
+        "{}",
+        feishu_lark_mode_option_description(selected, agent, i18n)
+    );
+
+    Ok(selected)
 }
 
 pub(in crate::cli) fn feishu_lark_mode_option_label(
@@ -419,47 +426,113 @@ pub(in crate::cli) fn feishu_lark_mode_option_label(
     i18n: I18n,
 ) -> String {
     let mut label = match mode {
-        FeishuLarkSetupMode::CustomBotWebhook => localized(
-            i18n,
-            "Custom Bot Webhook — Fallback\n  Send one-way notifications to one group. No replies or project rooms.",
-            "Custom Bot Webhook — 备用\n  单向发送通知到一个群。不支持回复或项目群。",
-        )
-        .to_string(),
-        FeishuLarkSetupMode::AppBot => {
-            if let Some(release_stage) = agent
-                .descriptor()
-                .continuation_capability()
-                .release_stage()
+        FeishuLarkSetupMode::PersonalAgentApp => {
+            if let Some(release_stage) =
+                agent.descriptor().continuation_capability().release_stage()
             {
                 localized_string(
                     i18n,
                     format!(
-                        "App Bot — {}\n  Send notifications through an app bot. Lark thread replies can continue Codex Desktop sessions; validate Feishu before relying on replies.",
+                        "Personal Agent App — {}",
                         continuation_release_stage_label(release_stage, i18n)
                     ),
                     format!(
-                        "App Bot — {}\n  通过应用机器人发送通知。Lark thread 回复可以继续 Codex Desktop session；Feishu 使用前需要在你的 workspace 里验证。",
+                        "Personal Agent App — {}",
                         continuation_release_stage_label(release_stage, i18n)
                     ),
                 )
             } else {
-                localized(
-                    i18n,
-                    "App Bot\n  Send notifications through an app bot. Replies are only available for Codex Desktop when continuation support is available.",
-                    "App Bot\n  通过应用机器人发送通知。只有 Codex Desktop continuation 可用时才支持回复。",
-                )
-                .to_string()
+                "Personal Agent App".to_string()
             }
         }
+        FeishuLarkSetupMode::AppBotCredentials => {
+            if let Some(release_stage) =
+                agent.descriptor().continuation_capability().release_stage()
+            {
+                localized_string(
+                    i18n,
+                    format!(
+                        "Existing App Bot Credentials — {}",
+                        continuation_release_stage_label(release_stage, i18n)
+                    ),
+                    format!(
+                        "Existing App Bot Credentials — {}",
+                        continuation_release_stage_label(release_stage, i18n)
+                    ),
+                )
+            } else {
+                "Existing App Bot Credentials".to_string()
+            }
+        }
+        FeishuLarkSetupMode::CustomBotWebhook => localized(
+            i18n,
+            "Custom Bot Webhook — Fallback",
+            "Custom Bot Webhook — 备用",
+        )
+        .to_string(),
     };
 
     if Some(mode) == default {
         label.push_str(&format!(" ({})", i18n.text(Text::CurrentSuffix)));
-    } else if default.is_none() && mode == FeishuLarkSetupMode::AppBot {
+    } else if default.is_none() && mode == FeishuLarkSetupMode::PersonalAgentApp {
         label.push_str(&format!(" ({})", i18n.text(Text::RecommendedSuffix)));
     }
 
     label
+}
+
+pub(in crate::cli) fn feishu_lark_mode_option_description(
+    mode: FeishuLarkSetupMode,
+    agent: setup::AgentIntegrationId,
+    i18n: I18n,
+) -> &'static str {
+    match mode {
+        FeishuLarkSetupMode::PersonalAgentApp => {
+            if agent
+                .descriptor()
+                .continuation_capability()
+                .release_stage()
+                .is_some()
+            {
+                localized(
+                    i18n,
+                    "Scan a QR code, add the agent to Lark rooms, then mention it and send `/bind` to connect project rooms. One Codex thread maps to one Lark thread.",
+                    "扫码创建 agent，把它拉进 Lark 群，然后 @ 它并发送 `/bind` 连接项目群。一个 Codex thread 对应一个 Lark thread。",
+                )
+            } else {
+                localized(
+                    i18n,
+                    "Scan a QR code, add the agent to rooms, then mention it and send `/bind` to connect project rooms.",
+                    "扫码创建 agent，把它拉进群，然后 @ 它并发送 `/bind` 连接项目群。",
+                )
+            }
+        }
+        FeishuLarkSetupMode::AppBotCredentials => {
+            if agent
+                .descriptor()
+                .continuation_capability()
+                .release_stage()
+                .is_some()
+            {
+                localized(
+                    i18n,
+                    "Use an existing self-built app and a default room Chat ID. Lark thread replies can continue Codex Desktop sessions.",
+                    "使用已有自建应用和默认群 Chat ID。Lark thread 回复可以继续 Codex Desktop session。",
+                )
+            } else {
+                localized(
+                    i18n,
+                    "Use an existing self-built app and a default room Chat ID.",
+                    "使用已有自建应用和默认群 Chat ID。",
+                )
+            }
+        }
+        FeishuLarkSetupMode::CustomBotWebhook => localized(
+            i18n,
+            "Send one-way notifications to one group. No replies or project rooms.",
+            "单向发送通知到一个群。不支持回复或项目群。",
+        ),
+    }
 }
 
 fn continuation_release_stage_label(
@@ -472,6 +545,118 @@ fn continuation_release_stage_label(
         (ContinuationReleaseStage::Stable, CliLanguage::English) => "Stable",
         (ContinuationReleaseStage::Stable, CliLanguage::SimplifiedChinese) => "稳定",
     }
+}
+
+pub(in crate::cli) async fn run_lark_personal_agent_qr_registration(
+    i18n: I18n,
+) -> anyhow::Result<setup::LarkPersonalAgentRegistrationResult> {
+    let mut domain = FeishuLarkAppDomain::Feishu;
+    let begin = setup::begin_lark_personal_agent_registration(domain).await?;
+    print_lark_personal_agent_qr_code(&begin.verification_url, begin.expires_in, i18n)?;
+
+    let deadline = Instant::now() + begin.expires_in;
+    let mut interval = begin.poll_interval;
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Lark Personal Agent QR code expired before setup completed");
+        }
+
+        sleep(interval).await;
+        match setup::poll_lark_personal_agent_registration(domain, &begin.device_code).await? {
+            setup::LarkPersonalAgentRegistrationPoll::Pending => {}
+            setup::LarkPersonalAgentRegistrationPoll::SlowDown => {
+                interval += Duration::from_secs(5);
+                println!(
+                    "{}",
+                    localized(
+                        i18n,
+                        "Lark asked us to slow down polling. Waiting a little longer...",
+                        "Lark 要求降低轮询频率，稍等一下..."
+                    )
+                );
+            }
+            setup::LarkPersonalAgentRegistrationPoll::DomainSwitched => {
+                domain = FeishuLarkAppDomain::Lark;
+                println!(
+                    "{}",
+                    localized(
+                        i18n,
+                        "Detected a Lark tenant. Switching registration polling to larksuite.com.",
+                        "识别到 Lark 租户，已切换到 larksuite.com 继续轮询。"
+                    )
+                );
+            }
+            setup::LarkPersonalAgentRegistrationPoll::Complete(result) => {
+                println!();
+                println!(
+                    "{}",
+                    style(localized(
+                        i18n,
+                        "Personal Agent app created.",
+                        "Personal Agent app 创建成功。"
+                    ))
+                    .green()
+                );
+                println!("  App ID: {}", result.app_id);
+                println!("  Domain: {}", result.domain.as_str());
+                if let Some(operator_open_id) = result.operator_open_id.as_deref() {
+                    println!("  Admin: {operator_open_id}");
+                }
+                println!();
+                return Ok(result);
+            }
+        }
+    }
+}
+
+fn print_lark_personal_agent_qr_code(
+    qr_content: &str,
+    expires_in: Duration,
+    i18n: I18n,
+) -> anyhow::Result<()> {
+    println!();
+    println!(
+        "{}",
+        localized(
+            i18n,
+            "Scan this QR code with Lark or Feishu:",
+            "用 Lark 或飞书扫描这个二维码："
+        )
+    );
+    let code = QrCode::new(qr_content.as_bytes())
+        .context("failed to render Lark Personal Agent QR code")?;
+    let image = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
+    println!("{image}");
+    println!("URL: {qr_content}");
+    println!(
+        "{}",
+        localized(
+            i18n,
+            "Keep this terminal open after scanning; setup continues when the app is created.",
+            "扫码后请保持这个终端打开；app 创建成功后 setup 会继续。"
+        )
+    );
+    println!(
+        "{}",
+        localized_string(
+            i18n,
+            format!(
+                "QR code expires in about {} minute{}.",
+                expires_in.as_secs().div_ceil(60),
+                if expires_in.as_secs().div_ceil(60) == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            format!(
+                "二维码有效期约 {} 分钟。",
+                expires_in.as_secs().div_ceil(60)
+            ),
+        )
+    );
+    println!();
+    Ok(())
 }
 
 pub(in crate::cli) fn prompt_for_feishu_lark_app_domain(

@@ -309,20 +309,34 @@ pub(in crate::cli) fn plain_summary_field(
 fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProviderSummary {
     if provider.mode.as_deref() == Some("app_bot") {
         return SetupProviderSummary {
-            provider_name: "Feishu/Lark app bot",
-            fields: vec![
-                plain_summary_field("domain", required_summary_string(provider, "domain")),
-                plain_summary_field("app id", required_summary_string(provider, "app_id")),
-                configured_or_not_summary_field(
-                    "app secret",
-                    provider_secret_configured(&provider.app_secret, &provider.app_secret_env),
-                ),
-                plain_summary_field(
-                    "tenant key",
-                    required_summary_string(provider, "tenant_key"),
-                ),
-                plain_summary_field("chat id", required_summary_string(provider, "chat_id")),
-            ],
+            provider_name: feishu_lark_app_provider_summary_name(provider),
+            fields: {
+                let mut fields = vec![
+                    plain_summary_field("domain", required_summary_string(provider, "domain")),
+                    plain_summary_field("app id", required_summary_string(provider, "app_id")),
+                    configured_or_not_summary_field(
+                        "app secret",
+                        provider_secret_configured(&provider.app_secret, &provider.app_secret_env),
+                    ),
+                ];
+                fields.push(match present_summary_str(provider.chat_id.as_deref()) {
+                    Some(chat_id) => plain_summary_field("default room", chat_id.to_string()),
+                    None => plain_summary_field(
+                        "default room",
+                        "project rooms only; mention the agent and send `/bind` in Lark"
+                            .to_string(),
+                    ),
+                });
+                if present_summary_str(provider.chat_id.as_deref()).is_none() {
+                    fields.push(personal_agent_room_events_summary_field(
+                        provider.app_registration_source.as_deref(),
+                    ));
+                }
+                if let Some(tenant_key) = present_summary_str(provider.tenant_key.as_deref()) {
+                    fields.push(plain_summary_field("tenant key", tenant_key.to_string()));
+                }
+                fields
+            },
         };
     }
 
@@ -335,6 +349,40 @@ fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProv
                 provider_secret_configured(&provider.secret, &provider.secret_env),
             ),
         ],
+    }
+}
+
+fn personal_agent_room_events_summary_field(source: Option<&str>) -> SetupProviderSummaryField {
+    match lark_personal_agent_channel::registration_source_status(source) {
+        lark_personal_agent_channel::RegistrationSourceStatus::Current => {
+            SetupProviderSummaryField {
+                label: "room events",
+                value: "configured".to_string(),
+                tone: SetupProviderSummaryTone::Success,
+            }
+        }
+        lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
+            SetupProviderSummaryField {
+                label: "room events",
+                value: "configured; run a room smoke to verify `/bind`".to_string(),
+                tone: SetupProviderSummaryTone::Warning,
+            }
+        }
+        lark_personal_agent_channel::RegistrationSourceStatus::Mismatch => {
+            SetupProviderSummaryField {
+                label: "room events",
+                value: "configured; source marker differs from this build".to_string(),
+                tone: SetupProviderSummaryTone::Warning,
+            }
+        }
+    }
+}
+
+fn feishu_lark_app_provider_summary_name(provider: &RawProviderConfig) -> &'static str {
+    if present_summary_str(provider.chat_id.as_deref()).is_some() {
+        "Feishu/Lark App Bot"
+    } else {
+        "Feishu/Lark Personal Agent"
     }
 }
 

@@ -1,7 +1,7 @@
 # agents-router
 
 两三分钟就能 setup 好本地 coding agent 通知。
-然后你就可以在 Slack、Discord、Telegram、Microsoft Teams、Email、ntfy、Pushover、飞书、Lark、Webhook、WhatsApp 或微信里收到本地 coding agents 的完成消息。Lark App Bot 下的 Codex Desktop thread reply 是 Experimental 路径。
+然后你就可以在 Slack、Discord、Telegram、Microsoft Teams、Email、ntfy、Pushover、飞书、Lark、Webhook、WhatsApp 或微信里收到本地 coding agents 的完成消息。Feishu/Lark Personal Agent 还可以把项目群变成 Codex Desktop 的双向控制面；thread replies 是 Experimental 路径。
 
 ---
 
@@ -49,8 +49,8 @@ Providers（你想在哪里收到通知？）：
 - [Email SMTP](https://www.rfc-editor.org/rfc/rfc6409)
 - [ntfy](https://ntfy.sh/)
 - [Pushover](https://pushover.net/api)
-- Feishu/Lark Custom Bot（[飞书](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot) / [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot)）
-- Feishu/Lark App Bot；Lark replies 实验性（[指南](providers/feishu-lark-app-bot.md)）
+- Feishu/Lark Personal Agent；QR setup、project rooms、Codex Desktop thread replies 实验性（[指南](providers/feishu-lark-app-bot.md)）
+- Feishu/Lark Custom Bot fallback（[飞书](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot) / [Lark](https://open.larksuite.com/document/client-docs/bot-v3/add-custom-bot)）
 - Webhook
 - [WhatsApp](https://developers.facebook.com/docs/whatsapp)
 - 微信（个人微信 iLink）
@@ -134,17 +134,18 @@ agents-router setup
 
 先选择 CLI 语言。默认是英文，也可以选择简体中文。
 
-然后回答 3 个问题：
+然后回答几个问题：
 
 1. 要监听哪个 agent？
 2. 通知要发到哪里？
 3. 哪些完成的任务需要发送通知？
+4. 如果选择 Feishu/Lark，要使用哪种模式？
 
-然后它会写入配置、启动 service，并发送一条测试通知。
+然后它会写入配置并启动 service。带固定目标群的 provider 会发送一条测试通知。Feishu/Lark Personal Agent 使用项目群：setup 会显示 QR code，扫码创建 Personal Agent 后，把它拉进群，@ 它并发送 `/bind /absolute/project/path`。
 
 Answer detail、是否包含 prompt、高级项目过滤等设置见 [Setup](setup.zh-CN.md)。
 
-最快、最稳定的一次性通知路径仍然是 Feishu/Lark Custom Bot。需要 Codex Desktop thread reply 时，选择 Lark App Bot Experimental 路径。Feishu App Bot 使用相同配置形态，但在依赖 replies 前应该先在自己的 workspace 做验证。
+需要 Feishu/Lark 双向 project room 体验时，默认选择 Personal Agent App。只需要单向通知时，再选择 Feishu/Lark Custom Bot。
 
 ## 🎉 就这样
 
@@ -165,8 +166,8 @@ Provider 设置教程：
 - [Email SMTP](providers/email-smtp.zh-CN.md)
 - [ntfy](providers/ntfy.zh-CN.md)
 - [Pushover](providers/pushover.zh-CN.md)
+- [飞书/Lark Personal Agent](providers/feishu-lark-app-bot.md)
 - [飞书/Lark Custom Bot](providers/feishu-lark-custom-bot.zh-CN.md)
-- [飞书/Lark App Bot；Lark replies 实验性](providers/feishu-lark-app-bot.md)
 - [Webhook](providers/webhook.zh-CN.md)
 - [WhatsApp](providers/whatsapp.zh-CN.md)
 - [微信](providers/wechat.zh-CN.md)

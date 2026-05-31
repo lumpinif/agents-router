@@ -26,7 +26,19 @@
       "chat_id": "oc_5ce6d572455d361153b7xx51da133945",
       "chat_type": "group",
       "message_type": "text",
-      "content": "{\"text\":\"continue with README\"}"
+      "content": "{\"text\":\"@_user_1 continue with README\"}",
+      "mentions": [
+        {
+          "key": "@_user_1",
+          "id": {
+            "union_id": "on_8ed6aa67826108097d9ee143816345",
+            "user_id": "e33ggbyz",
+            "open_id": "ou_test_bot"
+          },
+          "name": "Agents Router",
+          "tenant_key": "2ca1d211f64f6438"
+        }
+      ]
     }
   }
 }

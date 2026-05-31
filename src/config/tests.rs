@@ -1107,13 +1107,56 @@ providers = ["work_lark_app"]
                 domain: FeishuLarkAppDomain::Lark,
                 app_id,
                 app_secret: SecretSource::Env(app_secret_env),
+                app_registration_source: None,
                 tenant_key,
                 chat_id,
             }
         )) if app_id == "cli_9f5343c580712544"
             && app_secret_env == "AGENTS_ROUTER_LARK_APP_SECRET"
-            && tenant_key == "2ca1d211f64f6438"
-            && chat_id == "oc_5ce6d572455d361153b7xx51da133945"
+            && tenant_key.as_deref() == Some("2ca1d211f64f6438")
+            && chat_id.as_deref() == Some("oc_5ce6d572455d361153b7xx51da133945")
+    ));
+}
+
+#[test]
+fn parses_feishu_lark_personal_agent_app_without_default_room() {
+    let raw = r#"
+schema_version = 1
+
+[[sources]]
+id = "codex_desktop"
+type = "codex_desktop"
+
+[[providers]]
+id = "work_lark_app"
+type = "feishu_lark"
+mode = "app_bot"
+domain = "lark"
+app_id = "cli_9f5343c580712544"
+app_secret = "test-secret"
+app_registration_source = "agents-router"
+
+[[routes]]
+sources = ["codex_desktop"]
+providers = ["work_lark_app"]
+"#;
+
+    let config = ValidatedConfig::from_toml_str(raw).expect("Personal Agent config should parse");
+    let provider = config
+        .provider("work_lark_app")
+        .expect("validated provider should exist");
+
+    assert!(matches!(
+        &provider.detail,
+        ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(
+            FeishuLarkAppBotProviderConfig {
+                domain: FeishuLarkAppDomain::Lark,
+                app_registration_source: Some(source),
+                tenant_key: None,
+                chat_id: None,
+                ..
+            }
+        )) if source == "agents-router"
     ));
 }
 

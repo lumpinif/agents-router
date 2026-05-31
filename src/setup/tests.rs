@@ -257,6 +257,37 @@ fn writes_parseable_feishu_lark_app_bot_config_with_codex_reply_route() {
 }
 
 #[test]
+fn writes_parseable_feishu_lark_personal_agent_config_without_default_room() {
+    let dir = tempdir().expect("tempdir should be created");
+    let path = dir.path().join("config.toml");
+    let config = build_feishu_lark_personal_agent_config(
+        AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "test-app-secret",
+    );
+
+    write_config(&path, &config).expect("config should be written");
+
+    let parsed = read_valid_written_config(&path);
+    let provider = parsed
+        .provider("feishu_lark")
+        .expect("Personal Agent provider should be configured");
+    assert_eq!(provider.mode.as_deref(), Some("app_bot"));
+    assert_eq!(provider.domain.as_deref(), Some("lark"));
+    assert_eq!(provider.app_id.as_deref(), Some("cli_9f5343c580712544"));
+    assert_eq!(provider.app_secret.as_deref(), Some("test-app-secret"));
+    assert!(provider.tenant_key.is_none());
+    assert!(provider.chat_id.is_none());
+    assert_eq!(parsed.routes[0].sources, vec!["codex_desktop".to_string()]);
+    assert!(parsed.routes[0].response_surface.enabled);
+    assert_eq!(parsed.routes[1].sources, vec!["agents_router".to_string()]);
+    assert!(!parsed.routes[1].response_surface.enabled);
+}
+
+#[test]
 fn feishu_lark_app_bot_replies_are_not_enabled_for_non_codex_desktop_agents() {
     let config = build_feishu_lark_app_bot_config(
         AgentIntegrationId::ClaudeCode,

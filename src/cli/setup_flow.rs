@@ -75,9 +75,10 @@ pub(super) enum GuidedSetup {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum FeishuLarkSetupMode {
-    CustomBotWebhook,
     #[default]
-    AppBot,
+    PersonalAgentApp,
+    AppBotCredentials,
+    CustomBotWebhook,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,7 +254,8 @@ impl SetupDefaults {
 
 fn feishu_lark_setup_mode_from_raw_provider(provider: &RawProviderConfig) -> FeishuLarkSetupMode {
     match provider.mode.as_deref() {
-        Some("app_bot") => FeishuLarkSetupMode::AppBot,
+        Some("app_bot") if provider.chat_id.is_some() => FeishuLarkSetupMode::AppBotCredentials,
+        Some("app_bot") => FeishuLarkSetupMode::PersonalAgentApp,
         _ => FeishuLarkSetupMode::CustomBotWebhook,
     }
 }
@@ -556,7 +558,7 @@ pub(super) async fn run_guided_provider_setup(
 
     match provider {
         ProviderType::Ntfy => run_ntfy_setup(context),
-        ProviderType::FeishuLark => run_feishu_lark_setup(context),
+        ProviderType::FeishuLark => run_feishu_lark_setup(context).await,
         ProviderType::Webhook => run_webhook_setup(context),
         ProviderType::Pushover => run_pushover_setup(context),
         ProviderType::Slack => run_slack_setup(context),
@@ -857,7 +859,7 @@ pub(super) fn run_ntfy_setup(context: ProviderSetupContext<'_>) -> anyhow::Resul
     loaded_config(config, Some(GuidedSetup::Ntfy { agent, topic }))
 }
 
-pub(super) fn run_feishu_lark_setup(
+pub(super) async fn run_feishu_lark_setup(
     context: ProviderSetupContext<'_>,
 ) -> anyhow::Result<LoadedConfig> {
     let ProviderSetupContext {
@@ -872,7 +874,32 @@ pub(super) fn run_feishu_lark_setup(
     } = context;
     println!();
     let feishu_lark_mode = prompt_for_feishu_lark_mode(agent, defaults.feishu_lark_mode, i18n)?;
+    let route_filters = feishu_lark_route_filters_for_mode(feishu_lark_mode, route_filters);
     let mut config = match feishu_lark_mode {
+        FeishuLarkSetupMode::PersonalAgentApp => {
+            if let Some(existing) = existing_personal_agent_credentials(defaults) {
+                print_existing_personal_agent_reuse_notice(i18n);
+                setup::build_feishu_lark_personal_agent_config(
+                    agent,
+                    answer_detail,
+                    prompt_detail,
+                    existing.domain,
+                    existing.app_id,
+                    existing.app_secret,
+                )
+            } else {
+                print_feishu_lark_personal_agent_setup_intro(i18n);
+                let registration = run_lark_personal_agent_qr_registration(i18n).await?;
+                setup::build_feishu_lark_personal_agent_config(
+                    agent,
+                    answer_detail,
+                    prompt_detail,
+                    registration.domain.as_str(),
+                    &registration.app_id,
+                    &registration.app_secret,
+                )
+            }
+        }
         FeishuLarkSetupMode::CustomBotWebhook => {
             println!();
             println!("{}", i18n.text(Text::FeishuLarkIntro1));
@@ -894,7 +921,7 @@ pub(super) fn run_feishu_lark_setup(
                 secret,
             )
         }
-        FeishuLarkSetupMode::AppBot => {
+        FeishuLarkSetupMode::AppBotCredentials => {
             print_feishu_lark_app_bot_setup_checklist(i18n);
             let domain = prompt_for_feishu_lark_app_domain(
                 defaults.feishu_lark_app_domain.as_deref(),
@@ -943,7 +970,7 @@ pub(super) fn run_feishu_lark_setup(
         &mut config,
         i18n.language(),
         agent,
-        route_filters,
+        &route_filters,
     )?;
 
     println!();
@@ -953,7 +980,7 @@ pub(super) fn run_feishu_lark_setup(
         agent,
         answer_detail,
         prompt_detail,
-        route_filters,
+        &route_filters,
         i18n,
     );
     print_setup_provider_summary(&config, i18n);
@@ -965,6 +992,93 @@ pub(super) fn run_feishu_lark_setup(
             mode: feishu_lark_mode,
         }),
     )
+}
+
+pub(super) fn feishu_lark_route_filters_for_mode(
+    mode: FeishuLarkSetupMode,
+    route_filters: &SetupRouteFilters,
+) -> SetupRouteFilters {
+    let mut route_filters = route_filters.clone();
+    if mode == FeishuLarkSetupMode::PersonalAgentApp {
+        route_filters.only_forward_from_project_paths.clear();
+    }
+    route_filters
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExistingPersonalAgentCredentials<'a> {
+    pub(super) domain: &'a str,
+    pub(super) app_id: &'a str,
+    pub(super) app_secret: &'a str,
+}
+
+pub(super) fn existing_personal_agent_credentials(
+    defaults: &SetupDefaults,
+) -> Option<ExistingPersonalAgentCredentials<'_>> {
+    if defaults.feishu_lark_mode != Some(FeishuLarkSetupMode::PersonalAgentApp)
+        || defaults.feishu_lark_chat_id.is_some()
+    {
+        return None;
+    }
+
+    Some(ExistingPersonalAgentCredentials {
+        domain: defaults.feishu_lark_app_domain.as_deref()?,
+        app_id: defaults.feishu_lark_app_id.as_deref()?,
+        app_secret: defaults.feishu_lark_app_secret.as_deref()?,
+    })
+}
+
+fn print_existing_personal_agent_reuse_notice(i18n: I18n) {
+    println!();
+    match i18n.language() {
+        CliLanguage::English => {
+            println!("Personal Agent setup:");
+            println!("- Reusing the Personal Agent app already saved in this config.");
+            println!(
+                "- After setup, add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
+            );
+        }
+        CliLanguage::SimplifiedChinese => {
+            println!("Personal Agent setup:");
+            println!("- 复用当前 config 里已经保存的 Personal Agent app。");
+            println!(
+                "- setup 结束后，把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
+            );
+        }
+    }
+}
+
+fn print_feishu_lark_personal_agent_setup_intro(i18n: I18n) {
+    println!();
+    match i18n.language() {
+        CliLanguage::English => {
+            println!("Personal Agent setup:");
+            println!("- Agents Router will show a QR code in this terminal.");
+            println!(
+                "- Scan it with Lark or Feishu, then finish creating the Personal Agent app on the page that opens."
+            );
+            println!("- Keep this terminal open; setup continues automatically after creation.");
+            println!(
+                "- After setup, add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
+            );
+            println!(
+                "- New Codex Desktop updates from that project will land in that room, with one Lark thread per Codex thread."
+            );
+        }
+        CliLanguage::SimplifiedChinese => {
+            println!("Personal Agent setup:");
+            println!("- Agents Router 会在这个终端显示二维码。");
+            println!("- 用 Lark 或飞书扫码，然后在打开的页面里完成 Personal Agent app 创建。");
+            println!("- 保持这个终端打开；创建成功后 setup 会自动继续。");
+            println!(
+                "- setup 结束后，把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
+            );
+            println!(
+                "- 之后这个项目的新 Codex Desktop 更新会进入这个群，一个 Codex thread 对应一个 Lark thread。"
+            );
+        }
+    }
+    println!();
 }
 
 fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {

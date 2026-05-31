@@ -29,8 +29,8 @@ use crate::provider_inbound::{
     normalize_feishu_lark_long_connection_surface_reply,
 };
 use crate::providers::feishu_lark_long_connection::{
-    FeishuLarkLongConnectionDecision, FeishuLarkLongConnectionEvent,
-    FeishuLarkLongConnectionRuntime,
+    FeishuLarkLongConnectionBotIdentity, FeishuLarkLongConnectionDecision,
+    FeishuLarkLongConnectionEvent, FeishuLarkLongConnectionRuntime,
 };
 use crate::response_surface_ledger::{
     InboundEventClaimDecision, InboundEventDedupInput, InboundEventRecordDecision,
@@ -41,6 +41,8 @@ use crate::signal::{
     SignalAnswer, SignalAnswerKind, SignalConversation, SignalLifecycle, SignalLifecycleStatus,
     SignalLink, SignalWorkspace,
 };
+
+const TEST_LARK_BOT_OPEN_ID: &str = "ou_test_bot";
 
 #[test]
 fn rejects_invalid_webhook_url_from_env() {
@@ -257,6 +259,102 @@ async fn app_bot_can_send_to_bound_project_room() {
 }
 
 #[tokio::test]
+async fn app_bot_sends_project_update_to_existing_thread() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/open-apis/im/v1/messages/om_existing_root_message/reply",
+        ))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_project_update_reply",
+                "root_id": "om_existing_root_message",
+                "parent_id": "om_existing_root_message",
+                "thread_id": "omt_project_thread",
+                "msg_type": "interactive"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send_to_provider_thread(
+            &test_signal(),
+            "2ca1d211f64f6438",
+            "oc_project_room",
+            "om_existing_root_message",
+        )
+        .expect("App Bot should support bound thread delivery")
+        .await
+        .expect("bound thread send should succeed");
+
+    let receipt = result
+        .delivery_receipt
+        .expect("thread delivery should return a surface-ready receipt");
+    assert_eq!(
+        receipt.provider_account_id.as_deref(),
+        Some("2ca1d211f64f6438")
+    );
+    assert_eq!(
+        receipt.provider_conversation_id.as_deref(),
+        Some("oc_project_room")
+    );
+    assert_eq!(
+        receipt.provider_message_id.as_deref(),
+        Some("om_project_update_reply")
+    );
+    assert_eq!(
+        receipt.provider_thread_id.as_deref(),
+        Some("om_existing_root_message")
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let reply_request = requests
+        .iter()
+        .find(|request| {
+            request.url.path() == "/open-apis/im/v1/messages/om_existing_root_message/reply"
+        })
+        .expect("thread notification request should be recorded");
+    let body: serde_json::Value = reply_request
+        .body_json()
+        .expect("thread notification body should be JSON");
+    assert_eq!(body["reply_in_thread"], true);
+    assert_eq!(body["msg_type"], "interactive");
+    let content: serde_json::Value = serde_json::from_str(
+        body["content"]
+            .as_str()
+            .expect("interactive content should be a JSON string"),
+    )
+    .expect("interactive content should be valid JSON");
+    assert_eq!(content["config"]["wide_screen_mode"], true);
+}
+
+#[tokio::test]
 async fn app_bot_outbound_message_id_matches_inbound_reply_root_lookup_key() {
     let server = MockServer::start().await;
     let send_response: serde_json::Value = serde_json::from_str(include_str!(
@@ -290,6 +388,7 @@ async fn app_bot_outbound_message_id_matches_inbound_reply_root_lookup_key() {
     let ProviderInboundNormalizeResult::SurfaceReply(inbound_reply) =
         normalize_feishu_lark_long_connection_surface_reply(
             "work_chat",
+            TEST_LARK_BOT_OPEN_ID,
             include_bytes!(
                 "../../../tests/fixtures/provider_inbound/feishu_lark_app_bot_reply_to_sent_message.json"
             ),
@@ -408,6 +507,65 @@ async fn app_bot_sends_agent_result_text_to_same_root_thread() {
 }
 
 #[tokio::test]
+async fn personal_agent_without_default_room_can_reply_to_bound_thread() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "text",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_control_reply_message_id",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "text"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_personal_agent_provider(server.uri());
+    let result = provider
+        .send_thread_reply(thread_reply_request(
+            "Connected this room to:\n/Users/felix/Desktop/felix-projects/agents-router",
+        ))
+        .await
+        .expect("Personal Agent should reply to the inbound command thread without a default room");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_control_reply_message_id")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    assert!(requests.iter().any(|request| {
+        request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply"
+    }));
+}
+
+#[tokio::test]
 async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_processed() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -452,7 +610,8 @@ async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_proces
         .expect("surface should be created");
     let long_connection =
         FeishuLarkLongConnectionRuntime::from_provider_config(&lark_hidden_e2e_provider_config())
-            .expect("hidden App Bot long connection runtime should build");
+            .expect("hidden App Bot long connection runtime should build")
+            .with_bot_identity(test_lark_bot_identity());
     let provider = test_app_bot_provider(server.uri());
     let controller = RecordingCodexController::with_result("Codex final answer, unchanged.");
     let controller_runtime = AgentControllerRuntime::new(vec![&controller]);
@@ -468,16 +627,16 @@ async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_proces
             },
         )
         .expect("Lark reply should normalize, lookup, and claim");
-    let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = claim_decision else {
+    let FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) = claim_decision else {
         panic!("surface reply should be ready after local claim");
     };
-    assert_eq!(ready.reply.reply_text, "@_user_1 continue with README");
+    assert_eq!(ready.reply.reply_text, "continue with README");
 
     let decision = long_connection
         .continue_claimed_event_hidden_with_test_policy_facts(
             &lark_hidden_e2e_config(),
             &mut ledger,
-            ready.clone(),
+            *ready.clone(),
             &controller_runtime,
             &provider,
             now + Duration::seconds(2),
@@ -506,10 +665,7 @@ async fn hidden_lark_long_connection_closed_loop_replies_result_and_marks_proces
     let controller_requests = controller.requests();
     assert_eq!(controller_requests.len(), 1);
     assert_eq!(controller_requests[0].source_session_id, "session-1");
-    assert_eq!(
-        controller_requests[0].reply_text,
-        "@_user_1 continue with README"
-    );
+    assert_eq!(controller_requests[0].reply_text, "continue with README");
 
     let requests = server
         .received_requests()
@@ -548,7 +704,8 @@ async fn hidden_lark_closed_loop_still_skips_planned_codex_catalog() {
         .expect("surface should be created");
     let long_connection =
         FeishuLarkLongConnectionRuntime::from_provider_config(&lark_hidden_e2e_provider_config())
-            .expect("hidden App Bot long connection runtime should build");
+            .expect("hidden App Bot long connection runtime should build")
+            .with_bot_identity(test_lark_bot_identity());
     let provider = test_app_bot_provider("http://127.0.0.1:1".to_string());
     let controller = RecordingCodexController::with_result("should not run");
     let controller_runtime = AgentControllerRuntime::new(vec![&controller]);
@@ -564,7 +721,7 @@ async fn hidden_lark_closed_loop_still_skips_planned_codex_catalog() {
             },
         )
         .expect("Lark reply should normalize, lookup, and claim");
-    let FeishuLarkLongConnectionDecision::AckReadyAfterLocalClaim(ready) = claim_decision else {
+    let FeishuLarkLongConnectionDecision::ReadyAfterLocalClaim(ready) = claim_decision else {
         panic!("surface reply should be ready after local claim");
     };
 
@@ -572,7 +729,7 @@ async fn hidden_lark_closed_loop_still_skips_planned_codex_catalog() {
         .continue_claimed_event_hidden_with_test_policy_facts(
             &lark_hidden_e2e_config(),
             &mut ledger,
-            ready.clone(),
+            *ready.clone(),
             &controller_runtime,
             &provider,
             now + Duration::seconds(2),
@@ -1302,8 +1459,23 @@ fn test_app_bot_provider(api_base_url: String) -> FeishuLarkProvider {
             api_base_url,
             app_id: "cli_test".to_string(),
             app_secret: "test-app-secret".to_string(),
-            tenant_key: "2ca1d211f64f6438".to_string(),
-            chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+            tenant_key: Some("2ca1d211f64f6438".to_string()),
+            chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
+            computer_name: "Test Mac".to_string(),
+        }),
+        client: reqwest::Client::new(),
+    }
+}
+
+fn test_personal_agent_provider(api_base_url: String) -> FeishuLarkProvider {
+    FeishuLarkProvider {
+        id: "work_chat".to_string(),
+        runtime: FeishuLarkProviderRuntime::AppBot(FeishuLarkAppBotRuntime {
+            api_base_url,
+            app_id: "cli_test".to_string(),
+            app_secret: "test-app-secret".to_string(),
+            tenant_key: None,
+            chat_id: None,
             computer_name: "Test Mac".to_string(),
         }),
         client: reqwest::Client::new(),
@@ -1398,10 +1570,18 @@ fn lark_hidden_e2e_provider_config() -> ProviderConfig {
                 domain: FeishuLarkAppDomain::Lark,
                 app_id: "cli_test".to_string(),
                 app_secret: SecretSource::Inline("test-app-secret".to_string()),
-                tenant_key: "2ca1d211f64f6438".to_string(),
-                chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                app_registration_source: None,
+                tenant_key: Some("2ca1d211f64f6438".to_string()),
+                chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
             },
         )),
+    }
+}
+
+fn test_lark_bot_identity() -> FeishuLarkLongConnectionBotIdentity {
+    FeishuLarkLongConnectionBotIdentity {
+        open_id: TEST_LARK_BOT_OPEN_ID.to_string(),
+        name: "Agents Router".to_string(),
     }
 }
 

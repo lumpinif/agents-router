@@ -230,7 +230,7 @@ const FEISHU_LARK_PROVIDER_MODES: &[ProviderModeCapability] = &[
     ProviderModeCapability {
         provider_type: ProviderType::FeishuLark,
         mode: ProviderMode::FeishuLarkAppBot,
-        display_name: "Feishu/Lark app bot",
+        display_name: "Feishu/Lark Personal Agent",
         inbound_reply: FEISHU_LARK_LONG_CONNECTION_INBOUND_REPLY,
         delivery_receipt: RESPONSE_SURFACE_DELIVERY_RECEIPT_CAPABILITY,
     },
@@ -387,7 +387,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::Slack,
         display_name: "Slack",
-        setup_order: 10,
+        setup_order: 20,
         capabilities: ProviderCapabilities {
             message_constraints: SLACK_MESSAGE_CONSTRAINTS,
             modes: SLACK_PROVIDER_MODES,
@@ -396,7 +396,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::Discord,
         display_name: "Discord",
-        setup_order: 20,
+        setup_order: 30,
         capabilities: ProviderCapabilities {
             message_constraints: DISCORD_MESSAGE_CONSTRAINTS,
             modes: DISCORD_PROVIDER_MODES,
@@ -405,7 +405,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::Telegram,
         display_name: "Telegram",
-        setup_order: 30,
+        setup_order: 40,
         capabilities: ProviderCapabilities {
             message_constraints: TELEGRAM_MESSAGE_CONSTRAINTS,
             modes: TELEGRAM_PROVIDER_MODES,
@@ -414,7 +414,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::MicrosoftTeams,
         display_name: "Microsoft Teams",
-        setup_order: 40,
+        setup_order: 50,
         capabilities: ProviderCapabilities {
             message_constraints: MICROSOFT_TEAMS_MESSAGE_CONSTRAINTS,
             modes: MICROSOFT_TEAMS_PROVIDER_MODES,
@@ -423,7 +423,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::EmailSmtp,
         display_name: "Email SMTP",
-        setup_order: 50,
+        setup_order: 60,
         capabilities: ProviderCapabilities {
             message_constraints: NO_MESSAGE_CONSTRAINTS,
             modes: EMAIL_SMTP_PROVIDER_MODES,
@@ -432,7 +432,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::Ntfy,
         display_name: "ntfy",
-        setup_order: 60,
+        setup_order: 70,
         capabilities: ProviderCapabilities {
             message_constraints: NTFY_MESSAGE_CONSTRAINTS,
             modes: NTFY_PROVIDER_MODES,
@@ -441,7 +441,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::Pushover,
         display_name: "Pushover",
-        setup_order: 70,
+        setup_order: 80,
         capabilities: ProviderCapabilities {
             message_constraints: PUSHOVER_MESSAGE_CONSTRAINTS,
             modes: PUSHOVER_PROVIDER_MODES,
@@ -450,7 +450,7 @@ const PROVIDER_DESCRIPTORS: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         provider_type: ProviderType::FeishuLark,
         display_name: "Feishu/Lark",
-        setup_order: 80,
+        setup_order: 10,
         capabilities: ProviderCapabilities {
             message_constraints: NO_MESSAGE_CONSTRAINTS,
             modes: FEISHU_LARK_PROVIDER_MODES,
@@ -503,7 +503,7 @@ pub fn setup_provider_descriptors() -> impl Iterator<Item = &'static ProviderDes
 }
 
 pub fn default_setup_provider_type() -> ProviderType {
-    ProviderType::Slack
+    ProviderType::FeishuLark
 }
 
 pub fn default_setup_provider_descriptor() -> &'static ProviderDescriptor {
@@ -632,6 +632,7 @@ mod tests {
         assert_eq!(
             provider_ids,
             vec![
+                "feishu_lark",
                 "slack",
                 "discord",
                 "telegram",
@@ -639,7 +640,6 @@ mod tests {
                 "email_smtp",
                 "ntfy",
                 "pushover",
-                "feishu_lark",
                 "webhook",
                 "whatsapp",
                 "wechat",
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn default_setup_provider_is_cataloged() {
-        assert_eq!(default_setup_provider_type(), ProviderType::Slack);
+        assert_eq!(default_setup_provider_type(), ProviderType::FeishuLark);
         assert_eq!(
             default_setup_provider_descriptor().provider_type,
             default_setup_provider_type()
@@ -857,8 +857,9 @@ mod tests {
                     domain: FeishuLarkAppDomain::Lark,
                     app_id: "cli_9f5343c580712544".to_string(),
                     app_secret: SecretSource::Env("AGENTS_ROUTER_LARK_APP_SECRET".to_string()),
-                    tenant_key: "2ca1d211f64f6438".to_string(),
-                    chat_id: "oc_5ce6d572455d361153b7xx51da133945".to_string(),
+                    app_registration_source: None,
+                    tenant_key: Some("2ca1d211f64f6438".to_string()),
+                    chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
                 },
             )),
         };
