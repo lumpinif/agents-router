@@ -246,26 +246,64 @@ fn resolve_new_session_command(
 fn room_status(ledger: &BridgeBindingLedger, command: &NormalizedProviderControlCommand) -> String {
     let connected = ledger.connected_projects_for_room(&room_query(command));
     if connected.is_empty() {
-        return "This room is not connected to any projects.\nUse `/bind /absolute/project/path` in this room.".to_string();
+        return [
+            "Room status",
+            "",
+            "No projects are connected yet.",
+            "",
+            "Connect this room to a local project:",
+            "`/bind /absolute/project/path`",
+            "",
+            "After that, new Codex Desktop updates from that project will appear here, and `/new` can start a new Codex thread in that project.",
+        ]
+        .join("\n");
     }
 
-    format!(
-        "This room is connected to:\n{}",
-        format_project_list(&connected)
-    )
+    let project_count = connected.len();
+    let new_session_hint = if project_count == 1 {
+        "`/new what you want Codex to do`"
+    } else {
+        "`/new /absolute/project/path what you want Codex to do`"
+    };
+
+    [
+        "Room status".to_string(),
+        "".to_string(),
+        format!("Connected projects: {project_count}"),
+        format_project_list(&connected),
+        "".to_string(),
+        format!("Start a new Codex thread:\n{new_session_hint}"),
+        "".to_string(),
+        "When a Codex update appears here, reply in that Lark thread and mention me to continue the same Codex thread.".to_string(),
+    ]
+    .join("\n")
 }
 
 fn help_text() -> String {
     [
-        "Available commands:",
-        "`/bind /absolute/project/path` - connect this room to a local project.",
-        "`/new what you want Codex to do` - start a new Codex thread in the connected project.",
-        "`/new /absolute/project/path what you want Codex to do` - start in one connected project when this room has multiple projects.",
-        "`/status` - show connected projects for this room.",
-        "`/unbind /absolute/project/path` - disconnect one project.",
-        "`/unbind` - disconnect all projects from this room.",
+        "I connect this Lark room to local projects on your Mac.",
         "",
-        "In groups and threads, mention me before the command.",
+        "Commands",
+        "`/bind /absolute/project/path`",
+        "Connect this room to a local project.",
+        "",
+        "`/new what you want Codex to do`",
+        "Start a new Codex thread in the connected project.",
+        "",
+        "`/new /absolute/project/path what you want Codex to do`",
+        "Start in one connected project when this room has multiple projects.",
+        "",
+        "`/status`",
+        "Show what this room is connected to.",
+        "",
+        "`/unbind /absolute/project/path`",
+        "Disconnect one project from this room.",
+        "",
+        "`/unbind`",
+        "Disconnect all projects from this room.",
+        "",
+        "In group chats and Lark threads, mention me before you send a command or reply.",
+        "`/bind`, `/new`, and `/unbind` work only in the room, not inside a Lark thread.",
     ]
     .join("\n")
 }
@@ -402,7 +440,12 @@ mod tests {
             .expect("status should handle"),
         );
 
-        assert_eq!(reply, format!("This room is connected to:\n- {path}"));
+        assert_eq!(
+            reply,
+            format!(
+                "Room status\n\nConnected projects: 1\n- {path}\n\nStart a new Codex thread:\n`/new what you want Codex to do`\n\nWhen a Codex update appears here, reply in that Lark thread and mention me to continue the same Codex thread."
+            )
+        );
     }
 
     #[test]
@@ -419,8 +462,41 @@ mod tests {
 
         assert_eq!(
             reply,
-            "This room is not connected to any projects.\nUse `/bind /absolute/project/path` in this room."
+            "Room status\n\nNo projects are connected yet.\n\nConnect this room to a local project:\n`/bind /absolute/project/path`\n\nAfter that, new Codex Desktop updates from that project will appear here, and `/new` can start a new Codex thread in that project."
         );
+    }
+
+    #[test]
+    fn status_reports_explicit_new_command_for_multiple_projects() {
+        let first = tempfile::tempdir().expect("temp dir should exist");
+        let second = tempfile::tempdir().expect("temp dir should exist");
+        let first_path = first.path().to_string_lossy().to_string();
+        let second_path = second.path().to_string_lossy().to_string();
+        let mut ledger = BridgeBindingLedger::in_memory();
+        for path in [&first_path, &second_path] {
+            handle_provider_control_command(
+                &mut ledger,
+                command(ProviderControlCommand::BindProject {
+                    project_path: path.clone(),
+                }),
+                test_time(),
+            )
+            .expect("bind should handle");
+        }
+
+        let reply = reply_text(
+            handle_provider_control_command(
+                &mut ledger,
+                command(ProviderControlCommand::Status),
+                test_time(),
+            )
+            .expect("status should handle"),
+        );
+
+        assert!(reply.contains("Connected projects: 2"));
+        assert!(reply.contains(&first_path));
+        assert!(reply.contains(&second_path));
+        assert!(reply.contains("`/new /absolute/project/path what you want Codex to do`"));
     }
 
     #[test]
@@ -503,6 +579,8 @@ mod tests {
         assert!(reply.contains("`/new what you want Codex to do`"));
         assert!(reply.contains("`/status`"));
         assert!(reply.contains("`/unbind`"));
+        assert!(reply.contains("mention me before you send a command or reply"));
+        assert!(reply.contains("work only in the room"));
     }
 
     #[test]
