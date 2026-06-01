@@ -159,6 +159,22 @@ fn install_writes_plist_and_bootstraps_preferred_domain() {
 }
 
 #[test]
+fn install_creates_service_working_directory() {
+    let dir = tempdir().expect("tempdir should be created");
+    let plist = dir.path().join("LaunchAgents").join("service.plist");
+    let metadata = dir.path().join("Application Support").join("service.json");
+    let mut definition = test_definition();
+    definition.working_dir = dir.path().join("Application Support").join("agents-router");
+    let manager = LaunchAgentManager::with_uid(FakeLaunchctl::new(), 501);
+
+    manager
+        .install_or_update(&definition, &plist, &metadata)
+        .expect("service should start");
+
+    assert!(definition.working_dir.is_dir());
+}
+
+#[test]
 fn already_running_service_is_not_restarted_when_plist_matches() {
     let dir = tempdir().expect("tempdir should be created");
     let plist = dir.path().join("service.plist");

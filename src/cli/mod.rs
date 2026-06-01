@@ -406,12 +406,13 @@ async fn run_start_service(
 
 fn build_service_definition(config_path: &Path) -> anyhow::Result<ServiceDefinition> {
     let binary_path = service_binary_path()?;
-    let working_dir = std::env::current_dir().context("failed to detect working directory")?;
+    let invocation_dir = std::env::current_dir().context("failed to detect working directory")?;
     let config_path = if config_path.is_absolute() {
         config_path.to_path_buf()
     } else {
-        working_dir.join(config_path)
+        invocation_dir.join(config_path)
     };
+    let working_dir = app_support_dir_path()?;
     let log_file = log_file_path()?;
     let home = home_env_value()?;
     let env_path = std::env::var("PATH")

@@ -222,6 +222,12 @@ impl<R: LaunchctlRunner> LaunchAgentManager<R> {
                 format!("failed to create log directory `{}`", parent.display())
             })?;
         }
+        fs::create_dir_all(&definition.working_dir).with_context(|| {
+            format!(
+                "failed to create service working directory `{}`",
+                definition.working_dir.display()
+            )
+        })?;
 
         let desired_plist = build_plist(definition);
         let installed = plist_path.exists();

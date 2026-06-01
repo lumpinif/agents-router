@@ -59,6 +59,20 @@ Use a real absolute folder path on this computer. The first version does not sca
 
 After `/bind`, new updates from that project are sent to that room. If a new Codex Desktop thread creates an update, Agents Router creates or reuses the matching Feishu/Lark thread for that Codex thread. Mention the Personal Agent in that Feishu/Lark thread to continue the same Codex thread.
 
+## Room Commands
+
+In shared rooms and threads, mention the Personal Agent before each command. In a one-on-one chat with the Personal Agent, no mention is needed.
+
+```text
+/help
+/status
+/bind /absolute/project/path
+/unbind /absolute/project/path
+/unbind
+```
+
+Use `/help` to list the commands. Use `/status` in a project room to see which local projects are connected to that room. Use `/unbind /absolute/project/path` to disconnect one project from the room, or `/unbind` to disconnect all projects from that room.
+
 ## What Setup Writes
 
 Personal Agent setup writes an app-bot provider without a default room:

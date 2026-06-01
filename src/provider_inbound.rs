@@ -56,7 +56,23 @@ pub struct NormalizedProviderControlCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlCommand {
     BindProject { project_path: String },
+    Help,
+    Status,
+    UnbindProject { project_path: Option<String> },
     Invalid { message: String },
+}
+
+impl ProviderControlCommand {
+    fn changes_room_binding(&self) -> bool {
+        matches!(self, Self::BindProject { .. } | Self::UnbindProject { .. })
+    }
+
+    fn requires_project_room(&self) -> bool {
+        matches!(
+            self,
+            Self::BindProject { .. } | Self::Status | Self::UnbindProject { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,15 +390,13 @@ pub fn normalize_feishu_lark_long_connection_control_command(
 
     let root_id = optional_field(message.root_id.as_deref());
     let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
-    let command = if root_id.is_some() {
+    let command = if root_id.is_some() && command.changes_room_binding() {
         ProviderControlCommand::Invalid {
-            message: "Run `/bind` in the room, not inside a thread.".to_string(),
+            message: "Run `/bind` or `/unbind` in the room, not inside a thread.".to_string(),
         }
-    } else if matches!(command, ProviderControlCommand::BindProject { .. })
-        && feishu_lark_message_is_direct_chat(&message)
-    {
+    } else if command.requires_project_room() && feishu_lark_message_is_direct_chat(&message) {
         ProviderControlCommand::Invalid {
-            message: "Use `/bind` in a Lark or Feishu room, not in a direct chat.".to_string(),
+            message: "Use this command in a Lark or Feishu room, not in a direct chat.".to_string(),
         }
     } else {
         command
@@ -846,6 +860,31 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             }
             Some(ProviderControlCommand::BindProject {
                 project_path: project_path.to_string(),
+            })
+        }
+        "/help" => {
+            if !rest.trim().is_empty() {
+                return Some(ProviderControlCommand::Invalid {
+                    message: "Use `/help`.".to_string(),
+                });
+            }
+            Some(ProviderControlCommand::Help)
+        }
+        "/status" => {
+            if !rest.trim().is_empty() {
+                return Some(ProviderControlCommand::Invalid {
+                    message: "Use `/status`.".to_string(),
+                });
+            }
+            Some(ProviderControlCommand::Status)
+        }
+        "/unbind" => {
+            let project_path = rest.trim();
+            if project_path.is_empty() {
+                return Some(ProviderControlCommand::UnbindProject { project_path: None });
+            }
+            Some(ProviderControlCommand::UnbindProject {
+                project_path: Some(project_path.to_string()),
             })
         }
         _ => None,
@@ -1418,8 +1457,168 @@ mod tests {
                 provider_thread_id: "om_bind_message_id".to_string(),
                 provider_event_id: "om_bind_message_id".to_string(),
                 command: ProviderControlCommand::Invalid {
-                    message: "Use `/bind` in a Lark or Feishu room, not in a direct chat."
+                    message: "Use this command in a Lark or Feishu room, not in a direct chat."
                         .to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_feishu_lark_help_command_after_bot_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_help_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 /help\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let normalized = normalize_feishu_lark_long_connection_control_command(
+            "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
+            raw,
+        )
+        .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_help_message_id".to_string(),
+                provider_event_id: "om_help_message_id".to_string(),
+                command: ProviderControlCommand::Help,
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_feishu_lark_status_command_after_bot_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_status_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 /status\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let normalized = normalize_feishu_lark_long_connection_control_command(
+            "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
+            raw,
+        )
+        .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_status_message_id".to_string(),
+                provider_event_id: "om_status_message_id".to_string(),
+                command: ProviderControlCommand::Status,
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_feishu_lark_unbind_command_after_bot_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_unbind_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 /unbind /Users/felix/Desktop/felix-projects/agents-router\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let normalized = normalize_feishu_lark_long_connection_control_command(
+            "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
+            raw,
+        )
+        .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_unbind_message_id".to_string(),
+                provider_event_id: "om_unbind_message_id".to_string(),
+                command: ProviderControlCommand::UnbindProject {
+                    project_path: Some(
+                        "/Users/felix/Desktop/felix-projects/agents-router".to_string()
+                    ),
                 },
             })
         );
