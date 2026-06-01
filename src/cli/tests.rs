@@ -240,6 +240,28 @@ fn catalog_ingest_hook_commands_parse_as_cli_commands() {
 }
 
 #[test]
+fn unfinished_recovery_notice_keeps_agent_submit_boundary_conservative() {
+    assert_eq!(
+        unfinished_recovery_notice(&InboundEventDedupStatus::ClaimedBeforeSubmit),
+        Some((
+            RESTART_BEFORE_SUBMIT_NOTICE_TEXT,
+            InboundEventDedupStatus::FailedNotified
+        ))
+    );
+    assert_eq!(
+        unfinished_recovery_notice(&InboundEventDedupStatus::SubmittedPossible),
+        Some((
+            RESTART_AFTER_SUBMIT_NOTICE_TEXT,
+            InboundEventDedupStatus::SubmittedUnknownNotified
+        ))
+    );
+    assert_eq!(
+        unfinished_recovery_notice(&InboundEventDedupStatus::Processed),
+        None
+    );
+}
+
+#[test]
 fn catalog_emit_hook_commands_are_explicit_prefixes() {
     for descriptor in agents_router::agent_integration_catalog::all_agent_integration_descriptors()
     {

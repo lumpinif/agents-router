@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::{debug, info, warn};
 
 use crate::agent_integration_catalog::{
@@ -25,6 +26,11 @@ use crate::response_surface_runtime::response_surface_route_binding_hash;
 pub mod codex_app_server;
 
 const SUBMITTED_UNKNOWN_NOTICE_TEXT: &str = "Codex received your reply, but Agents Router could not find a final answer to send back. To avoid running the same reply twice, it will not retry automatically. Please check Codex Desktop.";
+const PROVIDER_THREAD_REPLY_MAX_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const PROVIDER_THREAD_REPLY_RETRY_DELAY: TokioDuration = TokioDuration::from_secs(1);
+#[cfg(test)]
+const PROVIDER_THREAD_REPLY_RETRY_DELAY: TokioDuration = TokioDuration::from_millis(1);
 
 pub type AgentControllerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
@@ -67,6 +73,47 @@ pub trait ProviderThreadReplyAdapter: Send + Sync {
         &'a self,
         request: ProviderThreadReplyRequest,
     ) -> ProviderThreadReplyFuture<'a>;
+}
+
+pub async fn send_provider_thread_reply_with_retry(
+    provider_reply: &dyn ProviderThreadReplyAdapter,
+    request: ProviderThreadReplyRequest,
+) -> Result<ProviderThreadReplySuccess, ProviderThreadReplyError> {
+    let mut attempt = 1;
+    loop {
+        match provider_reply.send_thread_reply(request.clone()).await {
+            Ok(success) => {
+                if attempt > 1 {
+                    info!(
+                        surface.id = %request.surface_id,
+                        provider.id = %request.provider_id,
+                        provider.type = %request.provider_type,
+                        provider.thread.id = %request.provider_thread_id,
+                        event.hash = %request.provider_event_id_hash,
+                        attempt,
+                        event = "provider_thread_result_reply.retry_succeeded",
+                    );
+                }
+                return Ok(success);
+            }
+            Err(error) if attempt < PROVIDER_THREAD_REPLY_MAX_ATTEMPTS => {
+                warn!(
+                    surface.id = %request.surface_id,
+                    provider.id = %request.provider_id,
+                    provider.type = %request.provider_type,
+                    provider.thread.id = %request.provider_thread_id,
+                    event.hash = %request.provider_event_id_hash,
+                    attempt,
+                    max_attempts = PROVIDER_THREAD_REPLY_MAX_ATTEMPTS,
+                    error = %error.message,
+                    event = "provider_thread_result_reply.retrying",
+                );
+                attempt += 1;
+                sleep(PROVIDER_THREAD_REPLY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -903,7 +950,8 @@ async fn send_explicit_text_reply_and_record_status(
         event.hash = %ready.provider_event_id_hash,
         event = "provider_thread_result_reply.started",
     );
-    let provider_reply_result = provider_reply.send_thread_reply(request).await;
+    let provider_reply_result =
+        send_provider_thread_reply_with_retry(provider_reply, request).await;
     let provider_reply_success = match provider_reply_result {
         Ok(success) => {
             info!(
@@ -1002,7 +1050,8 @@ async fn send_explicit_text_reply_and_record_status_with_store(
         event.hash = %ready.provider_event_id_hash,
         event = "provider_thread_result_reply.started",
     );
-    let provider_reply_result = provider_reply.send_thread_reply(request).await;
+    let provider_reply_result =
+        send_provider_thread_reply_with_retry(provider_reply, request).await;
     let provider_reply_success = match provider_reply_result {
         Ok(success) => {
             info!(
@@ -1807,8 +1856,50 @@ mod tests {
             )
         ));
         assert_eq!(adapter.requests().len(), 1);
-        assert_eq!(provider_reply.requests().len(), 1);
+        assert_eq!(
+            provider_reply.requests().len(),
+            PROVIDER_THREAD_REPLY_MAX_ATTEMPTS
+        );
         assert_event_is_submitted_possible(&mut ledger, ready);
+    }
+
+    #[tokio::test]
+    async fn closed_loop_retries_provider_result_reply_before_marking_processed() {
+        let (mut ledger, ready) = ledger_and_ready_with_claim();
+        let adapter = RecordingAdapter::with_success_message("agent final result");
+        let provider_reply = RecordingProviderThreadReplyAdapter::with_transient_errors(
+            2,
+            "temporary provider error",
+        );
+        let runtime = AgentControllerRuntime::new(vec![&adapter]);
+
+        let decision = runtime
+            .run_inbound_continuation_closed_loop_with_test_policy_facts(
+                &enabled_config(),
+                &mut ledger,
+                ready.clone(),
+                &provider_reply,
+                test_time() + Duration::seconds(2),
+                Some(available_codex_desktop()),
+                Some(slack_app_capability()),
+            )
+            .await
+            .expect("closed loop should not fail");
+
+        assert!(matches!(
+            decision,
+            AgentControllerClosedLoopDecision::Completed(AgentControllerClosedLoopCompletion {
+                outcome: AgentControllerClosedLoopOutcome::ControllerSucceeded(_),
+                inbound_event: InboundEventRecordDecision::Recorded {
+                    status: InboundEventDedupStatus::Processed,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(adapter.requests().len(), 1);
+        assert_eq!(provider_reply.requests().len(), 3);
+        assert_event_is_duplicate_processed(&mut ledger, ready);
     }
 
     #[tokio::test]
@@ -1911,7 +2002,10 @@ mod tests {
             )
         ));
         assert_eq!(adapter.requests().len(), 1);
-        assert_eq!(provider_reply.requests().len(), 1);
+        assert_eq!(
+            provider_reply.requests().len(),
+            PROVIDER_THREAD_REPLY_MAX_ATTEMPTS
+        );
         assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
@@ -2241,14 +2335,27 @@ mod tests {
     #[derive(Default)]
     struct RecordingProviderThreadReplyAdapter {
         requests: Arc<Mutex<Vec<ProviderThreadReplyRequest>>>,
-        error: Option<String>,
+        permanent_error: Option<String>,
+        transient_error: Option<String>,
+        transient_failures: Arc<Mutex<usize>>,
     }
 
     impl RecordingProviderThreadReplyAdapter {
         fn with_error(message: &str) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                error: Some(message.to_string()),
+                permanent_error: Some(message.to_string()),
+                transient_error: None,
+                transient_failures: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn with_transient_errors(count: usize, message: &str) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                permanent_error: None,
+                transient_error: Some(message.to_string()),
+                transient_failures: Arc::new(Mutex::new(count)),
             }
         }
 
@@ -2278,7 +2385,23 @@ mod tests {
                     .lock()
                     .expect("requests mutex should not be poisoned")
                     .push(request.clone());
-                if let Some(error) = &self.error {
+                if let Some(error) = &self.transient_error {
+                    let mut transient_failures = self
+                        .transient_failures
+                        .lock()
+                        .expect("transient failures mutex should not be poisoned");
+                    if *transient_failures > 0 {
+                        *transient_failures -= 1;
+                        return Err(ProviderThreadReplyError {
+                            provider_id: request.provider_id,
+                            provider_type: request.provider_type,
+                            surface_id: request.surface_id,
+                            provider_event_id_hash: request.provider_event_id_hash,
+                            message: error.clone(),
+                        });
+                    }
+                }
+                if let Some(error) = &self.permanent_error {
                     return Err(ProviderThreadReplyError {
                         provider_id: request.provider_id,
                         provider_type: request.provider_type,

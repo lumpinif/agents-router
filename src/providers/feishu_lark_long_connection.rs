@@ -589,7 +589,6 @@ impl FeishuLarkLongConnectionRuntime {
         bridge_binding_ledger_store: &BridgeBindingLedgerStore,
         transport: &mut dyn FeishuLarkLongConnectionTransport,
         payload_buffer: &mut FeishuLarkLongConnectionPayloadBuffer,
-        received_at: DateTime<Utc>,
     ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
         loop {
             let message = transport.receive().await?;
@@ -619,6 +618,7 @@ impl FeishuLarkLongConnectionRuntime {
                 provider.id = %self.config.provider_id,
                 event = "feishu_lark.long_connection.live.event.received",
             );
+            let received_at = Utc::now();
             let decision = self
                 .handle_event_before_platform_ack_with_stores_hidden(
                     response_surface_ledger_store,
@@ -758,7 +758,6 @@ async fn run_live_lark_long_connection_provider(
             &mut transport,
             &mut payload_buffer,
             dispatch_context,
-            Utc::now(),
         )
         .await?;
     }
@@ -776,7 +775,6 @@ async fn receive_and_dispatch_live_lark_event_hidden(
     transport: &mut dyn FeishuLarkLongConnectionTransport,
     payload_buffer: &mut FeishuLarkLongConnectionPayloadBuffer,
     dispatch_context: FeishuLarkLiveDispatchContext<'_>,
-    received_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let decision = long_connection
         .receive_event_before_platform_ack_with_stores_hidden(
@@ -784,7 +782,6 @@ async fn receive_and_dispatch_live_lark_event_hidden(
             dispatch_context.bridge_binding_ledger_store,
             transport,
             payload_buffer,
-            received_at,
         )
         .await?;
 
@@ -1628,7 +1625,6 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
             ),
-            now + Duration::seconds(1),
         )
         .await
         .expect("first event should be acknowledged and dispatched");
@@ -1645,7 +1641,6 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
             ),
-            now + Duration::seconds(2),
         )
         .await
         .expect("second event should be received without waiting for first continuation");
@@ -1659,7 +1654,6 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_transport_binds_room_command_before_ack_and_dispatches_control_reply() {
-        let now = test_time();
         let dir = tempdir().expect("temp dir should exist");
         let project_dir = tempdir().expect("project dir should exist");
         let project_path = project_dir.path().to_string_lossy().to_string();
@@ -1689,7 +1683,6 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
             ),
-            now + Duration::seconds(1),
         )
         .await
         .expect("bind command should ack and dispatch control reply");
@@ -1767,7 +1760,6 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
             ),
-            now + Duration::seconds(1),
         )
         .await
         .expect("thread-bound reply should ack and dispatch continuation");

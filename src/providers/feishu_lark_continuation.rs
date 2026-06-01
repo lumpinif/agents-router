@@ -4,7 +4,7 @@ use tracing::{debug, info, warn};
 use crate::agent_controller::{
     AgentControllerClosedLoopDecision, AgentControllerPolicyOverrides, AgentControllerRuntime,
     ProviderThreadReplyAdapter, ProviderThreadReplyRequest,
-    codex_app_server::CodexAppServerController,
+    codex_app_server::CodexAppServerController, send_provider_thread_reply_with_retry,
 };
 use crate::continuation_dispatcher::{ClaimedContinuationWork, ContinuationDispatcher};
 use crate::execution_scope_guard::{ExecutionScopeKey, ExecutionScopeLease};
@@ -220,8 +220,9 @@ async fn send_lark_thread_reply_text(
         event.hash = %ready.provider_event_id_hash,
         event = "provider_thread_result_reply.started",
     );
-    let reply_result = provider_reply
-        .send_thread_reply(ProviderThreadReplyRequest {
+    let reply_result = send_provider_thread_reply_with_retry(
+        provider_reply,
+        ProviderThreadReplyRequest {
             provider_id: ready.reply.provider_id.clone(),
             provider_type: ready.reply.provider_type.clone(),
             provider_account_id: ready.reply.provider_account_id.clone(),
@@ -230,8 +231,9 @@ async fn send_lark_thread_reply_text(
             surface_id: ready.surface.surface_id.clone(),
             provider_event_id_hash: ready.provider_event_id_hash.clone(),
             text: text.to_string(),
-        })
-        .await;
+        },
+    )
+    .await;
     let success = match reply_result {
         Ok(success) => success,
         Err(error) => {

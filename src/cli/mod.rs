@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use console::style;
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
@@ -14,6 +15,9 @@ use qrcode::render::unicode;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
+use agents_router::agent_controller::{
+    ProviderThreadReplyRequest, send_provider_thread_reply_with_retry,
+};
 use agents_router::agent_integration_catalog::{
     ContinuationReleaseStage, HookCommandTemplate, RuntimePlatform, SetupIntegrationKind,
     SourceIngestFormat, agent_integration_descriptor, agent_integration_for_source,
@@ -50,9 +54,13 @@ use agents_router::provider_catalog::{
     default_setup_provider_type, provider_descriptor, provider_mode_capability,
     setup_provider_descriptors,
 };
+use agents_router::providers::FeishuLarkProvider;
 use agents_router::providers::build_providers;
 use agents_router::response_surface_exposure::{
     ResponseSurfaceExposureDecision, evaluate_response_surface_exposure,
+};
+use agents_router::response_surface_ledger::{
+    InboundEventDedupStatus, UnfinishedInboundEventRecoveryRecord,
 };
 use agents_router::runtime::{
     RuntimeState, ensure_sources_supported_on_current_platform, reload_config_on_change,
@@ -77,6 +85,9 @@ use setup_flow::*;
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const START_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const UNFINISHED_INBOUND_RECOVERY_NOTICE_WINDOW_HOURS: i64 = 48;
+const RESTART_BEFORE_SUBMIT_NOTICE_TEXT: &str = "Agents Router restarted before it could forward this reply to the agent. Please send it again.";
+const RESTART_AFTER_SUBMIT_NOTICE_TEXT: &str = "Codex may have received your reply, but Agents Router restarted before it could send the result back. To avoid running the same reply twice, it will not retry automatically. Please check Codex Desktop.";
 
 struct ProgressLine {
     message: &'static str,
@@ -1672,28 +1683,190 @@ async fn run_watch(config_path: &Path, config: ValidatedConfig) -> anyhow::Resul
     local_integrations::ensure_local_source_integrations(&config)?;
     let runtime =
         RuntimeState::new_with_delivery_safety(config, DeliverySafetyGuard::load_default()?)?;
-    log_unfinished_response_surface_events(&runtime).await?;
+    spawn_unfinished_response_surface_recovery(runtime.clone());
     let endpoint = ingress_endpoint()?;
     run_service_tasks(config_path.to_path_buf(), runtime, endpoint).await
 }
 
-async fn log_unfinished_response_surface_events(runtime: &RuntimeState) -> anyhow::Result<()> {
-    for record in runtime
-        .response_surface_ledger()
-        .unfinished_inbound_events()
+fn spawn_unfinished_response_surface_recovery(runtime: RuntimeState) {
+    tokio::spawn(async move {
+        tracing::info!(event = "response_surface.inbound_event.recovery.started");
+        match reconcile_unfinished_response_surface_events(&runtime).await {
+            Ok(()) => {
+                tracing::info!(event = "response_surface.inbound_event.recovery.completed");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    event = "response_surface.inbound_event.recovery.failed",
+                );
+            }
+        }
+    });
+}
+
+async fn reconcile_unfinished_response_surface_events(
+    runtime: &RuntimeState,
+) -> anyhow::Result<()> {
+    let ledger_store = runtime.response_surface_ledger();
+    for record in ledger_store
+        .unfinished_inbound_event_recovery_records()
         .await?
     {
-        tracing::warn!(
-            provider.id = %record.provider_id,
-            provider.type = %record.provider_type,
-            surface.id = %record.surface_id,
-            event.hash = %record.provider_event_id_hash,
-            inbound.status = %record.status.as_str(),
-            received.at = %record.received_at,
-            event = "response_surface.inbound_event.unfinished_on_start",
-        );
+        log_unfinished_response_surface_event(&record);
+
+        let Some((notice_text, terminal_status)) = unfinished_recovery_notice(&record.status)
+        else {
+            continue;
+        };
+        if Utc::now() - record.received_at
+            > ChronoDuration::hours(UNFINISHED_INBOUND_RECOVERY_NOTICE_WINDOW_HOURS)
+        {
+            tracing::warn!(
+                provider.id = %record.provider_id,
+                provider.type = %record.provider_type,
+                surface.id = %record.surface_id,
+                event.hash = %record.provider_event_id_hash,
+                inbound.status = %record.status.as_str(),
+                received.at = %record.received_at,
+                event = "response_surface.inbound_event.recovery_notice.skipped_stale",
+            );
+            continue;
+        }
+
+        if record.provider_type != ProviderType::FeishuLark.as_str() {
+            tracing::warn!(
+                provider.id = %record.provider_id,
+                provider.type = %record.provider_type,
+                surface.id = %record.surface_id,
+                event.hash = %record.provider_event_id_hash,
+                inbound.status = %record.status.as_str(),
+                event = "response_surface.inbound_event.recovery_notice.unsupported_provider",
+            );
+            continue;
+        }
+
+        let snapshot = runtime.current()?;
+        let Some(provider_config) = snapshot.config.provider(&record.provider_id) else {
+            tracing::warn!(
+                provider.id = %record.provider_id,
+                provider.type = %record.provider_type,
+                surface.id = %record.surface_id,
+                event.hash = %record.provider_event_id_hash,
+                inbound.status = %record.status.as_str(),
+                event = "response_surface.inbound_event.recovery_notice.provider_missing",
+            );
+            continue;
+        };
+        if provider_config.provider_type().as_str() != record.provider_type {
+            tracing::warn!(
+                provider.id = %record.provider_id,
+                provider.type = %record.provider_type,
+                surface.id = %record.surface_id,
+                event.hash = %record.provider_event_id_hash,
+                current.provider.type = %provider_config.provider_type().as_str(),
+                inbound.status = %record.status.as_str(),
+                event = "response_surface.inbound_event.recovery_notice.provider_type_mismatch",
+            );
+            continue;
+        }
+
+        let provider_reply = match FeishuLarkProvider::from_config(provider_config) {
+            Ok(provider_reply) => provider_reply,
+            Err(error) => {
+                tracing::warn!(
+                    provider.id = %record.provider_id,
+                    provider.type = %record.provider_type,
+                    surface.id = %record.surface_id,
+                    event.hash = %record.provider_event_id_hash,
+                    inbound.status = %record.status.as_str(),
+                    error = %error,
+                    event = "response_surface.inbound_event.recovery_notice.provider_unavailable",
+                );
+                continue;
+            }
+        };
+
+        let request = ProviderThreadReplyRequest {
+            provider_id: record.provider_id.clone(),
+            provider_type: record.provider_type.clone(),
+            provider_account_id: record.provider_account_id.clone(),
+            provider_conversation_id: record.provider_conversation_id.clone(),
+            provider_thread_id: record.provider_thread_id.clone(),
+            surface_id: record.surface_id.clone(),
+            provider_event_id_hash: record.provider_event_id_hash.clone(),
+            text: notice_text.to_string(),
+        };
+
+        match send_provider_thread_reply_with_retry(&provider_reply, request).await {
+            Ok(success) => {
+                let decision = ledger_store
+                    .record_inbound_event_status_by_hash_at(
+                        &record.provider_id,
+                        &record.provider_type,
+                        &record.provider_event_id_hash,
+                        &record.surface_id,
+                        terminal_status,
+                        Utc::now(),
+                    )
+                    .await?;
+                tracing::info!(
+                    provider.id = %record.provider_id,
+                    provider.type = %record.provider_type,
+                    surface.id = %record.surface_id,
+                    provider.thread.id = %record.provider_thread_id,
+                    provider.reply.message_id = success.provider_reply_message_id.as_deref(),
+                    event.hash = %record.provider_event_id_hash,
+                    inbound.status = %terminal_status.as_str(),
+                    recorded = ?decision,
+                    event = "response_surface.inbound_event.recovery_notice.sent",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider.id = %record.provider_id,
+                    provider.type = %record.provider_type,
+                    surface.id = %record.surface_id,
+                    provider.thread.id = %record.provider_thread_id,
+                    event.hash = %record.provider_event_id_hash,
+                    inbound.status = %record.status.as_str(),
+                    error = %error.message,
+                    event = "response_surface.inbound_event.recovery_notice.failed",
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn log_unfinished_response_surface_event(record: &UnfinishedInboundEventRecoveryRecord) {
+    tracing::warn!(
+        provider.id = %record.provider_id,
+        provider.type = %record.provider_type,
+        surface.id = %record.surface_id,
+        event.hash = %record.provider_event_id_hash,
+        inbound.status = %record.status.as_str(),
+        received.at = %record.received_at,
+        event = "response_surface.inbound_event.unfinished_on_start",
+    );
+}
+
+fn unfinished_recovery_notice(
+    status: &InboundEventDedupStatus,
+) -> Option<(&'static str, InboundEventDedupStatus)> {
+    match status {
+        InboundEventDedupStatus::ClaimedBeforeSubmit => Some((
+            RESTART_BEFORE_SUBMIT_NOTICE_TEXT,
+            InboundEventDedupStatus::FailedNotified,
+        )),
+        InboundEventDedupStatus::SubmittedPossible => Some((
+            RESTART_AFTER_SUBMIT_NOTICE_TEXT,
+            InboundEventDedupStatus::SubmittedUnknownNotified,
+        )),
+        InboundEventDedupStatus::Processed
+        | InboundEventDedupStatus::FailedNotified
+        | InboundEventDedupStatus::SubmittedUnknownNotified => None,
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

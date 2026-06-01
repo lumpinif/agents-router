@@ -172,6 +172,19 @@ pub struct InboundEventDiagnosticRecord {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedInboundEventRecoveryRecord {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_event_id_hash: String,
+    pub surface_id: String,
+    pub status: InboundEventDedupStatus,
+    pub received_at: DateTime<Utc>,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct InboundEventDedupRecord {
     provider_id: String,
@@ -565,6 +578,80 @@ impl ResponseSurfaceLedger {
             .collect()
     }
 
+    pub fn unfinished_inbound_event_recovery_records(
+        &self,
+    ) -> Vec<UnfinishedInboundEventRecoveryRecord> {
+        self.state
+            .inbound_events
+            .iter()
+            .filter(|record| record.status.is_processing())
+            .filter_map(|event| {
+                let surface = self
+                    .state
+                    .surfaces
+                    .iter()
+                    .find(|surface| surface.surface_id == event.surface_id)?;
+                Some(UnfinishedInboundEventRecoveryRecord {
+                    provider_id: event.provider_id.clone(),
+                    provider_type: event.provider_type.clone(),
+                    provider_event_id_hash: event.provider_event_id_hash.clone(),
+                    surface_id: event.surface_id.clone(),
+                    status: event.status,
+                    received_at: event.received_at,
+                    provider_account_id: surface.provider_account_id.clone(),
+                    provider_conversation_id: surface.provider_conversation_id.clone(),
+                    provider_thread_id: surface.provider_thread_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn record_inbound_event_status_by_hash_at(
+        &mut self,
+        provider_id: &str,
+        provider_type: &str,
+        provider_event_id_hash: &str,
+        surface_id: &str,
+        status: InboundEventDedupStatus,
+        _now: DateTime<Utc>,
+    ) -> anyhow::Result<InboundEventRecordDecision> {
+        ensure_present("provider_id", provider_id)?;
+        ensure_present("provider_type", provider_type)?;
+        ensure_present("provider_event_id_hash", provider_event_id_hash)?;
+        ensure_present("surface_id", surface_id)?;
+        ensure!(
+            status.is_terminal(),
+            "inbound event recovery can only record terminal status"
+        );
+
+        let Some(existing) = self.state.inbound_events.iter_mut().find(|record| {
+            record.provider_id == provider_id
+                && record.provider_type == provider_type
+                && record.provider_event_id_hash == provider_event_id_hash
+        }) else {
+            anyhow::bail!("inbound event `{provider_event_id_hash}` was not found");
+        };
+        ensure!(
+            existing.surface_id == surface_id,
+            "inbound event is already associated with another response surface"
+        );
+
+        if existing.status == status || existing.status.is_terminal() {
+            return Ok(InboundEventRecordDecision::Duplicate {
+                provider_event_id_hash: existing.provider_event_id_hash.clone(),
+                surface_id: existing.surface_id.clone(),
+                status: existing.status,
+            });
+        }
+
+        existing.status = status;
+        self.save()?;
+        Ok(InboundEventRecordDecision::Recorded {
+            provider_event_id_hash: provider_event_id_hash.to_string(),
+            status,
+        })
+    }
+
     fn record_inbound_event_status_at(
         &mut self,
         input: InboundEventDedupInput,
@@ -681,6 +768,35 @@ impl ResponseSurfaceLedgerStore {
     ) -> anyhow::Result<Vec<InboundEventDiagnosticRecord>> {
         self.update(|ledger| Ok(ledger.unfinished_inbound_events()))
             .await
+    }
+
+    pub async fn unfinished_inbound_event_recovery_records(
+        &self,
+    ) -> anyhow::Result<Vec<UnfinishedInboundEventRecoveryRecord>> {
+        self.update(|ledger| Ok(ledger.unfinished_inbound_event_recovery_records()))
+            .await
+    }
+
+    pub async fn record_inbound_event_status_by_hash_at(
+        &self,
+        provider_id: &str,
+        provider_type: &str,
+        provider_event_id_hash: &str,
+        surface_id: &str,
+        status: InboundEventDedupStatus,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<InboundEventRecordDecision> {
+        self.update(|ledger| {
+            ledger.record_inbound_event_status_by_hash_at(
+                provider_id,
+                provider_type,
+                provider_event_id_hash,
+                surface_id,
+                status,
+                now,
+            )
+        })
+        .await
     }
 
     pub async fn response_surface_continuation_turn_index(
@@ -1237,6 +1353,93 @@ mod tests {
             }
         ));
         assert!(!released);
+    }
+
+    #[test]
+    fn unfinished_recovery_records_include_provider_thread_without_content() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        let surface = ledger
+            .create_surface_at(test_surface(now), now)
+            .expect("surface should be created");
+        let input = InboundEventDedupInput {
+            surface_id: surface.surface_id.clone(),
+            ..test_inbound_event(now)
+        };
+        let claim = ledger
+            .claim_inbound_event_at(input.clone(), now + Duration::seconds(1))
+            .expect("event should be claimed");
+        let InboundEventClaimDecision::Claimed {
+            provider_event_id_hash,
+        } = claim
+        else {
+            panic!("event should be claimed");
+        };
+        ledger
+            .record_submitted_possible_inbound_event_at(input, now + Duration::seconds(2))
+            .expect("submitted possible should record");
+
+        let records = ledger.unfinished_inbound_event_recovery_records();
+
+        assert_eq!(
+            records,
+            vec![UnfinishedInboundEventRecoveryRecord {
+                provider_id: "slack-work".to_string(),
+                provider_type: "slack".to_string(),
+                provider_event_id_hash,
+                surface_id: surface.surface_id,
+                status: InboundEventDedupStatus::SubmittedPossible,
+                received_at: now + Duration::seconds(1),
+                provider_account_id: "T123".to_string(),
+                provider_conversation_id: "C123".to_string(),
+                provider_thread_id: "1716200000.000100".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn recovery_can_mark_unfinished_event_terminal_by_hash() {
+        let mut ledger = ResponseSurfaceLedger::in_memory();
+        let now = test_time();
+        let input = test_inbound_event(now);
+        let claim = ledger
+            .claim_inbound_event_at(input.clone(), now)
+            .expect("event should be claimed");
+        let InboundEventClaimDecision::Claimed {
+            provider_event_id_hash,
+        } = claim
+        else {
+            panic!("event should be claimed");
+        };
+
+        let recorded = ledger
+            .record_inbound_event_status_by_hash_at(
+                &input.provider_id,
+                &input.provider_type,
+                &provider_event_id_hash,
+                &input.surface_id,
+                InboundEventDedupStatus::FailedNotified,
+                now + Duration::seconds(1),
+            )
+            .expect("terminal status should record by hash");
+        let duplicate = ledger
+            .claim_inbound_event_at(input, now + Duration::seconds(2))
+            .expect("terminal event should not claim again");
+
+        assert_eq!(
+            recorded,
+            InboundEventRecordDecision::Recorded {
+                provider_event_id_hash: provider_event_id_hash.clone(),
+                status: InboundEventDedupStatus::FailedNotified,
+            }
+        );
+        assert!(matches!(
+            duplicate,
+            InboundEventClaimDecision::DuplicateProcessed {
+                status: InboundEventDedupStatus::FailedNotified,
+                ..
+            }
+        ));
     }
 
     #[test]

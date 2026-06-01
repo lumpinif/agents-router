@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant as TokioInstant, sleep_until};
 use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
@@ -14,7 +14,10 @@ use crate::agent_controller::{
 };
 use crate::agent_integration_catalog::AgentControllerKind;
 
+#[cfg(not(test))]
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct CodexAppServerController {
@@ -428,6 +431,8 @@ async fn wait_for_final_answer(
     turn_state: &mut TurnStartState,
     controller_started_at: Instant,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
+    let mut next_poll_at = TokioInstant::now() + TURN_STATUS_POLL_INTERVAL;
+
     loop {
         if let Some(message) = turn_state.error_message.take() {
             warn!(
@@ -481,16 +486,12 @@ async fn wait_for_final_answer(
 
         // This is not an agent execution timeout. The router does not decide
         // that a long Codex turn failed because time passed. The timer only
-        // gives the controller a chance to read official thread status when
-        // the app-server stream is quiet.
-        let message = match timeout(
-            TURN_STATUS_POLL_INTERVAL,
-            read_message(connection, request, SubmitBoundary::AfterPossibleSubmit),
-        )
-        .await
-        {
-            Ok(message) => message?,
-            Err(_) => {
+        // gives the controller a regular chance to read official thread
+        // status even when the app-server stream stays busy with other events.
+        tokio::select! {
+            biased;
+
+            _ = sleep_until(next_poll_at) => {
                 poll_turn_status_from_thread_snapshot(
                     connection,
                     request,
@@ -499,10 +500,13 @@ async fn wait_for_final_answer(
                     controller_started_at,
                 )
                 .await?;
-                continue;
+                next_poll_at = TokioInstant::now() + TURN_STATUS_POLL_INTERVAL;
             }
-        };
-        turn_state.observe(&message);
+            message = read_message(connection, request, SubmitBoundary::AfterPossibleSubmit) => {
+                let message = message?;
+                turn_state.observe(&message);
+            }
+        }
     }
 }
 
@@ -1540,6 +1544,27 @@ mod tests {
         assert_eq!(result.result_text(), "snake case final");
     }
 
+    #[tokio::test]
+    async fn busy_stream_does_not_starve_thread_status_poll() {
+        let mut connection = BusyStreamConnection::new();
+        let request = controller_request("continue");
+
+        let result = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect("thread snapshot poll should recover the final answer");
+
+        assert_eq!(result.result_text(), "snapshot final");
+        assert!(
+            connection
+                .sent_methods()
+                .iter()
+                .filter(|method| method.as_str() == "thread/resume")
+                .count()
+                >= 2,
+            "controller should issue a status poll even while stream messages keep arriving"
+        );
+    }
+
     #[test]
     fn thread_snapshot_final_answer_marks_current_turn_done() {
         let mut state = TurnStartState::new("session-1".to_string());
@@ -1704,6 +1729,118 @@ mod tests {
 
         async fn read_line(&mut self) -> io::Result<Option<String>> {
             Ok(self.responses.pop_front())
+        }
+    }
+
+    #[derive(Debug)]
+    struct BusyStreamConnection {
+        sent: Vec<String>,
+        handshake: VecDeque<String>,
+        noise_sent: usize,
+        poll_response_sent: bool,
+    }
+
+    impl BusyStreamConnection {
+        fn new() -> Self {
+            Self {
+                sent: Vec::new(),
+                handshake: vec![
+                    response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
+                    thread_read_response(2, "idle"),
+                    response(
+                        3,
+                        json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
+                    ),
+                    response(4, json!({"turn": {"id": "turn-current"}})),
+                ]
+                .into(),
+                noise_sent: 0,
+                poll_response_sent: false,
+            }
+        }
+
+        fn sent_methods(&self) -> Vec<String> {
+            self.sent
+                .iter()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|value| {
+                    value
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+
+        fn last_sent_request(&self) -> Option<Value> {
+            self.sent
+                .last()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        }
+    }
+
+    impl AppServerConnection for BusyStreamConnection {
+        async fn send_line(&mut self, line: String) -> io::Result<()> {
+            self.sent.push(line);
+            Ok(())
+        }
+
+        async fn read_line(&mut self) -> io::Result<Option<String>> {
+            if let Some(response) = self.handshake.pop_front() {
+                return Ok(Some(response));
+            }
+
+            if !self.poll_response_sent
+                && let Some(request) = self.last_sent_request()
+                && request.get("method").and_then(Value::as_str) == Some("thread/resume")
+                && request
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|id| id > 3)
+            {
+                self.poll_response_sent = true;
+                let id = request
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .expect("poll request id should be present");
+                return Ok(Some(response(
+                    id,
+                    json!({
+                        "thread": {
+                            "id": "session-1",
+                            "sessionId": "session-1",
+                            "status": {"type": "idle"},
+                            "turns": [
+                                {
+                                    "id": "turn-current",
+                                    "status": {"type": "completed"},
+                                    "items": [
+                                        {
+                                            "type": "agentMessage",
+                                            "phase": "final_answer",
+                                            "text": "snapshot final"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }),
+                )));
+            }
+
+            if self.noise_sent < 4 {
+                self.noise_sent += 1;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                return Ok(Some(notification(
+                    "turn/started",
+                    json!({
+                        "threadId": "other-session",
+                        "turnId": format!("other-turn-{}", self.noise_sent)
+                    }),
+                )));
+            }
+
+            Ok(None)
         }
     }
 
