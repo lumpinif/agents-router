@@ -431,7 +431,7 @@ impl FeishuLarkLongConnectionRuntime {
                     .update(|ledger| {
                         self.handle_control_command_before_platform_ack(
                             ledger,
-                            command,
+                            *command,
                             event.received_at,
                         )
                     })

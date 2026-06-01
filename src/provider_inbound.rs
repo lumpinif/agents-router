@@ -58,6 +58,17 @@ pub enum ProviderControlCommand {
     BindProject {
         project_path: String,
     },
+    DirectBindProject {
+        project_path: String,
+    },
+    DirectChatGuidance,
+    DirectHelp,
+    DirectNewSession {
+        project_path: Option<String>,
+        prompt: String,
+    },
+    DirectStatus,
+    DirectUnbindProject,
     Help,
     NewSession {
         project_path: Option<String>,
@@ -86,14 +97,19 @@ impl ProviderControlCommand {
     fn requires_room_root(&self) -> bool {
         matches!(
             self,
-            Self::BindProject { .. } | Self::NewSession { .. } | Self::UnbindProject { .. }
+            Self::BindProject { .. }
+                | Self::DirectBindProject { .. }
+                | Self::DirectNewSession { .. }
+                | Self::NewSession { .. }
+                | Self::DirectUnbindProject
+                | Self::UnbindProject { .. }
         )
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlNormalizeResult {
-    ControlCommand(NormalizedProviderControlCommand),
+    ControlCommand(Box<NormalizedProviderControlCommand>),
     Skip(ProviderControlSkipReason),
 }
 
@@ -380,6 +396,9 @@ pub fn normalize_feishu_lark_long_connection_control_command(
         message.message_id.as_deref(),
     )?;
     let chat_id = required_owned("feishu_lark message.chat_id", message.chat_id.as_deref())?;
+    let is_direct_chat = feishu_lark_message_is_direct_chat(&message);
+    let is_thread_reply = optional_field(message.root_id.as_deref())
+        .is_some_and(|root_id| root_id != message_id.as_str());
     let content = required_trimmed("feishu_lark message.content", message.content.as_deref())?;
     let text_content: FeishuLarkTextContent = serde_json::from_str(content)
         .context("failed to parse Feishu/Lark text message content")?;
@@ -398,28 +417,54 @@ pub fn normalize_feishu_lark_long_connection_control_command(
             ProviderControlSkipReason::EmptyMessageText,
         ));
     }
-    let Some(command) = parse_provider_control_command(&text) else {
-        return Ok(ProviderControlNormalizeResult::Skip(
-            ProviderControlSkipReason::NotControlCommand,
-        ));
+    let command = match parse_provider_control_command(&text) {
+        Some(command) => command,
+        None if is_direct_chat && !is_thread_reply => ProviderControlCommand::DirectNewSession {
+            project_path: None,
+            prompt: text,
+        },
+        None => {
+            return Ok(ProviderControlNormalizeResult::Skip(
+                ProviderControlSkipReason::NotControlCommand,
+            ));
+        }
     };
 
     let root_id = optional_field(message.root_id.as_deref());
     let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
     let command = if root_id.is_some() && command.requires_room_root() {
         ProviderControlCommand::Invalid {
-            message: "Run `/bind`, `/new`, or `/unbind` in the room, not inside a thread."
+            message: "Run `/bind`, `/new`, or `/unbind` in the main chat, not inside a thread."
                 .to_string(),
         }
-    } else if command.requires_project_room() && feishu_lark_message_is_direct_chat(&message) {
-        ProviderControlCommand::Invalid {
-            message: "Use this command in a Lark or Feishu room, not in a direct chat.".to_string(),
+    } else if is_direct_chat {
+        match command {
+            ProviderControlCommand::BindProject { project_path } => {
+                ProviderControlCommand::DirectBindProject { project_path }
+            }
+            ProviderControlCommand::Help => ProviderControlCommand::DirectHelp,
+            ProviderControlCommand::Status => ProviderControlCommand::DirectStatus,
+            ProviderControlCommand::NewSession {
+                project_path,
+                prompt,
+            } => ProviderControlCommand::DirectNewSession {
+                project_path,
+                prompt,
+            },
+            ProviderControlCommand::UnbindProject { project_path: None } => {
+                ProviderControlCommand::DirectUnbindProject
+            }
+            command if command.requires_project_room() => ProviderControlCommand::Invalid {
+                message: "Use this command in a Lark or Feishu room, not in a direct chat."
+                    .to_string(),
+            },
+            command => command,
         }
     } else {
         command
     };
 
-    Ok(ProviderControlNormalizeResult::ControlCommand(
+    Ok(ProviderControlNormalizeResult::ControlCommand(Box::new(
         NormalizedProviderControlCommand {
             provider_id: provider_id.to_string(),
             provider_type: "feishu_lark".to_string(),
@@ -430,7 +475,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
             provider_event_id: message_id,
             command,
         },
-    ))
+    )))
 }
 
 pub fn lookup_and_claim_provider_surface_reply(
@@ -1044,6 +1089,10 @@ mod tests {
 
     const TEST_LARK_BOT_OPEN_ID: &str = "ou_test_bot";
 
+    fn control_result(command: NormalizedProviderControlCommand) -> ProviderControlNormalizeResult {
+        ProviderControlNormalizeResult::ControlCommand(Box::new(command))
+    }
+
     #[test]
     fn normalizes_slack_socket_mode_surface_reply_using_thread_ts_as_lookup_key() {
         let normalized = normalize_slack_socket_mode_surface_reply(
@@ -1247,7 +1296,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,
@@ -1301,7 +1350,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,
@@ -1528,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn feishu_lark_direct_chat_bind_reports_room_required() {
+    fn feishu_lark_direct_chat_bind_sets_direct_project() {
         let raw = br#"{
             "schema": "2.0",
             "header": {
@@ -1556,7 +1605,7 @@ mod tests {
                 raw,
             )
             .expect("Feishu/Lark event should parse"),
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,
@@ -1564,11 +1613,169 @@ mod tests {
                 provider_conversation_id: "oc_direct_chat".to_string(),
                 provider_thread_id: "om_bind_message_id".to_string(),
                 provider_event_id: "om_bind_message_id".to_string(),
-                command: ProviderControlCommand::Invalid {
-                    message: "Use this command in a Lark or Feishu room, not in a direct chat."
-                        .to_string(),
+                command: ProviderControlCommand::DirectBindProject {
+                    project_path: "/Users/felix/Desktop/felix-projects/agents-router".to_string(),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn feishu_lark_direct_chat_plain_text_starts_new_session() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_direct_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_direct_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"what is the time\"}"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            control_result(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_direct_chat".to_string(),
+                provider_thread_id: "om_direct_message_id".to_string(),
+                provider_event_id: "om_direct_message_id".to_string(),
+                command: ProviderControlCommand::DirectNewSession {
+                    project_path: None,
+                    prompt: "what is the time".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn feishu_lark_direct_chat_help_does_not_require_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_help_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_direct_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/help\"}"
+                }
+            }
+        }"#;
+
+        let ProviderControlNormalizeResult::ControlCommand(command) =
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse")
+        else {
+            panic!("direct chat help should normalize");
+        };
+
+        assert_eq!(command.command, ProviderControlCommand::DirectHelp);
+    }
+
+    #[test]
+    fn feishu_lark_direct_chat_status_does_not_require_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_status_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_direct_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/status\"}"
+                }
+            }
+        }"#;
+
+        let ProviderControlNormalizeResult::ControlCommand(command) =
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse")
+        else {
+            panic!("direct chat status should normalize");
+        };
+
+        assert_eq!(command.command, ProviderControlCommand::DirectStatus);
+    }
+
+    #[test]
+    fn feishu_lark_direct_chat_new_with_explicit_project_does_not_require_room() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_new_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_direct_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/new /Users/felix/Desktop/felix-projects/agents-router Reply OK.\"}"
+                }
+            }
+        }"#;
+
+        let ProviderControlNormalizeResult::ControlCommand(command) =
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse")
+        else {
+            panic!("direct chat new should normalize");
+        };
+
+        assert_eq!(
+            command.command,
+            ProviderControlCommand::DirectNewSession {
+                project_path: Some("/Users/felix/Desktop/felix-projects/agents-router".to_string()),
+                prompt: "Reply OK.".to_string(),
+            }
         );
     }
 
@@ -1611,7 +1818,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,
@@ -1663,7 +1870,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,
@@ -1715,7 +1922,7 @@ mod tests {
 
         assert_eq!(
             normalized,
-            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+            control_result(NormalizedProviderControlCommand {
                 provider_id: "lark-app".to_string(),
                 provider_type: "feishu_lark".to_string(),
                 provider_mode: ProviderMode::FeishuLarkAppBot,

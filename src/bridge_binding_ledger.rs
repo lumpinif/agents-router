@@ -29,6 +29,8 @@ pub struct BridgeBindingLedgerStore {
 struct BridgeBindingLedgerFile {
     schema_version: u32,
     room_project_bindings: Vec<RoomProjectBindingRecord>,
+    #[serde(default)]
+    direct_chat_project_bindings: Vec<DirectChatProjectBindingRecord>,
     thread_session_bindings: Vec<ThreadSessionBindingRecord>,
 }
 
@@ -62,6 +64,35 @@ pub struct RoomProjectBindingInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomBindingQuery {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectChatProjectBindingRecord {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub project_path: String,
+    pub status: RoomProjectBindingStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectChatProjectBindingInput {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub project_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectChatBindingQuery {
     pub provider_id: String,
     pub provider_type: String,
     pub provider_account_id: String,
@@ -254,6 +285,103 @@ impl BridgeBindingLedger {
             .collect())
     }
 
+    pub fn connected_room_project_bindings_for_provider_account(
+        &self,
+        provider_id: &str,
+        provider_type: &str,
+        provider_account_id: &str,
+    ) -> anyhow::Result<Vec<RoomProjectBindingRecord>> {
+        validate_present("provider_id", provider_id)?;
+        validate_present("provider_type", provider_type)?;
+        validate_present("provider_account_id", provider_account_id)?;
+        Ok(self
+            .state
+            .room_project_bindings
+            .iter()
+            .filter(|record| {
+                record.provider_id == provider_id
+                    && record.provider_type == provider_type
+                    && record.provider_account_id == provider_account_id
+                    && record.status == RoomProjectBindingStatus::Connected
+            })
+            .cloned()
+            .collect())
+    }
+
+    pub fn connect_direct_chat_project_at(
+        &mut self,
+        input: DirectChatProjectBindingInput,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<DirectChatProjectBindingRecord> {
+        validate_direct_chat_project_binding_input(&input)?;
+        if let Some(record) = self
+            .state
+            .direct_chat_project_bindings
+            .iter_mut()
+            .find(|record| {
+                direct_chat_binding_matches(record, &DirectChatBindingQuery::from(&input))
+            })
+        {
+            record.project_path = input.project_path;
+            record.status = RoomProjectBindingStatus::Connected;
+            record.updated_at = now;
+            let record = record.clone();
+            self.save()?;
+            return Ok(record);
+        }
+
+        let record = DirectChatProjectBindingRecord {
+            provider_id: input.provider_id,
+            provider_type: input.provider_type,
+            provider_account_id: input.provider_account_id,
+            provider_conversation_id: input.provider_conversation_id,
+            project_path: input.project_path,
+            status: RoomProjectBindingStatus::Connected,
+            created_at: now,
+            updated_at: now,
+        };
+        self.state.direct_chat_project_bindings.push(record.clone());
+        self.save()?;
+        Ok(record)
+    }
+
+    pub fn disconnect_direct_chat_project_at(
+        &mut self,
+        query: &DirectChatBindingQuery,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<DirectChatProjectBindingRecord>> {
+        validate_direct_chat_binding_query(query)?;
+        let Some(record) = self
+            .state
+            .direct_chat_project_bindings
+            .iter_mut()
+            .find(|record| direct_chat_binding_matches(record, query))
+        else {
+            return Ok(None);
+        };
+        record.status = RoomProjectBindingStatus::Disconnected;
+        record.updated_at = now;
+        let record = record.clone();
+        self.save()?;
+        Ok(Some(record))
+    }
+
+    pub fn connected_project_for_direct_chat(
+        &self,
+        query: &DirectChatBindingQuery,
+    ) -> anyhow::Result<Option<DirectChatProjectBindingRecord>> {
+        validate_direct_chat_binding_query(query)?;
+        Ok(self
+            .state
+            .direct_chat_project_bindings
+            .iter()
+            .find(|record| {
+                direct_chat_binding_matches(record, query)
+                    && record.status == RoomProjectBindingStatus::Connected
+            })
+            .cloned())
+    }
+
     pub fn connected_rooms_for_project(&self, project_path: &str) -> Vec<RoomProjectBindingRecord> {
         self.state
             .room_project_bindings
@@ -383,6 +511,7 @@ impl BridgeBindingLedgerFile {
         Self {
             schema_version: BRIDGE_BINDING_LEDGER_SCHEMA_VERSION,
             room_project_bindings: Vec::new(),
+            direct_chat_project_bindings: Vec::new(),
             thread_session_bindings: Vec::new(),
         }
     }
@@ -400,6 +529,17 @@ impl From<&ThreadSessionBindingInput> for ThreadBindingQuery {
     }
 }
 
+impl From<&DirectChatProjectBindingInput> for DirectChatBindingQuery {
+    fn from(input: &DirectChatProjectBindingInput) -> Self {
+        Self {
+            provider_id: input.provider_id.clone(),
+            provider_type: input.provider_type.clone(),
+            provider_account_id: input.provider_account_id.clone(),
+            provider_conversation_id: input.provider_conversation_id.clone(),
+        }
+    }
+}
+
 fn validate_room_project_binding_input(input: &RoomProjectBindingInput) -> anyhow::Result<()> {
     validate_provider_binding_parts(
         &input.provider_id,
@@ -408,6 +548,27 @@ fn validate_room_project_binding_input(input: &RoomProjectBindingInput) -> anyho
         &input.provider_conversation_id,
     )?;
     validate_project_path(&input.project_path)
+}
+
+fn validate_direct_chat_project_binding_input(
+    input: &DirectChatProjectBindingInput,
+) -> anyhow::Result<()> {
+    validate_provider_binding_parts(
+        &input.provider_id,
+        &input.provider_type,
+        &input.provider_account_id,
+        &input.provider_conversation_id,
+    )?;
+    validate_project_path(&input.project_path)
+}
+
+fn validate_direct_chat_binding_query(query: &DirectChatBindingQuery) -> anyhow::Result<()> {
+    validate_provider_binding_parts(
+        &query.provider_id,
+        &query.provider_type,
+        &query.provider_account_id,
+        &query.provider_conversation_id,
+    )
 }
 
 fn validate_thread_session_binding_input(input: &ThreadSessionBindingInput) -> anyhow::Result<()> {
@@ -480,6 +641,16 @@ fn room_project_binding_matches(
 }
 
 fn room_binding_matches(record: &RoomProjectBindingRecord, query: &RoomBindingQuery) -> bool {
+    record.provider_id == query.provider_id
+        && record.provider_type == query.provider_type
+        && record.provider_account_id == query.provider_account_id
+        && record.provider_conversation_id == query.provider_conversation_id
+}
+
+fn direct_chat_binding_matches(
+    record: &DirectChatProjectBindingRecord,
+    query: &DirectChatBindingQuery,
+) -> bool {
     record.provider_id == query.provider_id
         && record.provider_type == query.provider_type
         && record.provider_account_id == query.provider_account_id
@@ -656,6 +827,56 @@ mod tests {
         assert_eq!(bindings[0].project_path, "/repo/agents-router");
     }
 
+    #[test]
+    fn direct_chat_binding_keeps_one_default_project_per_chat() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let now = test_time();
+        ledger
+            .connect_direct_chat_project_at(
+                direct_chat_project("direct-chat-1", "/repo/agents-router"),
+                now,
+            )
+            .expect("direct chat should bind project");
+        ledger
+            .connect_direct_chat_project_at(
+                direct_chat_project("direct-chat-1", "/repo/agent-transport-system"),
+                now,
+            )
+            .expect("direct chat should replace default project");
+
+        let binding = ledger
+            .connected_project_for_direct_chat(&direct_chat_query("direct-chat-1"))
+            .expect("direct chat binding query should load")
+            .expect("direct chat should have a default project");
+        assert_eq!(binding.project_path, "/repo/agent-transport-system");
+        assert_eq!(ledger.state.direct_chat_project_bindings.len(), 1);
+    }
+
+    #[test]
+    fn direct_chat_binding_can_disconnect_default_project() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let now = test_time();
+        ledger
+            .connect_direct_chat_project_at(
+                direct_chat_project("direct-chat-1", "/repo/agents-router"),
+                now,
+            )
+            .expect("direct chat should bind project");
+
+        let disconnected = ledger
+            .disconnect_direct_chat_project_at(&direct_chat_query("direct-chat-1"), now)
+            .expect("direct chat should disconnect")
+            .expect("direct chat binding should exist");
+
+        assert_eq!(disconnected.project_path, "/repo/agents-router");
+        assert!(
+            ledger
+                .connected_project_for_direct_chat(&direct_chat_query("direct-chat-1"))
+                .expect("direct chat binding query should load")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn store_persists_room_project_binding() {
         let dir = tempfile::tempdir().expect("temp dir should exist");
@@ -693,6 +914,28 @@ mod tests {
 
     fn room_query(provider_conversation_id: &str) -> RoomBindingQuery {
         RoomBindingQuery {
+            provider_id: "lark-personal-agent".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_account_id: "tenant-1".to_string(),
+            provider_conversation_id: provider_conversation_id.to_string(),
+        }
+    }
+
+    fn direct_chat_project(
+        provider_conversation_id: &str,
+        project_path: &str,
+    ) -> DirectChatProjectBindingInput {
+        DirectChatProjectBindingInput {
+            provider_id: "lark-personal-agent".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_account_id: "tenant-1".to_string(),
+            provider_conversation_id: provider_conversation_id.to_string(),
+            project_path: project_path.to_string(),
+        }
+    }
+
+    fn direct_chat_query(provider_conversation_id: &str) -> DirectChatBindingQuery {
+        DirectChatBindingQuery {
             provider_id: "lark-personal-agent".to_string(),
             provider_type: "feishu_lark".to_string(),
             provider_account_id: "tenant-1".to_string(),
