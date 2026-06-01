@@ -19,6 +19,18 @@ impl ExecutionScopeKey {
         }
     }
 
+    pub(crate) fn from_parts(
+        source_type: impl Into<String>,
+        source_id: impl Into<String>,
+        source_session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_type: source_type.into(),
+            source_id: source_id.into(),
+            source_session_id: source_session_id.into(),
+        }
+    }
+
     pub(crate) fn source_type(&self) -> &str {
         &self.source_type
     }

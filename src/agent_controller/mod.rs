@@ -35,6 +35,10 @@ const PROVIDER_THREAD_REPLY_RETRY_DELAY: TokioDuration = TokioDuration::from_mil
 pub type AgentControllerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentControllerSuccess, AgentControllerError>> + Send + 'a>>;
 
+pub type AgentSessionStartFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<AgentSessionStartSuccess, AgentControllerError>> + Send + 'a>,
+>;
+
 pub type ProviderThreadReplyFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<ProviderThreadReplySuccess, ProviderThreadReplyError>>
@@ -51,6 +55,19 @@ pub trait AgentControllerAdapter: Send + Sync {
     fn continue_session<'a>(&'a self, request: AgentControllerRequest)
     -> AgentControllerFuture<'a>;
 
+    fn start_session<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+    ) -> AgentSessionStartFuture<'a> {
+        Box::pin(async move {
+            Err(AgentControllerError::failed_before_submit(
+                &request.as_placeholder_controller_request(),
+                AgentControllerErrorKind::ControllerUnavailable,
+                "agent controller adapter cannot start new sessions",
+            ))
+        })
+    }
+
     fn continue_session_with_submit_observer<'a>(
         &'a self,
         request: AgentControllerRequest,
@@ -59,11 +76,30 @@ pub trait AgentControllerAdapter: Send + Sync {
         let _ = submit_observer;
         self.continue_session(request)
     }
+
+    fn start_session_with_observer<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+        observer: &'a dyn AgentSessionStartObserver,
+    ) -> AgentSessionStartFuture<'a> {
+        let _ = observer;
+        self.start_session(request)
+    }
 }
 
 pub trait AgentControllerSubmitObserver: Send + Sync {
     fn submitted_possible<'a>(&'a self, source_turn_id: &'a str)
     -> AgentControllerSubmitFuture<'a>;
+}
+
+pub trait AgentSessionStartObserver: Send + Sync {
+    fn thread_started<'a>(&'a self, source_session_id: &'a str) -> AgentControllerSubmitFuture<'a>;
+
+    fn submitted_possible<'a>(
+        &'a self,
+        source_session_id: &'a str,
+        source_turn_id: &'a str,
+    ) -> AgentControllerSubmitFuture<'a>;
 }
 
 pub trait ProviderThreadReplyAdapter: Send + Sync {
@@ -131,6 +167,32 @@ pub struct AgentControllerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionStartRequest {
+    pub controller_kind: AgentControllerKind,
+    pub surface_id: String,
+    pub source_id: String,
+    pub source_type: SourceType,
+    pub project_path: String,
+    pub prompt: String,
+    pub provider_event_id_hash: String,
+}
+
+impl AgentSessionStartRequest {
+    pub(crate) fn as_placeholder_controller_request(&self) -> AgentControllerRequest {
+        AgentControllerRequest {
+            controller_kind: self.controller_kind,
+            surface_id: self.surface_id.clone(),
+            source_id: self.source_id.clone(),
+            source_type: self.source_type,
+            source_session_id: "new-session".to_string(),
+            source_turn_id: None,
+            reply_text: self.prompt.clone(),
+            provider_event_id_hash: self.provider_event_id_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentControllerSuccess {
     result_text: String,
 }
@@ -148,6 +210,12 @@ impl AgentControllerSuccess {
     pub fn result_text(&self) -> &str {
         &self.result_text
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionStartSuccess {
+    pub source_session_id: String,
+    pub result: AgentControllerSuccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -11,6 +11,8 @@ use tracing::{debug, info, warn};
 use crate::agent_controller::{
     AgentControllerAdapter, AgentControllerError, AgentControllerErrorKind, AgentControllerFuture,
     AgentControllerRequest, AgentControllerSubmitObserver, AgentControllerSuccess,
+    AgentSessionStartFuture, AgentSessionStartObserver, AgentSessionStartRequest,
+    AgentSessionStartSuccess,
 };
 use crate::agent_integration_catalog::AgentControllerKind;
 
@@ -95,6 +97,38 @@ impl AgentControllerAdapter for CodexAppServerController {
             result
         })
     }
+
+    fn start_session<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+    ) -> AgentSessionStartFuture<'a> {
+        Box::pin(async move {
+            let observer = NoopStartObserver;
+            self.start_session_with_observer(request, &observer).await
+        })
+    }
+
+    fn start_session_with_observer<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+        observer: &'a dyn AgentSessionStartObserver,
+    ) -> AgentSessionStartFuture<'a> {
+        Box::pin(async move {
+            let mut connection = ProcessAppServerConnection::spawn(&self.command)
+                .await
+                .map_err(|message| {
+                    AgentControllerError::failed_before_submit(
+                        &request.as_placeholder_controller_request(),
+                        AgentControllerErrorKind::ControllerUnavailable,
+                        message,
+                    )
+                })?;
+
+            let result = start_session_with_connection(&mut connection, &request, observer).await;
+            connection.shutdown().await;
+            result
+        })
+    }
 }
 
 struct NoopSubmitObserver;
@@ -102,6 +136,25 @@ struct NoopSubmitObserver;
 impl AgentControllerSubmitObserver for NoopSubmitObserver {
     fn submitted_possible<'a>(
         &'a self,
+        _source_turn_id: &'a str,
+    ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct NoopStartObserver;
+
+impl AgentSessionStartObserver for NoopStartObserver {
+    fn thread_started<'a>(
+        &'a self,
+        _source_session_id: &'a str,
+    ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn submitted_possible<'a>(
+        &'a self,
+        _source_session_id: &'a str,
         _source_turn_id: &'a str,
     ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
         Box::pin(async { Ok(()) })
@@ -424,6 +477,145 @@ async fn continue_session_with_connection(
     .await
 }
 
+async fn start_session_with_connection(
+    connection: &mut impl AppServerConnection,
+    request: &AgentSessionStartRequest,
+    observer: &dyn AgentSessionStartObserver,
+) -> Result<AgentSessionStartSuccess, AgentControllerError> {
+    let controller_started_at = Instant::now();
+    let placeholder = request.as_placeholder_controller_request();
+    info!(
+        surface.id = %request.surface_id,
+        source.id = %request.source_id,
+        source.type = %request.source_type.as_str(),
+        project.path = %request.project_path,
+        controller.kind = ?request.controller_kind,
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.session_start.controller.started",
+    );
+    let mut next_request_id = 1;
+    send_request(
+        connection,
+        &placeholder,
+        &mut next_request_id,
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "agents-router",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            },
+        }),
+        SubmitBoundary::BeforeSubmit,
+        None,
+    )
+    .await?;
+    send_notification(
+        connection,
+        &placeholder,
+        "initialized",
+        json!({}),
+        SubmitBoundary::BeforeSubmit,
+    )
+    .await?;
+
+    let thread_start_result = send_request(
+        connection,
+        &placeholder,
+        &mut next_request_id,
+        "thread/start",
+        json!({
+            "cwd": &request.project_path,
+            "threadSource": "user",
+        }),
+        SubmitBoundary::BeforeSubmit,
+        None,
+    )
+    .await?;
+    let source_session_id =
+        thread_id_from_result(&placeholder, &thread_start_result, "thread/start")?.to_string();
+    info!(
+        surface.id = %request.surface_id,
+        source.session.id = %source_session_id,
+        project.path = %request.project_path,
+        elapsed.ms = controller_started_at.elapsed().as_millis(),
+        event.hash = %request.provider_event_id_hash,
+        event = "codex_app_server.thread_start.succeeded",
+    );
+    observer
+        .thread_started(&source_session_id)
+        .await
+        .map_err(|error| {
+            AgentControllerError::failed_before_submit(
+                &AgentControllerRequest {
+                    source_session_id: source_session_id.clone(),
+                    ..placeholder.clone()
+                },
+                AgentControllerErrorKind::Internal,
+                format!("failed to record new session binding: {error}"),
+            )
+        })?;
+
+    let turn_request = AgentControllerRequest {
+        source_session_id: source_session_id.clone(),
+        reply_text: request.prompt.clone(),
+        ..placeholder
+    };
+    let mut turn_state = TurnStartState::new(source_session_id.clone());
+    let turn_start_result = send_request(
+        connection,
+        &turn_request,
+        &mut next_request_id,
+        "turn/start",
+        json!({
+            "threadId": source_session_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": &request.prompt,
+                }
+            ],
+        }),
+        SubmitBoundary::AfterPossibleSubmit,
+        Some(&mut turn_state),
+    )
+    .await?;
+    turn_state.bind_turn_from_start_response(&turn_request, &turn_start_result)?;
+    let source_turn_id = turn_state.turn_id.as_deref().ok_or_else(|| {
+        error_after_possible_submit(
+            &turn_request,
+            AgentControllerErrorKind::Internal,
+            "Codex App Server accepted turn/start without turn id",
+        )
+    })?;
+    observer
+        .submitted_possible(&source_session_id, source_turn_id)
+        .await
+        .map_err(|error| {
+            error_after_possible_submit(
+                &turn_request,
+                AgentControllerErrorKind::Internal,
+                format!("failed to record submitted new session boundary: {error}"),
+            )
+        })?;
+
+    let result = wait_for_final_answer(
+        connection,
+        &turn_request,
+        &mut next_request_id,
+        &mut turn_state,
+        controller_started_at,
+    )
+    .await?;
+
+    Ok(AgentSessionStartSuccess {
+        source_session_id,
+        result,
+    })
+}
+
 async fn wait_for_final_answer(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
@@ -721,6 +913,21 @@ fn thread_from_result<'a>(
             request,
             AgentControllerErrorKind::SessionNotContinuable,
             format!("Codex App Server {method} response did not include thread facts"),
+        )
+    })
+}
+
+fn thread_id_from_result<'a>(
+    request: &AgentControllerRequest,
+    result: &'a Value,
+    method: &str,
+) -> Result<&'a str, AgentControllerError> {
+    let thread = thread_from_result(request, result, method)?;
+    thread.get("id").and_then(Value::as_str).ok_or_else(|| {
+        AgentControllerError::failed_before_submit(
+            request,
+            AgentControllerErrorKind::SessionNotContinuable,
+            format!("Codex App Server {method} response did not include thread.id"),
         )
     })
 }
@@ -1698,6 +1905,60 @@ mod tests {
         assert_eq!(connection.sent_len(), 4);
     }
 
+    #[tokio::test]
+    async fn start_session_creates_thread_then_starts_first_turn() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.134.0"})),
+            response(
+                2,
+                json!({
+                    "thread": {
+                        "id": "new-session-1",
+                        "sessionId": "new-session-1",
+                        "status": {"type": "idle"}
+                    }
+                }),
+            ),
+            response(3, json!({"turn": {"id": "turn-new"}})),
+            notification(
+                "item/completed",
+                json!({
+                    "threadId": "new-session-1",
+                    "turnId": "turn-new",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item-final",
+                        "phase": "final_answer",
+                        "text": "new session result"
+                    }
+                }),
+            ),
+        ]);
+        let request = session_start_request("Reply OK.");
+        let observer = NoopStartObserver;
+
+        let result = start_session_with_connection(&mut connection, &request, &observer)
+            .await
+            .expect("new session should complete");
+
+        assert_eq!(result.source_session_id, "new-session-1");
+        assert_eq!(result.result.result_text(), "new session result");
+        assert_eq!(connection.sent_json(2)["method"], "thread/start");
+        assert_eq!(
+            connection.sent_json(2)["params"]["cwd"],
+            "/Users/tester/projects/agents-router"
+        );
+        assert_eq!(connection.sent_json(3)["method"], "turn/start");
+        assert_eq!(
+            connection.sent_json(3)["params"]["threadId"],
+            "new-session-1"
+        );
+        assert_eq!(
+            connection.sent_json(3)["params"]["input"][0]["text"],
+            "Reply OK."
+        );
+    }
+
     #[derive(Debug)]
     struct FakeAppServerConnection {
         sent: Vec<String>,
@@ -1906,6 +2167,18 @@ mod tests {
             source_session_id: "session-1".to_string(),
             source_turn_id: Some("turn-1".to_string()),
             reply_text: reply_text.to_string(),
+            provider_event_id_hash: "event-hash".to_string(),
+        }
+    }
+
+    fn session_start_request(prompt: &str) -> AgentSessionStartRequest {
+        AgentSessionStartRequest {
+            controller_kind: AgentControllerKind::CodexAppServer,
+            surface_id: "surface-new".to_string(),
+            source_id: "codex_desktop".to_string(),
+            source_type: SourceType::CodexDesktop,
+            project_path: "/Users/tester/projects/agents-router".to_string(),
+            prompt: prompt.to_string(),
             provider_event_id_hash: "event-hash".to_string(),
         }
     }

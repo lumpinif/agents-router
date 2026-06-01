@@ -14,6 +14,7 @@ pub mod local_ingress;
 pub mod local_integrations;
 pub mod local_machine;
 pub mod local_open_bridge;
+pub(crate) mod new_session_dispatcher;
 pub mod notification_detail_policy;
 pub mod paths;
 pub mod process;

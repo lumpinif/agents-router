@@ -6,6 +6,7 @@ pub mod feishu_lark;
 pub(crate) mod feishu_lark_continuation;
 pub(crate) mod feishu_lark_control;
 pub mod feishu_lark_long_connection;
+pub(crate) mod feishu_lark_new_session;
 mod formatting;
 mod http;
 pub mod microsoft_teams;

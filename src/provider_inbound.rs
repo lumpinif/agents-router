@@ -55,22 +55,38 @@ pub struct NormalizedProviderControlCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlCommand {
-    BindProject { project_path: String },
+    BindProject {
+        project_path: String,
+    },
     Help,
+    NewSession {
+        project_path: Option<String>,
+        prompt: String,
+    },
     Status,
-    UnbindProject { project_path: Option<String> },
-    Invalid { message: String },
+    UnbindProject {
+        project_path: Option<String>,
+    },
+    Invalid {
+        message: String,
+    },
 }
 
 impl ProviderControlCommand {
-    fn changes_room_binding(&self) -> bool {
-        matches!(self, Self::BindProject { .. } | Self::UnbindProject { .. })
-    }
-
     fn requires_project_room(&self) -> bool {
         matches!(
             self,
-            Self::BindProject { .. } | Self::Status | Self::UnbindProject { .. }
+            Self::BindProject { .. }
+                | Self::NewSession { .. }
+                | Self::Status
+                | Self::UnbindProject { .. }
+        )
+    }
+
+    fn requires_room_root(&self) -> bool {
+        matches!(
+            self,
+            Self::BindProject { .. } | Self::NewSession { .. } | Self::UnbindProject { .. }
         )
     }
 }
@@ -390,9 +406,10 @@ pub fn normalize_feishu_lark_long_connection_control_command(
 
     let root_id = optional_field(message.root_id.as_deref());
     let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
-    let command = if root_id.is_some() && command.changes_room_binding() {
+    let command = if root_id.is_some() && command.requires_room_root() {
         ProviderControlCommand::Invalid {
-            message: "Run `/bind` or `/unbind` in the room, not inside a thread.".to_string(),
+            message: "Run `/bind`, `/new`, or `/unbind` in the room, not inside a thread."
+                .to_string(),
         }
     } else if command.requires_project_room() && feishu_lark_message_is_direct_chat(&message) {
         ProviderControlCommand::Invalid {
@@ -870,6 +887,7 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             }
             Some(ProviderControlCommand::Help)
         }
+        "/new" => Some(parse_new_session_command(rest)),
         "/status" => {
             if !rest.trim().is_empty() {
                 return Some(ProviderControlCommand::Invalid {
@@ -888,6 +906,41 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             })
         }
         _ => None,
+    }
+}
+
+fn parse_new_session_command(rest: &str) -> ProviderControlCommand {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return ProviderControlCommand::Invalid {
+            message: "Use `/new what you want Codex to do`.".to_string(),
+        };
+    }
+
+    let Some((first, remaining)) = rest.split_once(char::is_whitespace) else {
+        return ProviderControlCommand::NewSession {
+            project_path: None,
+            prompt: rest.to_string(),
+        };
+    };
+
+    if first.starts_with('/') {
+        let prompt = remaining.trim();
+        if prompt.is_empty() {
+            return ProviderControlCommand::Invalid {
+                message: "Use `/new /absolute/project/path what you want Codex to do`.".to_string(),
+            };
+        }
+
+        return ProviderControlCommand::NewSession {
+            project_path: Some(first.to_string()),
+            prompt: prompt.to_string(),
+        };
+    }
+
+    ProviderControlCommand::NewSession {
+        project_path: None,
+        prompt: rest.to_string(),
     }
 }
 
@@ -1204,6 +1257,61 @@ mod tests {
                 provider_event_id: "om_bind_message_id".to_string(),
                 command: ProviderControlCommand::BindProject {
                     project_path: "/Users/felix/Desktop/felix-projects/agents-router".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_feishu_lark_root_new_command_after_bot_mention() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_new_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 /new Reply exactly OK.\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let normalized = normalize_feishu_lark_long_connection_control_command(
+            "lark-app",
+            TEST_LARK_BOT_OPEN_ID,
+            raw,
+        )
+        .expect("Feishu/Lark event should parse");
+
+        assert_eq!(
+            normalized,
+            ProviderControlNormalizeResult::ControlCommand(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_new_message_id".to_string(),
+                provider_event_id: "om_new_message_id".to_string(),
+                command: ProviderControlCommand::NewSession {
+                    project_path: None,
+                    prompt: "Reply exactly OK.".to_string(),
                 },
             })
         );
