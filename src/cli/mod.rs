@@ -1830,6 +1830,8 @@ async fn reconcile_unfinished_response_surface_events(
                     provider.thread.id = %record.provider_thread_id,
                     event.hash = %record.provider_event_id_hash,
                     inbound.status = %record.status.as_str(),
+                    http.status = error.http_status,
+                    error.retriable = error.retriable,
                     error = %error.message,
                     event = "response_surface.inbound_event.recovery_notice.failed",
                 );

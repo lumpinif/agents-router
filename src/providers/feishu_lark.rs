@@ -714,6 +714,7 @@ impl FeishuLarkProvider {
                         error.without_url()
                     ),
                 )
+                .with_retriable(true)
             })?;
 
         let status = response.status();
@@ -725,15 +726,19 @@ impl FeishuLarkProvider {
                     error.without_url()
                 ),
             )
+            .with_retriable(true)
         })?;
         if !status.is_success() {
+            let status_code = status.as_u16();
             return Err(thread_reply_error(
                 &request,
                 format!(
                     "Feishu/Lark App Bot thread reply returned HTTP status {}",
                     status
                 ),
-            ));
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
         }
 
         let provider_response: FeishuLarkAppBotReplyMessageResponse =
@@ -803,6 +808,7 @@ impl FeishuLarkProvider {
                         error.without_url()
                     ),
                 )
+                .with_retriable(true)
             })?;
 
         let status = response.status();
@@ -814,15 +820,19 @@ impl FeishuLarkProvider {
                     error.without_url()
                 ),
             )
+            .with_retriable(true)
         })?;
         if !status.is_success() {
+            let status_code = status.as_u16();
             return Err(thread_reply_error(
                 request,
                 format!(
                     "tenant access token request returned HTTP status {}",
                     status
                 ),
-            ));
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
         }
 
         let provider_response: FeishuLarkTenantAccessTokenResponse =
@@ -1315,7 +1325,9 @@ fn thread_reply_error(
         provider_type: request.provider_type.clone(),
         surface_id: request.surface_id.clone(),
         provider_event_id_hash: request.provider_event_id_hash.clone(),
-        message: message.into(),
+        message: message.into().into_boxed_str(),
+        http_status: None,
+        retriable: false,
     }
 }
 

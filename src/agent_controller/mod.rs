@@ -96,7 +96,7 @@ pub async fn send_provider_thread_reply_with_retry(
                 }
                 return Ok(success);
             }
-            Err(error) if attempt < PROVIDER_THREAD_REPLY_MAX_ATTEMPTS => {
+            Err(error) if error.retriable && attempt < PROVIDER_THREAD_REPLY_MAX_ATTEMPTS => {
                 warn!(
                     surface.id = %request.surface_id,
                     provider.id = %request.provider_id,
@@ -105,6 +105,8 @@ pub async fn send_provider_thread_reply_with_retry(
                     event.hash = %request.provider_event_id_hash,
                     attempt,
                     max_attempts = PROVIDER_THREAD_REPLY_MAX_ATTEMPTS,
+                    http.status = error.http_status,
+                    error.retriable = error.retriable,
                     error = %error.message,
                     event = "provider_thread_result_reply.retrying",
                 );
@@ -171,7 +173,9 @@ pub struct ProviderThreadReplyError {
     pub provider_type: String,
     pub surface_id: String,
     pub provider_event_id_hash: String,
-    pub message: String,
+    pub message: Box<str>,
+    pub http_status: Option<u16>,
+    pub retriable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,8 +850,20 @@ impl ProviderThreadReplyError {
             provider_type: ready.reply.provider_type.clone(),
             surface_id: ready.surface.surface_id.clone(),
             provider_event_id_hash: ready.provider_event_id_hash.clone(),
-            message: message.into(),
+            message: message.into().into_boxed_str(),
+            http_status: None,
+            retriable: false,
         }
+    }
+
+    pub fn with_http_status(mut self, http_status: u16) -> Self {
+        self.http_status = Some(http_status);
+        self
+    }
+
+    pub fn with_retriable(mut self, retriable: bool) -> Self {
+        self.retriable = retriable;
+        self
     }
 }
 
@@ -972,6 +988,8 @@ async fn send_explicit_text_reply_and_record_status(
                 provider.type = %ready.reply.provider_type,
                 provider.thread.id = %ready.reply.provider_thread_id,
                 event.hash = %ready.provider_event_id_hash,
+                http.status = error.http_status,
+                error.retriable = error.retriable,
                 error = %error.message,
                 event = "provider_thread_result_reply.failed",
             );
@@ -1072,6 +1090,8 @@ async fn send_explicit_text_reply_and_record_status_with_store(
                 provider.type = %ready.reply.provider_type,
                 provider.thread.id = %ready.reply.provider_thread_id,
                 event.hash = %ready.provider_event_id_hash,
+                http.status = error.http_status,
+                error.retriable = error.retriable,
                 error = %error.message,
                 event = "provider_thread_result_reply.failed",
             );
@@ -1856,10 +1876,7 @@ mod tests {
             )
         ));
         assert_eq!(adapter.requests().len(), 1);
-        assert_eq!(
-            provider_reply.requests().len(),
-            PROVIDER_THREAD_REPLY_MAX_ATTEMPTS
-        );
+        assert_eq!(provider_reply.requests().len(), 1);
         assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
@@ -2002,10 +2019,7 @@ mod tests {
             )
         ));
         assert_eq!(adapter.requests().len(), 1);
-        assert_eq!(
-            provider_reply.requests().len(),
-            PROVIDER_THREAD_REPLY_MAX_ATTEMPTS
-        );
+        assert_eq!(provider_reply.requests().len(), 1);
         assert_event_is_submitted_possible(&mut ledger, ready);
     }
 
@@ -2397,7 +2411,9 @@ mod tests {
                             provider_type: request.provider_type,
                             surface_id: request.surface_id,
                             provider_event_id_hash: request.provider_event_id_hash,
-                            message: error.clone(),
+                            message: error.clone().into_boxed_str(),
+                            http_status: None,
+                            retriable: true,
                         });
                     }
                 }
@@ -2407,7 +2423,9 @@ mod tests {
                         provider_type: request.provider_type,
                         surface_id: request.surface_id,
                         provider_event_id_hash: request.provider_event_id_hash,
-                        message: error.clone(),
+                        message: error.clone().into_boxed_str(),
+                        http_status: Some(400),
+                        retriable: false,
                     });
                 }
                 Ok(ProviderThreadReplySuccess {

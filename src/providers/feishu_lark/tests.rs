@@ -507,6 +507,102 @@ async fn app_bot_sends_agent_result_text_to_same_root_thread() {
 }
 
 #[tokio::test]
+async fn app_bot_thread_reply_http_400_is_not_retriable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "code": 99991663,
+            "msg": "invalid request"
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("HTTP 400 should fail");
+
+    assert_eq!(err.http_status, Some(400));
+    assert!(!err.retriable);
+}
+
+#[tokio::test]
+async fn app_bot_thread_reply_http_429_is_retriable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "code": 99991429,
+            "msg": "rate limited"
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("HTTP 429 should fail");
+
+    assert_eq!(err.http_status, Some(429));
+    assert!(err.retriable);
+}
+
+#[tokio::test]
+async fn app_bot_thread_reply_http_500_is_retriable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "code": 99991500,
+            "msg": "server error"
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let err = provider
+        .send_thread_reply(thread_reply_request("agent final result"))
+        .await
+        .expect_err("HTTP 500 should fail");
+
+    assert_eq!(err.http_status, Some(500));
+    assert!(err.retriable);
+}
+
+#[tokio::test]
 async fn personal_agent_without_default_room_can_reply_to_bound_thread() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

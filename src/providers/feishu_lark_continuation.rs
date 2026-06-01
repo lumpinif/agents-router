@@ -243,6 +243,8 @@ async fn send_lark_thread_reply_text(
                 provider.type = %ready.reply.provider_type,
                 provider.thread.id = %ready.reply.provider_thread_id,
                 event.hash = %ready.provider_event_id_hash,
+                http.status = error.http_status,
+                error.retriable = error.retriable,
                 error = %error.message,
                 event = "provider_thread_result_reply.failed",
             );
