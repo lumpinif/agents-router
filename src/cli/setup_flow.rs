@@ -1102,7 +1102,9 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!(
                 "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly."
             );
-            println!("- Subscribe to im.message.receive_v1 with Long Connection / WebSocket.");
+            println!(
+                "- Subscribe to im.message.receive_v1 and im.chat.member.bot.added_v1 with Long Connection / WebSocket."
+            );
             println!("- Publish a new app version after permission or event changes.");
             println!(
                 "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"
@@ -1117,7 +1119,9 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!(
                 "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly。"
             );
-            println!("- 用 Long Connection / WebSocket 订阅 im.message.receive_v1。");
+            println!(
+                "- 用 Long Connection / WebSocket 订阅 im.message.receive_v1 和 im.chat.member.bot.added_v1。"
+            );
             println!("- 修改权限或事件后，发布新版本并等待审批通过。");
             println!(
                 "Guide: https://github.com/lumpinif/agents-router/blob/main/docs/providers/feishu-lark-app-bot.md"

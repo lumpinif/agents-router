@@ -20,6 +20,7 @@ const SLACK_EVENT_CALLBACK_TYPE: &str = "event_callback";
 const SLACK_MESSAGE_EVENT_TYPE: &str = "message";
 const FEISHU_LARK_EVENT_SCHEMA: &str = "2.0";
 const FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE: &str = "im.message.receive_v1";
+const FEISHU_LARK_BOT_ADDED_EVENT_TYPE: &str = "im.chat.member.bot.added_v1";
 const FEISHU_LARK_TEXT_MESSAGE_TYPE: &str = "text";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,17 @@ pub struct NormalizedProviderControlCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedProviderRoomEvent {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_mode: ProviderMode,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_event_id: String,
+    pub event: ProviderRoomEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlCommand {
     BindProject {
         project_path: String,
@@ -74,6 +86,7 @@ pub enum ProviderControlCommand {
         project_path: Option<String>,
         prompt: String,
     },
+    RoomGuidance,
     Status,
     UnbindProject {
         project_path: Option<String>,
@@ -81,6 +94,11 @@ pub enum ProviderControlCommand {
     Invalid {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRoomEvent {
+    BotAddedToChat,
 }
 
 impl ProviderControlCommand {
@@ -110,6 +128,7 @@ impl ProviderControlCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlNormalizeResult {
     ControlCommand(Box<NormalizedProviderControlCommand>),
+    RoomEvent(Box<NormalizedProviderRoomEvent>),
     Skip(ProviderControlSkipReason),
 }
 
@@ -359,8 +378,30 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     let header = envelope
         .header
         .context("Feishu/Lark event is missing header")?;
-    if optional_field(header.event_type.as_deref()) != Some(FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE)
-    {
+    let event_type = optional_field(header.event_type.as_deref());
+    if event_type == Some(FEISHU_LARK_BOT_ADDED_EVENT_TYPE) {
+        let tenant_key = required_owned(
+            "feishu_lark header.tenant_key",
+            header.tenant_key.as_deref(),
+        )?;
+        let event_id = required_owned("feishu_lark header.event_id", header.event_id.as_deref())?;
+        let event = envelope
+            .event
+            .context("Feishu/Lark bot added event is missing event")?;
+        let chat_id = required_owned("feishu_lark event.chat_id", event.chat_id.as_deref())?;
+        return Ok(ProviderControlNormalizeResult::RoomEvent(Box::new(
+            NormalizedProviderRoomEvent {
+                provider_id: provider_id.to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: tenant_key,
+                provider_conversation_id: chat_id,
+                provider_event_id: event_id,
+                event: ProviderRoomEvent::BotAddedToChat,
+            },
+        )));
+    }
+    if event_type != Some(FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE) {
         return Ok(ProviderControlNormalizeResult::Skip(
             ProviderControlSkipReason::UnsupportedEventType,
         ));
@@ -423,6 +464,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
             project_path: None,
             prompt: text,
         },
+        None if !is_direct_chat && !is_thread_reply => ProviderControlCommand::RoomGuidance,
         None => {
             return Ok(ProviderControlNormalizeResult::Skip(
                 ProviderControlSkipReason::NotControlCommand,
@@ -858,6 +900,7 @@ struct FeishuLarkEventHeader {
 struct FeishuLarkEventBody {
     sender: Option<FeishuLarkEventSender>,
     message: Option<FeishuLarkEventMessage>,
+    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1581,6 +1624,89 @@ mod tests {
             )
             .expect("Feishu/Lark event should parse"),
             ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotAddressedToBot)
+        );
+    }
+
+    #[test]
+    fn feishu_lark_bot_added_event_normalizes_as_room_event() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-bot-added",
+                "event_type": "im.chat.member.bot.added_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "chat_id": "oc_project_room"
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            ProviderControlNormalizeResult::RoomEvent(Box::new(NormalizedProviderRoomEvent {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_event_id: "event-bot-added".to_string(),
+                event: ProviderRoomEvent::BotAddedToChat,
+            }))
+        );
+    }
+
+    #[test]
+    fn feishu_lark_shared_root_plain_mention_returns_room_guidance() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-1",
+                "event_type": "im.message.receive_v1",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "sender": { "sender_type": "user" },
+                "message": {
+                    "message_id": "om_plain_message_id",
+                    "root_id": "",
+                    "chat_id": "oc_project_room",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 hello\"}",
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": { "open_id": "ou_test_bot" },
+                            "name": "Agents Router",
+                            "tenant_key": "2ca1d211f64f6438"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark event should parse"),
+            control_result(NormalizedProviderControlCommand {
+                provider_id: "lark-app".to_string(),
+                provider_type: "feishu_lark".to_string(),
+                provider_mode: ProviderMode::FeishuLarkAppBot,
+                provider_account_id: "2ca1d211f64f6438".to_string(),
+                provider_conversation_id: "oc_project_room".to_string(),
+                provider_thread_id: "om_plain_message_id".to_string(),
+                provider_event_id: "om_plain_message_id".to_string(),
+                command: ProviderControlCommand::RoomGuidance,
+            })
         );
     }
 

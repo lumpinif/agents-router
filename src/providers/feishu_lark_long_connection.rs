@@ -26,7 +26,8 @@ use crate::agent_integration_catalog::agent_integration_for_source;
 use crate::bridge_binding_ledger::ThreadSessionBindingInput;
 use crate::bridge_binding_ledger::{BridgeBindingLedger, BridgeBindingLedgerStore};
 use crate::bridge_control::{
-    BridgeControlOutcome, BridgeControlReply, handle_provider_control_command,
+    BridgeControlOutcome, BridgeControlReply, BridgeRoomMessage, disconnected_lark_thread_reply,
+    handle_provider_control_command, handle_provider_room_event,
 };
 use crate::config::{
     FeishuLarkAppDomain, FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail,
@@ -50,7 +51,9 @@ use crate::provider_inbound::{
     thread_binding_query_for_reply,
 };
 use crate::providers::feishu_lark_continuation::FeishuLarkContinuationDispatcher;
-use crate::providers::feishu_lark_control::dispatch_feishu_lark_control_reply;
+use crate::providers::feishu_lark_control::{
+    dispatch_feishu_lark_control_reply, dispatch_feishu_lark_room_message,
+};
 use crate::providers::feishu_lark_new_session::FeishuLarkNewSessionDispatcher;
 use crate::response_surface_exposure::evaluate_response_surface_exposure;
 #[cfg(test)]
@@ -180,6 +183,7 @@ pub(crate) enum FeishuLarkPlatformAck {
 pub(crate) enum FeishuLarkLongConnectionDecision {
     ReadyAfterLocalClaim(Box<ProviderInboundReady>),
     ControlReply(BridgeControlReply),
+    RoomMessage(BridgeRoomMessage),
     NewSession(Box<crate::bridge_control::BridgeNewSessionCommand>),
     Skip(ProviderInboundSkipReason),
     ControlSkip(ProviderControlSkipReason),
@@ -441,6 +445,9 @@ impl FeishuLarkLongConnectionRuntime {
                     })
                     .await;
             }
+            ProviderControlNormalizeResult::RoomEvent(event) => {
+                return self.handle_room_event_before_platform_ack(*event);
+            }
             ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotControlCommand) => {}
             ProviderControlNormalizeResult::Skip(reason) => {
                 return Ok(FeishuLarkLongConnectionDecision::ControlSkip(reason));
@@ -475,6 +482,11 @@ impl FeishuLarkLongConnectionRuntime {
                     ready,
                 ));
             }
+            ProviderInboundDecision::Skip(ProviderInboundSkipReason::SurfaceClosed { .. }) => {
+                return Ok(FeishuLarkLongConnectionDecision::ControlReply(
+                    disconnected_lark_thread_reply(reply),
+                ));
+            }
             ProviderInboundDecision::Skip(ProviderInboundSkipReason::SurfaceLookupMiss) => {}
             ProviderInboundDecision::Skip(reason) => {
                 return Ok(FeishuLarkLongConnectionDecision::Skip(reason));
@@ -487,8 +499,8 @@ impl FeishuLarkLongConnectionRuntime {
             })
             .await?;
         let Some(thread_binding) = thread_binding else {
-            return Ok(FeishuLarkLongConnectionDecision::Skip(
-                ProviderInboundSkipReason::SurfaceLookupMiss,
+            return Ok(FeishuLarkLongConnectionDecision::ControlReply(
+                disconnected_lark_thread_reply(reply),
             ));
         };
 
@@ -539,6 +551,33 @@ impl FeishuLarkLongConnectionRuntime {
             event = "feishu_lark.long_connection.live.control.accepted",
         );
         match handle_provider_control_command(ledger, command, received_at)? {
+            BridgeControlOutcome::Reply(reply) => {
+                Ok(FeishuLarkLongConnectionDecision::ControlReply(reply))
+            }
+            BridgeControlOutcome::RoomMessage(message) => {
+                Ok(FeishuLarkLongConnectionDecision::RoomMessage(message))
+            }
+            BridgeControlOutcome::NewSession(command) => Ok(
+                FeishuLarkLongConnectionDecision::NewSession(Box::new(command)),
+            ),
+        }
+    }
+
+    fn handle_room_event_before_platform_ack(
+        &self,
+        event: crate::provider_inbound::NormalizedProviderRoomEvent,
+    ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
+        info!(
+            provider.id = %event.provider_id,
+            provider.conversation.id = %event.provider_conversation_id,
+            event.hash = %provider_event_id_stable_hash(&event.provider_event_id),
+            event.kind = ?event.event,
+            event = "feishu_lark.long_connection.live.room_event.accepted",
+        );
+        match handle_provider_room_event(event)? {
+            BridgeControlOutcome::RoomMessage(message) => {
+                Ok(FeishuLarkLongConnectionDecision::RoomMessage(message))
+            }
             BridgeControlOutcome::Reply(reply) => {
                 Ok(FeishuLarkLongConnectionDecision::ControlReply(reply))
             }
@@ -762,6 +801,7 @@ async fn run_live_lark_long_connection_provider(
     let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
     let dispatcher = FeishuLarkContinuationDispatcher::new(runtime_state.clone());
     let control_reply_dispatcher = LiveFeishuLarkControlReplyDispatcher::new(runtime_state.clone());
+    let room_message_dispatcher = LiveFeishuLarkRoomMessageDispatcher::new(runtime_state.clone());
     let new_session_dispatcher = FeishuLarkNewSessionDispatcher::new(runtime_state.clone());
 
     info!(
@@ -777,6 +817,7 @@ async fn run_live_lark_long_connection_provider(
             bridge_binding_ledger_store: &bridge_binding_ledger_store,
             dispatcher: &dispatcher,
             control_reply_dispatcher: &control_reply_dispatcher,
+            room_message_dispatcher: &room_message_dispatcher,
             new_session_dispatcher: &new_session_dispatcher,
         };
         receive_and_dispatch_live_lark_event_hidden(
@@ -794,6 +835,7 @@ struct FeishuLarkLiveDispatchContext<'a> {
     bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
     dispatcher: &'a dyn ContinuationDispatcher,
     control_reply_dispatcher: &'a dyn FeishuLarkControlReplyDispatcher,
+    room_message_dispatcher: &'a dyn FeishuLarkRoomMessageDispatcher,
     new_session_dispatcher: &'a dyn NewSessionDispatcher,
 }
 
@@ -833,6 +875,9 @@ async fn receive_and_dispatch_live_lark_event_hidden(
         FeishuLarkLongConnectionDecision::ControlReply(reply) => {
             dispatch_context.control_reply_dispatcher.dispatch(reply)?;
         }
+        FeishuLarkLongConnectionDecision::RoomMessage(message) => {
+            dispatch_context.room_message_dispatcher.dispatch(message)?;
+        }
         FeishuLarkLongConnectionDecision::NewSession(command) => {
             dispatch_context
                 .new_session_dispatcher
@@ -853,6 +898,10 @@ trait FeishuLarkControlReplyDispatcher: Send + Sync {
     fn dispatch(&self, reply: BridgeControlReply) -> anyhow::Result<()>;
 }
 
+trait FeishuLarkRoomMessageDispatcher: Send + Sync {
+    fn dispatch(&self, message: BridgeRoomMessage) -> anyhow::Result<()>;
+}
+
 #[derive(Clone)]
 struct LiveFeishuLarkControlReplyDispatcher {
     runtime_state: RuntimeState,
@@ -867,6 +916,24 @@ impl LiveFeishuLarkControlReplyDispatcher {
 impl FeishuLarkControlReplyDispatcher for LiveFeishuLarkControlReplyDispatcher {
     fn dispatch(&self, reply: BridgeControlReply) -> anyhow::Result<()> {
         dispatch_feishu_lark_control_reply(self.runtime_state.clone(), reply);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LiveFeishuLarkRoomMessageDispatcher {
+    runtime_state: RuntimeState,
+}
+
+impl LiveFeishuLarkRoomMessageDispatcher {
+    fn new(runtime_state: RuntimeState) -> Self {
+        Self { runtime_state }
+    }
+}
+
+impl FeishuLarkRoomMessageDispatcher for LiveFeishuLarkRoomMessageDispatcher {
+    fn dispatch(&self, message: BridgeRoomMessage) -> anyhow::Result<()> {
+        dispatch_feishu_lark_room_message(self.runtime_state.clone(), message);
         Ok(())
     }
 }
@@ -936,6 +1003,14 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
+        FeishuLarkLongConnectionDecision::RoomMessage(message) => {
+            info!(
+                provider.id = %provider_id,
+                provider.conversation.id = %message.provider_conversation_id,
+                event.hash = %message.provider_event_id_hash,
+                event = "feishu_lark.long_connection.live.platform_ack.sent",
+            );
+        }
         FeishuLarkLongConnectionDecision::NewSession(command) => {
             info!(
                 provider.id = %provider_id,
@@ -967,6 +1042,7 @@ fn control_command_name(command: &ProviderControlCommand) -> &'static str {
         ProviderControlCommand::DirectUnbindProject => "direct_unbind",
         ProviderControlCommand::Help => "help",
         ProviderControlCommand::NewSession { .. } => "new",
+        ProviderControlCommand::RoomGuidance => "room_guidance",
         ProviderControlCommand::Status => "status",
         ProviderControlCommand::UnbindProject { .. } => "unbind",
         ProviderControlCommand::Invalid { .. } => "invalid",
@@ -984,6 +1060,7 @@ fn control_command_surface(command: &ProviderControlCommand) -> &'static str {
         ProviderControlCommand::BindProject { .. }
         | ProviderControlCommand::Help
         | ProviderControlCommand::NewSession { .. }
+        | ProviderControlCommand::RoomGuidance
         | ProviderControlCommand::Status
         | ProviderControlCommand::UnbindProject { .. } => "project_room",
         ProviderControlCommand::Invalid { .. } => "invalid",
@@ -1693,6 +1770,7 @@ mod tests {
         let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1704,6 +1782,7 @@ mod tests {
                 &bridge_binding_ledger_store,
                 &dispatcher,
                 &control_reply_dispatcher,
+                &room_message_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1721,6 +1800,7 @@ mod tests {
                 &bridge_binding_ledger_store,
                 &dispatcher,
                 &control_reply_dispatcher,
+                &room_message_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1754,6 +1834,7 @@ mod tests {
         let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1765,6 +1846,7 @@ mod tests {
                 &bridge_binding_ledger_store,
                 &dispatcher,
                 &control_reply_dispatcher,
+                &room_message_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1793,6 +1875,64 @@ mod tests {
             .expect("binding ledger should read");
         assert_eq!(connected.len(), 1);
         assert_eq!(connected[0].project_path, project_path);
+    }
+
+    #[tokio::test]
+    async fn hidden_transport_dispatches_room_welcome_for_bot_added_event() {
+        let dir = tempdir().expect("temp dir should exist");
+        let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
+            .expect("ledger store should build");
+        let bridge_binding_ledger_store =
+            BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
+                .expect("binding ledger store should build");
+        let runtime = app_bot_runtime();
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
+                br#"{
+                    "schema": "2.0",
+                    "header": {
+                        "event_id": "event-bot-added",
+                        "event_type": "im.chat.member.bot.added_v1",
+                        "tenant_key": "2ca1d211f64f6438"
+                    },
+                    "event": {
+                        "chat_id": "oc_project_room"
+                    }
+                }"#
+                .to_vec(),
+            )),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+        let dispatcher = RecordingContinuationDispatcher::default();
+        let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let new_session_dispatcher = RecordingNewSessionDispatcher::default();
+
+        receive_and_dispatch_live_lark_event_hidden(
+            &runtime,
+            &mut transport,
+            &mut payload_buffer,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+                &room_message_dispatcher,
+                &new_session_dispatcher,
+            ),
+        )
+        .await
+        .expect("bot-added event should ack and dispatch a room message");
+
+        assert_eq!(transport.sent_messages().len(), 1);
+        assert!(dispatcher.dispatched().is_empty());
+        assert!(control_reply_dispatcher.dispatched().is_empty());
+        assert!(new_session_dispatcher.dispatched().is_empty());
+        let messages = room_message_dispatcher.dispatched();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].provider_conversation_id, "oc_project_room");
+        assert!(messages[0].text.contains("I connect this Lark room"));
+        assert!(messages[0].text.contains("`/bind /absolute/project/path`"));
     }
 
     #[tokio::test]
@@ -1831,6 +1971,7 @@ mod tests {
         let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1842,6 +1983,7 @@ mod tests {
                 &bridge_binding_ledger_store,
                 &dispatcher,
                 &control_reply_dispatcher,
+                &room_message_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1900,6 +2042,7 @@ mod tests {
         let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1911,6 +2054,7 @@ mod tests {
                 &bridge_binding_ledger_store,
                 &dispatcher,
                 &control_reply_dispatcher,
+                &room_message_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1932,6 +2076,57 @@ mod tests {
                 .surface
                 .surface_id
                 .starts_with("bridge-thread-")
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_transport_replies_when_lark_thread_is_not_connected() {
+        let dir = tempdir().expect("temp dir should exist");
+        let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
+            .expect("ledger store should build");
+        let bridge_binding_ledger_store =
+            BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
+                .expect("binding ledger store should build");
+        let runtime = app_bot_runtime();
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
+                "om_unbound_reply",
+                "@_user_1 continue from old thread",
+            ))),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+        let dispatcher = RecordingContinuationDispatcher::default();
+        let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let new_session_dispatcher = RecordingNewSessionDispatcher::default();
+
+        receive_and_dispatch_live_lark_event_hidden(
+            &runtime,
+            &mut transport,
+            &mut payload_buffer,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+                &room_message_dispatcher,
+                &new_session_dispatcher,
+            ),
+        )
+        .await
+        .expect("unbound thread reply should ack and dispatch a helpful reply");
+
+        assert_eq!(transport.sent_messages().len(), 1);
+        assert!(dispatcher.dispatched().is_empty());
+        assert!(room_message_dispatcher.dispatched().is_empty());
+        assert!(new_session_dispatcher.dispatched().is_empty());
+        let replies = control_reply_dispatcher.dispatched();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].provider_thread_id, "om_root_message_id");
+        assert!(
+            replies[0]
+                .text
+                .contains("no longer connected to a Codex thread")
         );
     }
 
@@ -2254,6 +2449,30 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RecordingRoomMessageDispatcher {
+        dispatched: Arc<Mutex<Vec<BridgeRoomMessage>>>,
+    }
+
+    impl RecordingRoomMessageDispatcher {
+        fn dispatched(&self) -> Vec<BridgeRoomMessage> {
+            self.dispatched
+                .lock()
+                .expect("room message dispatcher record lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl FeishuLarkRoomMessageDispatcher for RecordingRoomMessageDispatcher {
+        fn dispatch(&self, message: BridgeRoomMessage) -> anyhow::Result<()> {
+            self.dispatched
+                .lock()
+                .expect("room message dispatcher record lock should not be poisoned")
+                .push(message);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingNewSessionDispatcher {
         dispatched: Arc<Mutex<Vec<NewSessionWork>>>,
     }
@@ -2282,6 +2501,7 @@ mod tests {
         bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
         dispatcher: &'a RecordingContinuationDispatcher,
         control_reply_dispatcher: &'a RecordingControlReplyDispatcher,
+        room_message_dispatcher: &'a RecordingRoomMessageDispatcher,
         new_session_dispatcher: &'a RecordingNewSessionDispatcher,
     ) -> FeishuLarkLiveDispatchContext<'a> {
         FeishuLarkLiveDispatchContext {
@@ -2289,6 +2509,7 @@ mod tests {
             bridge_binding_ledger_store,
             dispatcher,
             control_reply_dispatcher,
+            room_message_dispatcher,
             new_session_dispatcher,
         }
     }

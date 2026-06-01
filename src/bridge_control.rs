@@ -7,7 +7,10 @@ use crate::bridge_binding_ledger::{
     RoomProjectBindingInput, RoomProjectBindingRecord,
 };
 use crate::config::is_clean_absolute_project_path;
-use crate::provider_inbound::{NormalizedProviderControlCommand, ProviderControlCommand};
+use crate::provider_inbound::{
+    NormalizedProviderControlCommand, NormalizedProviderRoomEvent, NormalizedProviderSurfaceReply,
+    ProviderControlCommand, ProviderRoomEvent,
+};
 use crate::response_surface_ledger::provider_event_id_hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +39,44 @@ pub(crate) struct BridgeNewSessionCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeRoomMessage {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_event_id_hash: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BridgeControlOutcome {
     Reply(BridgeControlReply),
+    RoomMessage(BridgeRoomMessage),
     NewSession(BridgeNewSessionCommand),
+}
+
+pub(crate) fn handle_provider_room_event(
+    event: NormalizedProviderRoomEvent,
+) -> anyhow::Result<BridgeControlOutcome> {
+    let provider_event_id_hash = provider_event_id_hash(
+        &event.provider_type,
+        &event.provider_id,
+        &event.provider_account_id,
+        &event.provider_conversation_id,
+        &event.provider_event_id,
+    );
+    let text = match event.event {
+        ProviderRoomEvent::BotAddedToChat => room_welcome_text(),
+    };
+
+    Ok(BridgeControlOutcome::RoomMessage(BridgeRoomMessage {
+        provider_id: event.provider_id,
+        provider_type: event.provider_type,
+        provider_account_id: event.provider_account_id,
+        provider_conversation_id: event.provider_conversation_id,
+        provider_event_id_hash,
+        text,
+    }))
 }
 
 pub(crate) fn handle_provider_control_command(
@@ -99,6 +137,11 @@ pub(crate) fn handle_provider_control_command(
             project_path.as_deref(),
             prompt,
         )?,
+        ProviderControlCommand::RoomGuidance => reply_outcome(
+            &command,
+            provider_event_id_hash,
+            room_guidance_text(ledger, &command),
+        ),
         ProviderControlCommand::BindProject { project_path } => reply_outcome(
             &command,
             provider_event_id_hash,
@@ -123,6 +166,28 @@ pub(crate) fn handle_provider_control_command(
     };
 
     Ok(outcome)
+}
+
+pub(crate) fn disconnected_lark_thread_reply(
+    reply: NormalizedProviderSurfaceReply,
+) -> BridgeControlReply {
+    let provider_event_id_hash = provider_event_id_hash(
+        &reply.provider_type,
+        &reply.provider_id,
+        &reply.provider_account_id,
+        &reply.provider_conversation_id,
+        &reply.provider_event_id,
+    );
+
+    BridgeControlReply {
+        provider_id: reply.provider_id,
+        provider_type: reply.provider_type,
+        provider_account_id: reply.provider_account_id,
+        provider_conversation_id: reply.provider_conversation_id,
+        provider_thread_id: reply.provider_thread_id,
+        provider_event_id_hash,
+        text: disconnected_lark_thread_text(),
+    }
 }
 
 fn bind_project(
@@ -617,6 +682,62 @@ fn direct_chat_guidance_text() -> String {
         "`/bind /absolute/project/path`",
         "",
         "After that, any plain message here starts a new Codex thread in that project.",
+    ]
+    .join("\n")
+}
+
+fn room_welcome_text() -> String {
+    [
+        "I connect this Lark room to local Codex projects on your Mac.",
+        "",
+        "To connect a project, mention me and send:",
+        "`/bind /absolute/project/path`",
+        "",
+        "After that, new Codex Desktop updates from that project will appear here. To start a new Codex thread from this room, mention me and send:",
+        "`/new what you want Codex to do`",
+    ]
+    .join("\n")
+}
+
+fn room_guidance_text(
+    ledger: &BridgeBindingLedger,
+    command: &NormalizedProviderControlCommand,
+) -> String {
+    let connected = ledger.connected_projects_for_room(&room_query(command));
+    if connected.is_empty() {
+        return [
+            "This room is not connected to a project yet.",
+            "",
+            "Mention me and send:",
+            "`/bind /absolute/project/path`",
+            "",
+            "After that, new Codex Desktop updates from that project will appear here.",
+        ]
+        .join("\n");
+    }
+
+    let new_session_hint = if connected.len() == 1 {
+        "`/new what you want Codex to do`"
+    } else {
+        "`/new /absolute/project/path what you want Codex to do`"
+    };
+    [
+        "This room is connected to local Codex.",
+        "",
+        "Start a new Codex thread by mentioning me and sending:",
+        new_session_hint,
+        "",
+        "When a Codex update appears here, open its Lark thread, mention me, and reply there to continue the same Codex thread.",
+    ]
+    .join("\n")
+}
+
+fn disconnected_lark_thread_text() -> String {
+    [
+        "This Lark thread is no longer connected to a Codex thread.",
+        "",
+        "Start a new Codex thread from the main room. Mention me and send:",
+        "`/new what you want Codex to do`",
     ]
     .join("\n")
 }
@@ -1175,6 +1296,51 @@ mod tests {
     }
 
     #[test]
+    fn room_guidance_explains_bind_before_project_is_connected() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let reply = reply_text(
+            handle_provider_control_command(
+                &mut ledger,
+                command(ProviderControlCommand::RoomGuidance),
+                test_time(),
+            )
+            .expect("room guidance should handle"),
+        );
+
+        assert!(reply.contains("not connected to a project yet"));
+        assert!(reply.contains("Mention me"));
+        assert!(reply.contains("`/bind /absolute/project/path`"));
+    }
+
+    #[test]
+    fn room_event_welcomes_new_project_room() {
+        let outcome = handle_provider_room_event(room_event(ProviderRoomEvent::BotAddedToChat))
+            .expect("room event should handle");
+
+        let BridgeControlOutcome::RoomMessage(message) = outcome else {
+            panic!("room event should send a room message");
+        };
+        assert_eq!(message.provider_conversation_id, "room-1");
+        assert!(message.text.contains("I connect this Lark room"));
+        assert!(message.text.contains("`/bind /absolute/project/path`"));
+        assert!(message.text.contains("`/new what you want Codex to do`"));
+    }
+
+    #[test]
+    fn disconnected_lark_thread_reply_explains_how_to_start_over() {
+        let reply = disconnected_lark_thread_reply(surface_reply());
+
+        assert_eq!(reply.provider_thread_id, "message-1");
+        assert!(reply.text.contains("no longer connected to a Codex thread"));
+        assert!(
+            reply
+                .text
+                .contains("Start a new Codex thread from the main room")
+        );
+        assert!(reply.text.contains("`/new what you want Codex to do`"));
+    }
+
+    #[test]
     fn new_session_uses_the_only_connected_project() {
         let dir = tempfile::tempdir().expect("temp dir should exist");
         let path = dir.path().to_string_lossy().to_string();
@@ -1245,6 +1411,7 @@ mod tests {
     fn reply_text(outcome: BridgeControlOutcome) -> String {
         match outcome {
             BridgeControlOutcome::Reply(reply) => reply.text,
+            BridgeControlOutcome::RoomMessage(_) => panic!("expected reply outcome"),
             BridgeControlOutcome::NewSession(_) => panic!("expected reply outcome"),
         }
     }
@@ -1259,6 +1426,32 @@ mod tests {
             provider_thread_id: "message-1".to_string(),
             provider_event_id: "message-1".to_string(),
             command,
+        }
+    }
+
+    fn room_event(event: ProviderRoomEvent) -> NormalizedProviderRoomEvent {
+        NormalizedProviderRoomEvent {
+            provider_id: "lark-personal-agent".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_mode: ProviderMode::FeishuLarkAppBot,
+            provider_account_id: "tenant-1".to_string(),
+            provider_conversation_id: "room-1".to_string(),
+            provider_event_id: "event-1".to_string(),
+            event,
+        }
+    }
+
+    fn surface_reply() -> NormalizedProviderSurfaceReply {
+        NormalizedProviderSurfaceReply {
+            provider_id: "lark-personal-agent".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_mode: ProviderMode::FeishuLarkAppBot,
+            provider_account_id: "tenant-1".to_string(),
+            provider_conversation_id: "room-1".to_string(),
+            provider_thread_id: "message-1".to_string(),
+            provider_event_id: "event-1".to_string(),
+            provider_reply_message_id: Some("event-1".to_string()),
+            reply_text: "continue".to_string(),
         }
     }
 

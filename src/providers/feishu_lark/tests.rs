@@ -259,6 +259,86 @@ async fn app_bot_can_send_to_bound_project_room() {
 }
 
 #[tokio::test]
+async fn app_bot_sends_plain_text_to_room_for_control_guidance() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "receive_id": "oc_project_room",
+            "msg_type": "text"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_room_guidance",
+                "chat_id": "oc_project_room",
+                "sender": {
+                    "tenant_key": "2ca1d211f64f6438"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send_text_to_conversation(FeishuLarkConversationTextRequest {
+            provider_id: "work_chat".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_account_id: "2ca1d211f64f6438".to_string(),
+            provider_conversation_id: "oc_project_room".to_string(),
+            provider_event_id_hash: "event-hash".to_string(),
+            text: "Mention me and send:\n`/bind /absolute/project/path`".to_string(),
+        })
+        .await
+        .expect("room text message should succeed");
+
+    assert_eq!(
+        result.provider_message_id.as_deref(),
+        Some("om_room_guidance")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let send_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages")
+        .expect("room text request should be recorded");
+    let body: serde_json::Value = send_request
+        .body_json()
+        .expect("room text body should be JSON");
+    assert_eq!(body["msg_type"], "text");
+    let content: serde_json::Value = serde_json::from_str(
+        body["content"]
+            .as_str()
+            .expect("room text content should be a JSON string"),
+    )
+    .expect("room text content should be JSON");
+    assert_eq!(
+        content["text"],
+        "Mention me and send:\n`/bind /absolute/project/path`"
+    );
+}
+
+#[tokio::test]
 async fn app_bot_sends_project_update_to_existing_thread() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

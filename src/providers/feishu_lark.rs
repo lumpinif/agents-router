@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Local, Utc};
@@ -36,6 +36,21 @@ pub struct FeishuLarkProvider {
     id: String,
     runtime: FeishuLarkProviderRuntime,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkConversationTextRequest {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_event_id_hash: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkConversationTextSuccess {
+    pub provider_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +98,20 @@ impl FeishuLarkProvider {
             runtime,
             client: provider_http_client()?,
         })
+    }
+
+    pub(crate) async fn send_text_to_conversation(
+        &self,
+        request: FeishuLarkConversationTextRequest,
+    ) -> anyhow::Result<FeishuLarkConversationTextSuccess> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => {
+                anyhow::bail!("Feishu/Lark custom bot mode does not support room messages")
+            }
+            FeishuLarkProviderRuntime::AppBot(runtime) => {
+                self.send_app_bot_conversation_text(request, runtime).await
+            }
+        }
     }
 }
 
@@ -779,6 +808,88 @@ impl FeishuLarkProvider {
         })
     }
 
+    async fn send_app_bot_conversation_text(
+        &self,
+        request: FeishuLarkConversationTextRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> anyhow::Result<FeishuLarkConversationTextSuccess> {
+        validate_app_bot_conversation_text_request(&request, &self.id, runtime)?;
+        let token = self
+            .fetch_tenant_access_token_for_conversation_text(&request, runtime)
+            .await?;
+        let content = serde_json::to_string(&FeishuLarkTextMessageContent {
+            text: request.text.as_str(),
+        })
+        .context("failed to serialize Feishu/Lark room text content")?;
+        let body = FeishuLarkAppBotSendMessageRequest {
+            receive_id: &request.provider_conversation_id,
+            msg_type: "text",
+            content,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/open-apis/im/v1/messages", runtime.api_base_url))
+            .query(&[("receive_id_type", "chat_id")])
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to send Feishu/Lark room message: {}",
+                    error.without_url()
+                )
+            })?;
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            anyhow!(
+                "failed to read Feishu/Lark room message response: {}",
+                error.without_url()
+            )
+        })?;
+        ensure!(
+            status.is_success(),
+            "Feishu/Lark room message returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkAppBotSendMessageResponse =
+            serde_json::from_str(&response_body)
+                .context("Feishu/Lark room message response returned invalid JSON")?;
+        ensure!(
+            provider_response.code == 0,
+            "Feishu/Lark room message returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        let data = provider_response
+            .data
+            .context("Feishu/Lark room message response did not include message data")?;
+        let message_id = present_owned(data.message_id)
+            .context("Feishu/Lark room message response did not include message_id")?;
+        let chat_id = present_owned(data.chat_id)
+            .context("Feishu/Lark room message response did not include chat_id")?;
+        ensure!(
+            chat_id == request.provider_conversation_id,
+            "Feishu/Lark room message response chat_id did not match target room"
+        );
+        if let Some(sender) = data.sender
+            && let Some(tenant_key) = present_owned(sender.tenant_key)
+        {
+            ensure!(
+                tenant_key == request.provider_account_id,
+                "Feishu/Lark room message response tenant_key did not match target tenant"
+            );
+        }
+
+        Ok(FeishuLarkConversationTextSuccess {
+            provider_message_id: Some(message_id),
+        })
+    }
+
     async fn fetch_tenant_access_token_for_thread_reply(
         &self,
         request: &ProviderThreadReplyRequest,
@@ -864,6 +975,67 @@ impl FeishuLarkProvider {
             ));
         }
 
+        Ok(token)
+    }
+
+    async fn fetch_tenant_access_token_for_conversation_text(
+        &self,
+        request: &FeishuLarkConversationTextRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> anyhow::Result<String> {
+        let token_request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&token_request)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to fetch tenant access token for Feishu/Lark room message `{}`: {}",
+                    request.provider_event_id_hash,
+                    error.without_url()
+                )
+            })?;
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            anyhow!(
+                "failed to read tenant access token response for Feishu/Lark room message `{}`: {}",
+                request.provider_event_id_hash,
+                error.without_url()
+            )
+        })?;
+        ensure!(
+            status.is_success(),
+            "tenant access token request for Feishu/Lark room message returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse = serde_json::from_str(
+            &response_body,
+        )
+        .context("tenant access token response for Feishu/Lark room message was invalid JSON")?;
+        ensure!(
+            provider_response.code == 0,
+            "tenant access token request for Feishu/Lark room message returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        let token = present_owned(provider_response.tenant_access_token).context(
+            "tenant access token response for Feishu/Lark room message did not include a token",
+        )?;
+        ensure!(
+            provider_response.expire.unwrap_or_default() > 0,
+            "tenant access token response for Feishu/Lark room message had an invalid expiry"
+        );
         Ok(token)
     }
 }
@@ -1297,6 +1469,44 @@ fn validate_app_bot_thread_reply_request(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_app_bot_conversation_text_request(
+    request: &FeishuLarkConversationTextRequest,
+    provider_id: &str,
+    runtime: &FeishuLarkAppBotRuntime,
+) -> anyhow::Result<()> {
+    ensure!(
+        request.provider_id == provider_id,
+        "Feishu/Lark room message provider_id did not match adapter"
+    );
+    ensure!(
+        request.provider_type == ProviderType::FeishuLark.as_str(),
+        "Feishu/Lark room message provider_type did not match adapter"
+    );
+    if let Some(configured_tenant_key) = runtime.tenant_key.as_deref() {
+        ensure!(
+            request.provider_account_id == configured_tenant_key,
+            "Feishu/Lark room message tenant did not match app config"
+        );
+    }
+    ensure!(
+        present(Some(request.provider_account_id.as_str())).is_some(),
+        "Feishu/Lark room message did not include provider_account_id"
+    );
+    ensure!(
+        present(Some(request.provider_conversation_id.as_str())).is_some(),
+        "Feishu/Lark room message did not include provider_conversation_id"
+    );
+    ensure!(
+        present(Some(request.provider_event_id_hash.as_str())).is_some(),
+        "Feishu/Lark room message did not include provider_event_id_hash"
+    );
+    ensure!(
+        present(Some(request.text.as_str())).is_some(),
+        "Feishu/Lark room message text was empty"
+    );
     Ok(())
 }
 
