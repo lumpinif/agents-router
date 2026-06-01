@@ -1859,7 +1859,9 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(
             replies[0].text,
-            format!("Connected this room to:\n{project_path}")
+            format!(
+                "Done. This room is connected to:\n{project_path}\n\nNew Codex updates for this folder will appear here."
+            )
         );
         assert!(new_session_dispatcher.dispatched().is_empty());
         let connected = bridge_binding_ledger_store
@@ -1931,8 +1933,13 @@ mod tests {
         let messages = room_message_dispatcher.dispatched();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_conversation_id, "oc_project_room");
-        assert!(messages[0].text.contains("I connect this Lark room"));
-        assert!(messages[0].text.contains("`/bind /absolute/project/path`"));
+        assert!(messages[0].text.contains("Hi, I can bring Codex updates"));
+        assert!(
+            messages[0]
+                .text
+                .contains("`@your-bot /bind /path/to/project`")
+        );
+        assert!(messages[0].text.contains("Use Lark's @ menu to select me"));
     }
 
     #[tokio::test]
@@ -2123,11 +2130,7 @@ mod tests {
         let replies = control_reply_dispatcher.dispatched();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].provider_thread_id, "om_root_message_id");
-        assert!(
-            replies[0]
-                .text
-                .contains("no longer connected to a Codex thread")
-        );
+        assert!(replies[0].text.contains("no longer connected to Codex"));
     }
 
     #[tokio::test]

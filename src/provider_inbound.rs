@@ -476,7 +476,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
     let command = if root_id.is_some() && command.requires_room_root() {
         ProviderControlCommand::Invalid {
-            message: "Run `/bind`, `/new`, or `/unbind` in the main room, not inside a Lark thread. Thread replies are only for continuing the Codex thread that created the message.".to_string(),
+            message: "That command only works in the room itself, not inside a Lark thread.\n\nGo back to the room, mention me, and send the command there. Thread replies are only for continuing the Codex task that posted the update.".to_string(),
         }
     } else if is_direct_chat {
         match command {
@@ -501,7 +501,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
                 message: "Use `/unbind` in direct chat to clear the default project.".to_string(),
             },
             command if command.requires_project_room() => ProviderControlCommand::Invalid {
-                message: "This command is for project rooms. In direct chat, use `/bind /absolute/project/path`, `/new ...`, `/status`, or `/help`.".to_string(),
+                message: "That command is for group rooms. In direct chat, use `/bind /path/to/project`, `/new ...`, `/status`, or `/help`.".to_string(),
             },
             command => command,
         }
@@ -967,7 +967,7 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             let project_path = rest.trim();
             if project_path.is_empty() {
                 return Some(ProviderControlCommand::Invalid {
-                    message: "Use a clean absolute folder path:\n`/bind /absolute/project/path`."
+                    message: "Use the full path to a folder on your Mac.\n\nDirect chat:\n`/bind /path/to/project`\n\nGroup room:\n`@your-bot /bind /path/to/project`\n\nUse Lark's @ menu to select me. Do not type the @ name as plain text."
                         .to_string(),
                 });
             }
@@ -1009,7 +1009,7 @@ fn parse_new_session_command(rest: &str) -> ProviderControlCommand {
     let rest = rest.trim();
     if rest.is_empty() {
         return ProviderControlCommand::Invalid {
-            message: "Use `/new what you want Codex to do`.".to_string(),
+            message: "Tell Codex what to do.\n\nDirect chat:\n`/new what you want Codex to do`\n\nGroup room:\n`@your-bot /new what you want Codex to do`\n\nUse Lark's @ menu to select me in group rooms.".to_string(),
         };
     }
 
@@ -1024,7 +1024,7 @@ fn parse_new_session_command(rest: &str) -> ProviderControlCommand {
         let prompt = remaining.trim();
         if prompt.is_empty() {
             return ProviderControlCommand::Invalid {
-                message: "Use `/new /absolute/project/path what you want Codex to do`.".to_string(),
+                message: "Use the full path to a folder on your Mac.\n\nDirect chat:\n`/new /path/to/project what you want Codex to do`\n\nGroup room:\n`@your-bot /new /path/to/project what you want Codex to do`\n\nUse Lark's @ menu to select me in group rooms.".to_string(),
             };
         }
 

@@ -305,7 +305,7 @@ async fn app_bot_sends_plain_text_to_room_for_control_guidance() {
             provider_account_id: "2ca1d211f64f6438".to_string(),
             provider_conversation_id: "oc_project_room".to_string(),
             provider_event_id_hash: "event-hash".to_string(),
-            text: "Mention me and send:\n`/bind /absolute/project/path`".to_string(),
+            text: "Use Lark's @ menu and send:\n`@your-bot /bind /path/to/project`".to_string(),
         })
         .await
         .expect("room text message should succeed");
@@ -334,7 +334,7 @@ async fn app_bot_sends_plain_text_to_room_for_control_guidance() {
     .expect("room text content should be JSON");
     assert_eq!(
         content["text"],
-        "Mention me and send:\n`/bind /absolute/project/path`"
+        "Use Lark's @ menu and send:\n`@your-bot /bind /path/to/project`"
     );
 }
 
