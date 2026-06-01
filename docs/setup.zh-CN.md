@@ -108,7 +108,7 @@ Provider 教程：
 
 ```text
 Personal Agent App — Experimental
-  扫码创建 Personal Agent，把它拉进 Lark 或飞书群，然后 @ 它并发送 `/bind` 连接项目群。
+  扫码创建 Personal Agent。私聊用 `/new` 开 Codex 任务，用 `/bind` 选择项目群。
 
 已有自建应用 — 高级
   使用已有自建应用连接一个固定群。高级配置；默认推荐 Personal Agent。Codex Desktop thread 回复仍是实验性。
@@ -117,9 +117,9 @@ Personal Agent App — Experimental
   单向发送通知到一个群。不支持回复或项目群。
 ```
 
-Personal Agent App 是默认推荐选项，因为它支持双向 project room 体验：扫码 setup、`/bind`、一个 Codex thread 对应一个 Lark thread。setup 会显示 QR code，扫码创建 Personal Agent app，并在完成后提示你把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。
+Personal Agent App 是默认推荐选项，因为它支持双向 project room 体验：扫码 setup、私聊 `/new /absolute/project/path ...` 开新 Codex thread、私聊 `/bind /absolute/project/path` 打开项目群选择菜单、项目群 `/bind` 直接连接当前群、一个 Codex thread 对应一个 Lark thread。setup 会显示 QR code，扫码创建 Personal Agent app，并在完成后提示你私聊可以用 `/new /absolute/project/path what you want Codex to do` 开新 Codex thread；也可以在私聊里发送 `/bind /absolute/project/path`，选择建新群、使用已有群，或者忽略这个项目。项目群里则把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。如果之后 Codex 从一个还没连接过的项目产生新更新，Agents Router 会在私聊里给出同一套选择。
 
-如果你已经有自建应用并且明确想连接一个固定群，请选择“已有自建应用”。如果你只想要一个简单的单向 fallback，请选择“群 Webhook”。
+如果你已经有自建应用并且明确想连接一个固定群，请选择“已有自建应用”。这个模式需要 Bot 能力、包含 `im:chat:create` 的消息和群权限、`im.message.receive_v1`、`im.chat.member.bot.added_v1`、`card.action.trigger`、Long Connection / WebSocket、Tenant Key、Room Chat ID，以及已发布的新应用版本。如果你只想要一个简单的单向 fallback，请选择“群 Webhook”。
 
 ## Provider ID
 
@@ -202,8 +202,8 @@ agents-router emit \
 `only_forward_from_project_paths`，两个条件都满足后才会发送通知。
 
 Feishu/Lark Personal Agent 的 project room 不在 setup 里使用
-`only_forward_from_project_paths`。这个模式下，`/bind /absolute/project/path` 才是项目入口。
-这样 project-room routing 只有一个事实源：本机 room binding ledger。
+`only_forward_from_project_paths`。这个模式下，`/bind /absolute/project/path` 只负责把项目连接到群。
+在群里发送 `/bind /absolute/project/path` 会把项目连接到当前群。私聊开新 Codex thread 时，用 `/new /absolute/project/path what you want Codex to do` 明确 working directory；私聊发送 `/bind /absolute/project/path` 会打开这个项目的项目群选择菜单。
 
 ## Answer Detail
 
@@ -320,7 +320,7 @@ Agents Router 才会转发。项目路径必须是干净的绝对路径。如果
 
 - 如果没有设置 `only_forward_from_project_paths`，或它是空数组，通知不会按项目路径过滤。
 - Setup 不会询问这个选项。需要只转发指定项目时，手动把它加到真实 agent 的 route 上。
-- Feishu/Lark Personal Agent setup 会清空所选 agent route 上的这个过滤。用 Lark 或飞书群里的 `/bind` 选择项目目标。
+- Feishu/Lark Personal Agent setup 会清空所选 agent route 上的这个过滤。私聊 `/bind /absolute/project/path` 可以选择项目群，群里 `/bind /absolute/project/path` 会连接当前群。
 - 这个值是数组，所以同一条 route 可以允许多个项目路径。
 - 路径必须是非空绝对路径，不能包含 `.` 或 `..` 路径组件。
 - 匹配使用路径组件语义，不是字符串前缀。例如 `/Users/me/app` 会匹配 `/Users/me/app/api`，但不会匹配 `/Users/me/app-copy`。

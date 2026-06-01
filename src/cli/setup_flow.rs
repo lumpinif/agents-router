@@ -116,6 +116,7 @@ pub(super) struct SetupDefaults {
     pub(super) feishu_lark_app_domain: Option<String>,
     pub(super) feishu_lark_app_id: Option<String>,
     pub(super) feishu_lark_app_secret: Option<String>,
+    pub(super) feishu_lark_operator_open_id: Option<String>,
     pub(super) feishu_lark_tenant_key: Option<String>,
     pub(super) feishu_lark_chat_id: Option<String>,
     pub(super) webhook_url: Option<String>,
@@ -180,6 +181,8 @@ impl SetupDefaults {
                 .and_then(|provider| provider.app_id.clone()),
             feishu_lark_app_secret: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(|provider| provider.app_secret.clone()),
+            feishu_lark_operator_open_id: first_provider_of_type(config, ProviderType::FeishuLark)
+                .and_then(|provider| provider.operator_open_id.clone()),
             feishu_lark_tenant_key: first_provider_of_type(config, ProviderType::FeishuLark)
                 .and_then(|provider| provider.tenant_key.clone()),
             feishu_lark_chat_id: first_provider_of_type(config, ProviderType::FeishuLark)
@@ -886,6 +889,7 @@ pub(super) async fn run_feishu_lark_setup(
                     existing.domain,
                     existing.app_id,
                     existing.app_secret,
+                    Some(existing.operator_open_id),
                 )
             } else {
                 print_feishu_lark_personal_agent_setup_intro(i18n);
@@ -897,6 +901,7 @@ pub(super) async fn run_feishu_lark_setup(
                     registration.domain.as_str(),
                     &registration.app_id,
                     &registration.app_secret,
+                    registration.operator_open_id.as_deref(),
                 )
             }
         }
@@ -1010,6 +1015,7 @@ pub(super) struct ExistingPersonalAgentCredentials<'a> {
     pub(super) domain: &'a str,
     pub(super) app_id: &'a str,
     pub(super) app_secret: &'a str,
+    pub(super) operator_open_id: &'a str,
 }
 
 pub(super) fn existing_personal_agent_credentials(
@@ -1025,6 +1031,7 @@ pub(super) fn existing_personal_agent_credentials(
         domain: defaults.feishu_lark_app_domain.as_deref()?,
         app_id: defaults.feishu_lark_app_id.as_deref()?,
         app_secret: defaults.feishu_lark_app_secret.as_deref()?,
+        operator_open_id: defaults.feishu_lark_operator_open_id.as_deref()?,
     })
 }
 
@@ -1035,7 +1042,10 @@ fn print_existing_personal_agent_reuse_notice(i18n: I18n) {
             println!("Personal Agent setup:");
             println!("- Reusing the Personal Agent app already saved in this config.");
             println!(
-                "- Direct chat: send `/bind /absolute/project/path`, then send any message to start a new Codex thread."
+                "- Direct chat: send `/new /absolute/project/path what you want Codex to do` to start a new Codex thread."
+            );
+            println!(
+                "- Direct chat: send `/bind /absolute/project/path` to choose where that project's updates should go."
             );
             println!(
                 "- Project rooms: add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
@@ -1045,7 +1055,10 @@ fn print_existing_personal_agent_reuse_notice(i18n: I18n) {
             println!("Personal Agent setup:");
             println!("- 复用当前 config 里已经保存的 Personal Agent app。");
             println!(
-                "- 私聊：发送 `/bind /absolute/project/path`，之后直接发消息就会启动新的 Codex thread。"
+                "- 私聊：发送 `/new /absolute/project/path what you want Codex to do` 启动新的 Codex thread。"
+            );
+            println!(
+                "- 私聊：发送 `/bind /absolute/project/path` 选择这个项目的更新要进入哪个群。"
             );
             println!(
                 "- 项目群：把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
@@ -1065,7 +1078,10 @@ fn print_feishu_lark_personal_agent_setup_intro(i18n: I18n) {
             );
             println!("- Keep this terminal open; setup continues automatically after creation.");
             println!(
-                "- Direct chat: send `/bind /absolute/project/path`, then send any message to start a new Codex thread."
+                "- Direct chat: send `/new /absolute/project/path what you want Codex to do` to start a new Codex thread."
+            );
+            println!(
+                "- Direct chat: send `/bind /absolute/project/path` to choose where that project's updates should go."
             );
             println!(
                 "- Project rooms: add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
@@ -1080,7 +1096,10 @@ fn print_feishu_lark_personal_agent_setup_intro(i18n: I18n) {
             println!("- 用 Lark 或飞书扫码，然后在打开的页面里完成 Personal Agent app 创建。");
             println!("- 保持这个终端打开；创建成功后 setup 会自动继续。");
             println!(
-                "- 私聊：发送 `/bind /absolute/project/path`，之后直接发消息就会启动新的 Codex thread。"
+                "- 私聊：发送 `/new /absolute/project/path what you want Codex to do` 启动新的 Codex thread。"
+            );
+            println!(
+                "- 私聊：发送 `/bind /absolute/project/path` 选择这个项目的更新要进入哪个群。"
             );
             println!(
                 "- 项目群：把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
@@ -1100,10 +1119,10 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!("Self-built app checklist:");
             println!("- Add Bot capability.");
             println!(
-                "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly."
+                "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly, im:chat:create."
             );
             println!(
-                "- Subscribe to im.message.receive_v1 and im.chat.member.bot.added_v1 with Long Connection / WebSocket."
+                "- Subscribe to im.message.receive_v1, im.chat.member.bot.added_v1, and card.action.trigger with Long Connection / WebSocket."
             );
             println!("- Publish a new app version after permission or event changes.");
             println!(
@@ -1117,10 +1136,10 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!("自建应用检查清单:");
             println!("- 添加 Bot 能力。");
             println!(
-                "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly。"
+                "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly、im:chat:create。"
             );
             println!(
-                "- 用 Long Connection / WebSocket 订阅 im.message.receive_v1 和 im.chat.member.bot.added_v1。"
+                "- 用 Long Connection / WebSocket 订阅 im.message.receive_v1、im.chat.member.bot.added_v1 和 card.action.trigger。"
             );
             println!("- 修改权限或事件后，发布新版本并等待审批通过。");
             println!(

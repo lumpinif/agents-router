@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::bridge_binding_ledger::{
-    BridgeBindingLedger, DirectChatBindingQuery, DirectChatProjectBindingInput, RoomBindingQuery,
+    BridgeBindingLedger, OwnerDirectChatInput, ProjectRoomProposalInput, RoomBindingQuery,
     RoomProjectBindingInput, RoomProjectBindingRecord,
 };
 use crate::config::is_clean_absolute_project_path;
@@ -13,10 +13,8 @@ use crate::provider_inbound::{
 };
 use crate::response_surface_ledger::provider_event_id_hash;
 
-const BIND_COMMAND_HINT: &str = "`/bind /path/to/project`";
-const BIND_COMMAND_EXAMPLE: &str = "`/bind /Users/alex/Projects/my-app`";
-const NEW_COMMAND_HINT: &str = "`/new what you want Codex to do`";
 const NEW_WITH_PROJECT_COMMAND_HINT: &str = "`/new /path/to/project what you want Codex to do`";
+const DIRECT_BIND_COMMAND_HINT: &str = "`/bind /path/to/project`";
 const ROOM_BIND_COMMAND_HINT: &str = "`@your-bot /bind /path/to/project`";
 const ROOM_BIND_COMMAND_EXAMPLE: &str = "`@Agents Router /bind /Users/alex/Projects/my-app`";
 const ROOM_NEW_COMMAND_HINT: &str = "`@your-bot /new what you want Codex to do`";
@@ -62,9 +60,23 @@ pub(crate) struct BridgeRoomMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeProjectRoomPrompt {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+    pub provider_event_id_hash: String,
+    pub proposal_id: String,
+    pub project_path: String,
+    pub project_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BridgeControlOutcome {
     Reply(BridgeControlReply),
     RoomMessage(BridgeRoomMessage),
+    ProjectRoomPrompt(BridgeProjectRoomPrompt),
     NewSession(BridgeNewSessionCommand),
 }
 
@@ -105,12 +117,28 @@ pub(crate) fn handle_provider_control_command(
         &command.provider_event_id,
     );
 
+    if is_direct_chat_command(&command.command) {
+        ledger.remember_owner_direct_chat_at(
+            OwnerDirectChatInput {
+                provider_id: command.provider_id.clone(),
+                provider_type: command.provider_type.clone(),
+                provider_account_id: command.provider_account_id.clone(),
+                provider_conversation_id: command.provider_conversation_id.clone(),
+            },
+            now,
+        )?;
+    }
+
     let outcome = match &command.command {
-        ProviderControlCommand::DirectBindProject { project_path } => reply_outcome(
-            &command,
-            provider_event_id_hash,
-            bind_direct_chat_project(ledger, &command, project_path, now)?,
-        ),
+        ProviderControlCommand::DirectProjectRoomPrompt { project_path } => {
+            direct_project_room_prompt(
+                ledger,
+                &command,
+                &provider_event_id_hash,
+                project_path,
+                now,
+            )?
+        }
         ProviderControlCommand::DirectChatGuidance => reply_outcome(
             &command,
             provider_event_id_hash,
@@ -123,22 +151,20 @@ pub(crate) fn handle_provider_control_command(
             project_path,
             prompt,
         } => resolve_direct_new_session_command(
-            ledger,
             &command,
             &provider_event_id_hash,
             project_path.as_deref(),
             prompt,
-            now,
         )?,
         ProviderControlCommand::DirectStatus => reply_outcome(
             &command,
             provider_event_id_hash,
             direct_chat_status(ledger, &command)?,
         ),
-        ProviderControlCommand::DirectUnbindProject => reply_outcome(
+        ProviderControlCommand::DirectUnbindProjectGuidance => reply_outcome(
             &command,
             provider_event_id_hash,
-            unbind_direct_chat_project(ledger, &command, now)?,
+            direct_unbind_project_guidance_text(),
         ),
         ProviderControlCommand::NewSession {
             project_path,
@@ -179,6 +205,18 @@ pub(crate) fn handle_provider_control_command(
     };
 
     Ok(outcome)
+}
+
+fn is_direct_chat_command(command: &ProviderControlCommand) -> bool {
+    matches!(
+        command,
+        ProviderControlCommand::DirectProjectRoomPrompt { .. }
+            | ProviderControlCommand::DirectChatGuidance
+            | ProviderControlCommand::DirectHelp
+            | ProviderControlCommand::DirectNewSession { .. }
+            | ProviderControlCommand::DirectStatus
+            | ProviderControlCommand::DirectUnbindProjectGuidance
+    )
 }
 
 pub(crate) fn disconnected_lark_thread_reply(
@@ -236,54 +274,64 @@ fn bind_project(
     ))
 }
 
-fn bind_direct_chat_project(
+fn direct_project_room_prompt(
     ledger: &mut BridgeBindingLedger,
     command: &NormalizedProviderControlCommand,
+    provider_event_id_hash: &str,
     project_path: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<BridgeControlOutcome> {
     if !is_clean_absolute_project_path(project_path) {
-        return Ok(format!(
-            "Choose a default project folder first.\n\nFormat:\n{BIND_COMMAND_HINT}\n\nExample:\n{BIND_COMMAND_EXAMPLE}"
+        return Ok(reply_outcome(
+            command,
+            provider_event_id_hash.to_string(),
+            format!(
+                "`/bind` connects a project to a group room.\n\nUse the full folder path on this Mac:\n`/bind /path/to/project`\n\nTo start a new Codex session instead, use:\n{NEW_WITH_PROJECT_COMMAND_HINT}"
+            ),
         ));
     }
     if !Path::new(project_path).is_dir() {
-        return Ok(format!(
-            "I can't find that folder on this Mac:\n{project_path}"
+        return Ok(reply_outcome(
+            command,
+            provider_event_id_hash.to_string(),
+            format!("I can't find that folder on this Mac:\n{project_path}"),
         ));
     }
 
-    ledger.connect_direct_chat_project_at(
-        DirectChatProjectBindingInput {
+    let record = ledger.begin_manual_project_room_proposal_prompt_at(
+        ProjectRoomProposalInput {
             provider_id: command.provider_id.clone(),
             provider_type: command.provider_type.clone(),
-            provider_account_id: command.provider_account_id.clone(),
-            provider_conversation_id: command.provider_conversation_id.clone(),
             project_path: project_path.to_string(),
         },
         now,
     )?;
 
-    Ok(format!(
-        "Done. Direct chat will use:\n{project_path}\n\nNow you can send a normal message here to start a new Codex task."
+    Ok(BridgeControlOutcome::ProjectRoomPrompt(
+        BridgeProjectRoomPrompt {
+            provider_id: command.provider_id.clone(),
+            provider_type: command.provider_type.clone(),
+            provider_account_id: command.provider_account_id.clone(),
+            provider_conversation_id: command.provider_conversation_id.clone(),
+            provider_thread_id: command.provider_thread_id.clone(),
+            provider_event_id_hash: provider_event_id_hash.to_string(),
+            proposal_id: record.proposal_id,
+            project_path: record.project_path,
+            project_name: record.project_name,
+        },
     ))
 }
 
-fn unbind_direct_chat_project(
-    ledger: &mut BridgeBindingLedger,
-    command: &NormalizedProviderControlCommand,
-    now: DateTime<Utc>,
-) -> anyhow::Result<String> {
-    let disconnected =
-        ledger.disconnect_direct_chat_project_at(&direct_chat_query(command), now)?;
-    if let Some(disconnected) = disconnected {
-        Ok(format!(
-            "Direct chat no longer uses:\n{}",
-            disconnected.project_path
-        ))
-    } else {
-        Ok("Direct chat is not connected to a project.".to_string())
-    }
+fn direct_unbind_project_guidance_text() -> String {
+    [
+        "Direct chat does not bind a project folder.",
+        "",
+        "To start a new Codex session from direct chat, include the folder in `/new`:",
+        NEW_WITH_PROJECT_COMMAND_HINT,
+        "",
+        "To disconnect a group room, use `/unbind` in that room.",
+    ]
+    .join("\n")
 }
 
 fn unbind_project(
@@ -413,19 +461,17 @@ fn resolve_new_session_command(
 }
 
 fn resolve_direct_new_session_command(
-    ledger: &mut BridgeBindingLedger,
     command: &NormalizedProviderControlCommand,
     provider_event_id_hash: &str,
     explicit_project_path: Option<&str>,
     prompt: &str,
-    now: DateTime<Utc>,
 ) -> anyhow::Result<BridgeControlOutcome> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Ok(reply_outcome(
             command,
             provider_event_id_hash.to_string(),
-            format!("Tell Codex what to do.\n\nExample:\n{NEW_COMMAND_HINT}"),
+            format!("Tell Codex what to do.\n\nExample:\n{NEW_WITH_PROJECT_COMMAND_HINT}"),
         ));
     }
 
@@ -449,14 +495,14 @@ fn resolve_direct_new_session_command(
             }
             Some(project_path.to_string())
         }
-        None => direct_chat_project_path_or_reply(ledger, command, now)?,
+        None => None,
     };
 
     let Some(project_path) = project_path else {
         return Ok(reply_outcome(
             command,
             provider_event_id_hash.to_string(),
-            direct_chat_needs_project_text(ledger, command)?,
+            direct_chat_needs_project_text(),
         ));
     };
 
@@ -465,7 +511,7 @@ fn resolve_direct_new_session_command(
             command,
             provider_event_id_hash.to_string(),
             format!(
-                "I can't find the direct chat project on this Mac:\n{project_path}\n\nChoose a new project folder with:\n{BIND_COMMAND_HINT}"
+                "I can't find that folder on this Mac:\n{project_path}\n\nStart again with:\n{NEW_WITH_PROJECT_COMMAND_HINT}"
             ),
         ));
     }
@@ -478,71 +524,17 @@ fn resolve_direct_new_session_command(
     ))
 }
 
-fn direct_chat_project_path_or_reply(
-    ledger: &mut BridgeBindingLedger,
-    command: &NormalizedProviderControlCommand,
-    now: DateTime<Utc>,
-) -> anyhow::Result<Option<String>> {
-    if let Some(record) = ledger.connected_project_for_direct_chat(&direct_chat_query(command))? {
-        return Ok(Some(record.project_path));
-    }
-
-    let connected = unique_connected_projects_for_provider_account(ledger, command)?;
-    if connected.len() == 1 {
-        let project_path = connected[0].clone();
-        ledger.connect_direct_chat_project_at(
-            DirectChatProjectBindingInput {
-                provider_id: command.provider_id.clone(),
-                provider_type: command.provider_type.clone(),
-                provider_account_id: command.provider_account_id.clone(),
-                provider_conversation_id: command.provider_conversation_id.clone(),
-                project_path: project_path.clone(),
-            },
-            now,
-        )?;
-        return Ok(Some(project_path));
-    }
-
-    Ok(None)
-}
-
-fn direct_chat_needs_project_text(
-    ledger: &BridgeBindingLedger,
-    command: &NormalizedProviderControlCommand,
-) -> anyhow::Result<String> {
-    let connected = unique_connected_projects_for_provider_account(ledger, command)?;
-    if connected.is_empty() {
-        return Ok([
-            "Choose a default project folder first.",
-            "",
-            "Send:",
-            BIND_COMMAND_HINT,
-            "",
-            "Example:",
-            BIND_COMMAND_EXAMPLE,
-            "",
-            "After that, any normal message here starts a new Codex task.",
-        ]
-        .join("\n"));
-    }
-
-    let mut lines = vec![
-        "I found more than one connected folder.".to_string(),
-        "".to_string(),
-        "Choose the folder this direct chat should use:".to_string(),
-        BIND_COMMAND_HINT.to_string(),
-        "".to_string(),
-        "Example:".to_string(),
-        BIND_COMMAND_EXAMPLE.to_string(),
-        "".to_string(),
-        "Connected folders:".to_string(),
-    ];
-    lines.extend(
-        connected
-            .iter()
-            .map(|project_path| format!("- {project_path}")),
-    );
-    Ok(lines.join("\n"))
+fn direct_chat_needs_project_text() -> String {
+    [
+        "Tell me which folder Codex should use.",
+        "",
+        "Send:",
+        NEW_WITH_PROJECT_COMMAND_HINT,
+        "",
+        "Example:",
+        "`/new /Users/alex/Projects/my-app fix the failing test`",
+    ]
+    .join("\n")
 }
 
 fn new_session_outcome(
@@ -615,42 +607,38 @@ fn direct_chat_status(
     ledger: &BridgeBindingLedger,
     command: &NormalizedProviderControlCommand,
 ) -> anyhow::Result<String> {
-    let direct_project = ledger.connected_project_for_direct_chat(&direct_chat_query(command))?;
     let connected = ledger.connected_room_project_bindings_for_provider_account(
         &command.provider_id,
         &command.provider_type,
         &command.provider_account_id,
     )?;
-    if direct_project.is_none() && connected.is_empty() {
+    if connected.is_empty() {
         return Ok([
-            "Direct chat is not connected yet.",
+            "Direct chat is ready.",
             "",
-            "Choose the project folder Codex should use here:",
-            BIND_COMMAND_HINT,
+            "Start a new Codex session by choosing a folder in `/new`:",
+            NEW_WITH_PROJECT_COMMAND_HINT,
             "",
             "Example:",
-            BIND_COMMAND_EXAMPLE,
+            "`/new /Users/alex/Projects/my-app fix the failing test`",
             "",
-            "After that, send any normal message here to start a new Codex task.",
+            "To connect a project to a Lark room, open the project room menu:",
+            DIRECT_BIND_COMMAND_HINT,
         ]
         .join("\n"));
     }
 
     let mut lines = vec!["Direct chat is ready".to_string(), "".to_string()];
-    if let Some(project) = direct_project {
-        lines.push("Default project folder:".to_string());
-        lines.push(format!("- {}", project.project_path));
-        lines.push("".to_string());
-        lines.push("Any normal message here starts a new Codex task in that folder.".to_string());
-    } else {
-        lines.push("No default project folder is set.".to_string());
-        lines.push(format!("Choose one with {BIND_COMMAND_HINT}."));
-    }
-    if !connected.is_empty() {
-        lines.push("".to_string());
-        lines.push(format!("Folders connected in rooms: {}", connected.len()));
-        lines.push(format_project_list(&connected));
-    }
+    lines.push("Start a new Codex session by choosing a folder in `/new`:".to_string());
+    lines.push(NEW_WITH_PROJECT_COMMAND_HINT.to_string());
+    lines.push("".to_string());
+    lines.push(format!("Folders connected in rooms: {}", connected.len()));
+    lines.push(format_project_list(&connected));
+    lines.push("".to_string());
+    lines.push("Those room bindings do not become a direct chat default.".to_string());
+    lines.push("".to_string());
+    lines.push("To connect another project to a room, use:".to_string());
+    lines.push(DIRECT_BIND_COMMAND_HINT.to_string());
     Ok(lines.join("\n"))
 }
 
@@ -697,29 +685,23 @@ fn direct_help_text() -> String {
         "",
         "No mention is needed in direct chat.",
         "",
-        "First, choose a default project folder:",
-        BIND_COMMAND_HINT,
+        "Start a new Codex session by choosing a folder in `/new`:",
+        NEW_WITH_PROJECT_COMMAND_HINT,
         "",
         "Example:",
-        BIND_COMMAND_EXAMPLE,
-        "",
-        "After that, send any normal message here to start a new Codex task.",
+        "`/new /Users/alex/Projects/my-app fix the failing test`",
         "",
         "Common commands",
         "`/help`",
         "Show this help.",
         "",
         "`/status`",
-        "Show the default folder for this direct chat.",
+        "Show direct chat guidance and connected project rooms.",
         "",
-        NEW_COMMAND_HINT,
-        "Start a new Codex task in the default folder.",
+        DIRECT_BIND_COMMAND_HINT,
+        "Open the project room menu for a folder.",
         "",
-        NEW_WITH_PROJECT_COMMAND_HINT,
-        "Start a new Codex task in a one-off folder.",
-        "",
-        "Group rooms",
-        "Add me to a group, then send the full message like this:",
+        "You can also add me to a group and connect that room directly:",
         ROOM_BIND_COMMAND_HINT,
         "",
         ROOM_MENTION_NOTE,
@@ -731,13 +713,14 @@ fn direct_chat_guidance_text() -> String {
     [
         "Direct chat is ready.",
         "",
-        "Choose the project folder Codex should use here:",
-        BIND_COMMAND_HINT,
+        "Start a new Codex session by choosing a folder in `/new`:",
+        NEW_WITH_PROJECT_COMMAND_HINT,
         "",
         "Example:",
-        BIND_COMMAND_EXAMPLE,
+        "`/new /Users/alex/Projects/my-app fix the failing test`",
         "",
-        "After that, send any normal message to start a new Codex task.",
+        "To connect a project to a Lark room, open the project room menu:",
+        DIRECT_BIND_COMMAND_HINT,
     ]
     .join("\n")
 }
@@ -859,33 +842,6 @@ fn room_query(command: &NormalizedProviderControlCommand) -> RoomBindingQuery {
         provider_account_id: command.provider_account_id.clone(),
         provider_conversation_id: command.provider_conversation_id.clone(),
     }
-}
-
-fn direct_chat_query(command: &NormalizedProviderControlCommand) -> DirectChatBindingQuery {
-    DirectChatBindingQuery {
-        provider_id: command.provider_id.clone(),
-        provider_type: command.provider_type.clone(),
-        provider_account_id: command.provider_account_id.clone(),
-        provider_conversation_id: command.provider_conversation_id.clone(),
-    }
-}
-
-fn unique_connected_projects_for_provider_account(
-    ledger: &BridgeBindingLedger,
-    command: &NormalizedProviderControlCommand,
-) -> anyhow::Result<Vec<String>> {
-    let mut project_paths = ledger
-        .connected_room_project_bindings_for_provider_account(
-            &command.provider_id,
-            &command.provider_type,
-            &command.provider_account_id,
-        )?
-        .into_iter()
-        .map(|record| record.project_path)
-        .collect::<Vec<_>>();
-    project_paths.sort();
-    project_paths.dedup();
-    Ok(project_paths)
 }
 
 fn format_project_list(records: &[RoomProjectBindingRecord]) -> String {
@@ -1132,44 +1088,96 @@ mod tests {
         );
 
         assert!(reply.contains("Chat with Codex on your Mac."));
-        assert!(reply.contains("`/bind /path/to/project`"));
-        assert!(reply.contains("send any normal message"));
-        assert!(reply.contains("`/new what you want Codex to do`"));
         assert!(reply.contains("`/new /path/to/project what you want Codex to do`"));
-        assert!(reply.contains("Group rooms"));
+        assert!(reply.contains("Start a new Codex session"));
+        assert!(reply.contains("Open the project room menu for a folder."));
+        assert!(reply.contains("You can also add me to a group"));
         assert!(reply.contains("`@your-bot /bind /path/to/project`"));
         assert!(reply.contains("Use Lark's @ menu to select me"));
     }
 
     #[test]
-    fn direct_bind_project_sets_direct_chat_default_project() {
+    fn direct_bind_project_opens_project_room_prompt() {
         let dir = tempfile::tempdir().expect("temp dir should exist");
         let path = dir.path().to_string_lossy().to_string();
         let mut ledger = BridgeBindingLedger::in_memory();
-        let reply = reply_text(
-            handle_provider_control_command(
-                &mut ledger,
-                command(ProviderControlCommand::DirectBindProject {
-                    project_path: path.clone(),
-                }),
-                test_time(),
-            )
-            .expect("direct bind should handle"),
-        );
+        let outcome = handle_provider_control_command(
+            &mut ledger,
+            command(ProviderControlCommand::DirectProjectRoomPrompt {
+                project_path: path.clone(),
+            }),
+            test_time(),
+        )
+        .expect("direct bind should handle");
 
+        let BridgeControlOutcome::ProjectRoomPrompt(prompt) = outcome else {
+            panic!("direct bind should dispatch project room prompt");
+        };
+        assert_eq!(prompt.project_path, path);
+        assert_eq!(prompt.provider_conversation_id, "room-1");
+        assert_eq!(prompt.provider_thread_id, "message-1");
         assert_eq!(
-            reply,
-            format!(
-                "Done. Direct chat will use:\n{path}\n\nNow you can send a normal message here to start a new Codex task."
-            )
+            prompt.project_name,
+            dir.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
         );
-        let binding = ledger
-            .connected_project_for_direct_chat(&direct_chat_query(&command(
-                ProviderControlCommand::DirectStatus,
-            )))
-            .expect("direct chat binding should query")
-            .expect("direct chat should have a default project");
-        assert_eq!(binding.project_path, path);
+        assert!(
+            ledger
+                .lookup_project_room_proposal(&prompt.proposal_id)
+                .expect("proposal lookup should load")
+                .is_some()
+        );
+        let owner = ledger
+            .owner_direct_chat_for_provider("lark-personal-agent", "feishu_lark")
+            .expect("owner direct chat lookup should load")
+            .expect("direct command should remember the owner direct chat");
+        assert_eq!(owner.provider_conversation_id, "room-1");
+    }
+
+    #[test]
+    fn direct_bind_project_reopens_ignored_project_room_prompt() {
+        let dir = tempfile::tempdir().expect("temp dir should exist");
+        let path = dir.path().to_string_lossy().to_string();
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let first = handle_provider_control_command(
+            &mut ledger,
+            command(ProviderControlCommand::DirectProjectRoomPrompt {
+                project_path: path.clone(),
+            }),
+            test_time(),
+        )
+        .expect("direct bind should handle");
+        let BridgeControlOutcome::ProjectRoomPrompt(first_prompt) = first else {
+            panic!("first bind should dispatch project room prompt");
+        };
+        ledger
+            .ignore_project_room_proposal_at(&first_prompt.proposal_id, test_time())
+            .expect("proposal should ignore");
+
+        let reopened = handle_provider_control_command(
+            &mut ledger,
+            command(ProviderControlCommand::DirectProjectRoomPrompt {
+                project_path: path.clone(),
+            }),
+            test_time(),
+        )
+        .expect("direct bind should reopen");
+        let BridgeControlOutcome::ProjectRoomPrompt(reopened_prompt) = reopened else {
+            panic!("manual bind should reopen project room prompt");
+        };
+
+        assert_eq!(reopened_prompt.proposal_id, first_prompt.proposal_id);
+        assert_eq!(
+            ledger
+                .lookup_project_room_proposal(&reopened_prompt.proposal_id)
+                .expect("proposal lookup should load")
+                .expect("proposal should exist")
+                .status,
+            crate::bridge_binding_ledger::ProjectRoomProposalStatus::Pending
+        );
     }
 
     #[test]
@@ -1196,25 +1204,14 @@ mod tests {
         );
 
         assert!(reply.contains("Direct chat is ready"));
-        assert!(reply.contains("No default project folder is set."));
+        assert!(reply.contains("Start a new Codex session by choosing a folder in `/new`"));
         assert!(reply.contains("Folders connected in rooms: 1"));
         assert!(reply.contains(&path));
     }
 
     #[test]
-    fn direct_status_reports_direct_chat_default_project() {
-        let dir = tempfile::tempdir().expect("temp dir should exist");
-        let path = dir.path().to_string_lossy().to_string();
+    fn direct_status_without_room_bindings_points_to_new_with_project() {
         let mut ledger = BridgeBindingLedger::in_memory();
-        handle_provider_control_command(
-            &mut ledger,
-            command(ProviderControlCommand::DirectBindProject {
-                project_path: path.clone(),
-            }),
-            test_time(),
-        )
-        .expect("direct bind should handle");
-
         let reply = reply_text(
             handle_provider_control_command(
                 &mut ledger,
@@ -1224,82 +1221,33 @@ mod tests {
             .expect("direct status should handle"),
         );
 
-        assert!(reply.contains("Default project folder:"));
-        assert!(reply.contains(&path));
-        assert!(reply.contains("Any normal message here starts a new Codex task"));
+        assert!(reply.contains("Direct chat is ready"));
+        assert!(reply.contains("`/new /path/to/project what you want Codex to do`"));
+        assert!(reply.contains("To connect a project to a Lark room"));
+        assert!(reply.contains("`/bind /path/to/project`"));
     }
 
     #[test]
-    fn direct_new_session_uses_direct_chat_default_project() {
-        let dir = tempfile::tempdir().expect("temp dir should exist");
-        let path = dir.path().to_string_lossy().to_string();
+    fn direct_new_session_without_project_asks_for_path() {
         let mut ledger = BridgeBindingLedger::in_memory();
-        handle_provider_control_command(
-            &mut ledger,
-            command(ProviderControlCommand::DirectBindProject {
-                project_path: path.clone(),
-            }),
-            test_time(),
-        )
-        .expect("direct bind should handle");
-
-        let outcome = handle_provider_control_command(
-            &mut ledger,
-            command(ProviderControlCommand::DirectNewSession {
-                project_path: None,
-                prompt: "What is the time?".to_string(),
-            }),
-            test_time(),
-        )
-        .expect("direct new should handle");
-
-        let BridgeControlOutcome::NewSession(new_session) = outcome else {
-            panic!("direct new session should dispatch work");
-        };
-        assert_eq!(new_session.project_path, path);
-        assert_eq!(new_session.prompt, "What is the time?");
-    }
-
-    #[test]
-    fn direct_new_session_adopts_the_only_connected_project_room() {
-        let dir = tempfile::tempdir().expect("temp dir should exist");
-        let path = dir.path().to_string_lossy().to_string();
-        let mut ledger = BridgeBindingLedger::in_memory();
-        handle_provider_control_command(
-            &mut ledger,
-            command(ProviderControlCommand::BindProject {
-                project_path: path.clone(),
-            }),
-            test_time(),
-        )
-        .expect("room bind should handle");
-
-        let outcome = handle_provider_control_command(
-            &mut ledger,
-            command(ProviderControlCommand::DirectNewSession {
-                project_path: None,
-                prompt: "What is the time?".to_string(),
-            }),
-            test_time(),
-        )
-        .expect("direct new should handle");
-
-        let BridgeControlOutcome::NewSession(new_session) = outcome else {
-            panic!("direct new session should dispatch work");
-        };
-        assert_eq!(new_session.project_path, path);
-        assert!(
-            ledger
-                .connected_project_for_direct_chat(&direct_chat_query(&command(
-                    ProviderControlCommand::DirectStatus,
-                )))
-                .expect("direct chat binding should query")
-                .is_some()
+        let reply = reply_text(
+            handle_provider_control_command(
+                &mut ledger,
+                command(ProviderControlCommand::DirectNewSession {
+                    project_path: None,
+                    prompt: "What is the time?".to_string(),
+                }),
+                test_time(),
+            )
+            .expect("direct new should handle"),
         );
+
+        assert!(reply.contains("Tell me which folder Codex should use."));
+        assert!(reply.contains("`/new /path/to/project what you want Codex to do`"));
     }
 
     #[test]
-    fn direct_new_session_asks_for_project_when_multiple_project_rooms_exist() {
+    fn direct_new_session_still_requires_project_when_project_rooms_exist() {
         let first = tempfile::tempdir().expect("temp dir should exist");
         let second = tempfile::tempdir().expect("temp dir should exist");
         let first_path = first.path().to_string_lossy().to_string();
@@ -1328,10 +1276,10 @@ mod tests {
             .expect("direct new should handle"),
         );
 
-        assert!(reply.contains("I found more than one connected folder"));
-        assert!(reply.contains("Choose the folder this direct chat should use"));
-        assert!(reply.contains(&first_path));
-        assert!(reply.contains(&second_path));
+        assert!(reply.contains("Tell me which folder Codex should use."));
+        assert!(reply.contains("`/new /path/to/project what you want Codex to do`"));
+        assert!(!reply.contains(&first_path));
+        assert!(!reply.contains(&second_path));
     }
 
     #[test]
@@ -1371,9 +1319,10 @@ mod tests {
             .expect("direct guidance should handle"),
         );
 
-        assert!(reply.contains("Choose the project folder Codex should use here"));
+        assert!(reply.contains("Start a new Codex session by choosing a folder in `/new`"));
+        assert!(reply.contains("`/new /path/to/project what you want Codex to do`"));
+        assert!(reply.contains("To connect a project to a Lark room"));
         assert!(reply.contains("`/bind /path/to/project`"));
-        assert!(reply.contains("send any normal message"));
     }
 
     #[test]
@@ -1503,6 +1452,7 @@ mod tests {
         match outcome {
             BridgeControlOutcome::Reply(reply) => reply.text,
             BridgeControlOutcome::RoomMessage(_) => panic!("expected reply outcome"),
+            BridgeControlOutcome::ProjectRoomPrompt(_) => panic!("expected reply outcome"),
             BridgeControlOutcome::NewSession(_) => panic!("expected reply outcome"),
         }
     }

@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Local, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::agent_controller::{
@@ -25,6 +26,7 @@ use crate::providers::http::provider_http_client;
 use crate::providers::notification_view::{
     NotificationAction, NotificationFieldKey, NotificationSection, SignalNotificationView,
 };
+use crate::router::{ProjectRoomPromptFuture, ProjectRoomPromptRequest, ProjectRoomPromptResult};
 use crate::router::{Provider, ProviderFuture};
 use crate::signal::Signal;
 
@@ -53,6 +55,23 @@ pub(crate) struct FeishuLarkConversationTextSuccess {
     pub provider_message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkCreateProjectRoomRequest {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub operator_open_id: String,
+    pub project_name: String,
+    pub project_path: String,
+    pub proposal_id: String,
+    pub proposal_created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkCreateProjectRoomSuccess {
+    pub provider_conversation_id: String,
+}
+
 #[derive(Debug, Clone)]
 enum FeishuLarkProviderRuntime {
     CustomBot(FeishuLarkCustomBotRuntime),
@@ -71,6 +90,7 @@ struct FeishuLarkAppBotRuntime {
     api_base_url: String,
     app_id: String,
     app_secret: String,
+    operator_open_id: Option<String>,
     tenant_key: Option<String>,
     chat_id: Option<String>,
     computer_name: String,
@@ -113,6 +133,20 @@ impl FeishuLarkProvider {
             }
         }
     }
+
+    pub(crate) async fn create_project_room(
+        &self,
+        request: FeishuLarkCreateProjectRoomRequest,
+    ) -> anyhow::Result<FeishuLarkCreateProjectRoomSuccess> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => {
+                anyhow::bail!("Feishu/Lark custom bot mode does not support creating rooms")
+            }
+            FeishuLarkProviderRuntime::AppBot(runtime) => {
+                self.create_app_bot_project_room(request, runtime).await
+            }
+        }
+    }
 }
 
 impl Provider for FeishuLarkProvider {
@@ -135,6 +169,23 @@ impl Provider for FeishuLarkProvider {
                 }
             }
         })
+    }
+
+    fn can_prompt_for_project_room(&self) -> bool {
+        matches!(&self.runtime, FeishuLarkProviderRuntime::AppBot(_))
+    }
+
+    fn send_project_room_prompt<'a>(
+        &'a self,
+        request: ProjectRoomPromptRequest,
+    ) -> Option<ProjectRoomPromptFuture<'a>> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => None,
+            FeishuLarkProviderRuntime::AppBot(runtime) => Some(Box::pin(async move {
+                self.send_app_bot_project_room_prompt(request, runtime)
+                    .await
+            })),
+        }
     }
 
     fn send_to_provider_conversation<'a>(
@@ -310,7 +361,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Config,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` has no fixed room configured; use `/bind /absolute/project/path` in direct chat or a project room, or set `chat_id` only for the advanced fixed-room setup",
+                    "feishu_lark provider `{}` has no fixed room configured; connect a project room with `/bind /absolute/project/path`, or set `chat_id` only for the advanced fixed-room setup",
                     self.id
                 ),
             )
@@ -890,6 +941,362 @@ impl FeishuLarkProvider {
         })
     }
 
+    async fn send_app_bot_project_room_prompt(
+        &self,
+        request: ProjectRoomPromptRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<ProjectRoomPromptResult, DeliveryError> {
+        let provider_type = ProviderType::FeishuLark.as_str();
+        let context = || {
+            DeliveryErrorContext::provider_control(&request.proposal_id, &self.id, provider_type)
+        };
+        let prompt_conversation_id = request
+            .prompt_conversation_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| ("chat_id", value));
+        let operator_open_id = runtime
+            .operator_open_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| ("open_id", value));
+        let (receive_id_type, receive_id) = prompt_conversation_id
+            .or(operator_open_id)
+            .ok_or_else(|| {
+                DeliveryError::new(
+                    DeliveryErrorKind::Config,
+                    context(),
+                    format!(
+                        "feishu_lark provider `{}` cannot prompt for project rooms because neither prompt_conversation_id nor operator_open_id is configured",
+                        self.id
+                    ),
+                )
+        })?;
+        let token = self
+            .fetch_tenant_access_token_for_project_room_prompt(&request, runtime)
+            .await?;
+        let content =
+            serde_json::to_string(&project_room_prompt_card(&request)).map_err(|error| {
+                DeliveryError::new(
+                    DeliveryErrorKind::Internal,
+                    context(),
+                    format!(
+                        "feishu_lark provider `{}` failed to serialize project room prompt card",
+                        self.id
+                    ),
+                )
+                .with_source(error)
+            })?;
+        let body = FeishuLarkAppBotSendMessageRequest {
+            receive_id,
+            msg_type: "interactive",
+            content,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/open-apis/im/v1/messages", runtime.api_base_url))
+            .query(&[("receive_id_type", receive_id_type)])
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                let is_timeout = error.is_timeout();
+                let kind = if is_timeout {
+                    DeliveryErrorKind::Timeout
+                } else {
+                    DeliveryErrorKind::Network
+                };
+                DeliveryError::new(
+                    kind,
+                    context(),
+                    format!(
+                        "feishu_lark provider `{}` request failed while sending project room prompt",
+                        self.id
+                    ),
+                )
+                .with_retriable(true)
+                .with_source(error.without_url())
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` failed to read project room prompt response",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` returned HTTP status {} while sending project room prompt",
+                    self.id, status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkAppBotSendMessageResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` returned invalid project room prompt response JSON",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_source(error)
+            })?;
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` returned code {} while sending project room prompt: {}",
+                    self.id,
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+        let data = provider_response.data.ok_or_else(|| {
+            DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` project room prompt response did not include message data",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+        })?;
+        let provider_account_id = data
+            .sender
+            .and_then(|sender| sender.tenant_key)
+            .and_then(|tenant_key| present_owned(Some(tenant_key)));
+
+        Ok(ProjectRoomPromptResult {
+            provider_account_id,
+            provider_conversation_id: data
+                .chat_id
+                .and_then(|chat_id| present_owned(Some(chat_id))),
+            provider_message_id: data
+                .message_id
+                .and_then(|message_id| present_owned(Some(message_id))),
+        })
+    }
+
+    async fn create_app_bot_project_room(
+        &self,
+        request: FeishuLarkCreateProjectRoomRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> anyhow::Result<FeishuLarkCreateProjectRoomSuccess> {
+        validate_app_bot_create_project_room_request(&request, &self.id, runtime)?;
+        let token = self
+            .fetch_tenant_access_token_for_project_room_create(&request, runtime)
+            .await?;
+        let body = FeishuLarkCreateChatRequest {
+            name: project_room_name(&request.project_name),
+            description: project_room_description(&request.project_path),
+            owner_id: request.operator_open_id.clone(),
+            user_id_list: vec![request.operator_open_id.clone()],
+            group_message_type: "chat",
+            chat_mode: "group",
+            chat_type: "private",
+            join_message_visibility: "all_members",
+            leave_message_visibility: "all_members",
+        };
+        let uuid = project_room_create_uuid(&request.proposal_id, request.proposal_created_at);
+
+        let response = self
+            .client
+            .post(format!("{}/open-apis/im/v1/chats", runtime.api_base_url))
+            .query(&[
+                ("user_id_type", "open_id"),
+                ("set_bot_manager", "true"),
+                ("uuid", uuid.as_str()),
+            ])
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to create Feishu/Lark project room for `{}`: {}",
+                    request.project_path,
+                    error.without_url()
+                )
+            })?;
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            anyhow!(
+                "failed to read Feishu/Lark project room create response for `{}`: {}",
+                request.project_path,
+                error.without_url()
+            )
+        })?;
+        ensure!(
+            status.is_success(),
+            "Feishu/Lark project room create returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkCreateChatResponse = serde_json::from_str(&response_body)
+            .context("Feishu/Lark project room create response returned invalid JSON")?;
+        ensure!(
+            provider_response.code == 0,
+            "Feishu/Lark project room create returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        let data = provider_response
+            .data
+            .context("Feishu/Lark project room create response did not include data")?;
+        let chat_id = present_owned(data.chat_id)
+            .context("Feishu/Lark project room create response did not include chat_id")?;
+
+        Ok(FeishuLarkCreateProjectRoomSuccess {
+            provider_conversation_id: chat_id,
+        })
+    }
+
+    async fn fetch_tenant_access_token_for_project_room_prompt(
+        &self,
+        request: &ProjectRoomPromptRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<String, DeliveryError> {
+        let context = || {
+            DeliveryErrorContext::provider_control(
+                &request.proposal_id,
+                &self.id,
+                ProviderType::FeishuLark.as_str(),
+            )
+        };
+        let token_request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&token_request)
+            .send()
+            .await
+            .map_err(|error| {
+                let kind = if error.is_timeout() {
+                    DeliveryErrorKind::Timeout
+                } else {
+                    DeliveryErrorKind::Network
+                };
+                DeliveryError::new(
+                    kind,
+                    context(),
+                    format!(
+                        "feishu_lark provider `{}` failed to fetch tenant access token for project room prompt",
+                        self.id
+                    ),
+                )
+                .with_retriable(true)
+                .with_source(error.without_url())
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let response_body = response.text().await.map_err(|error| {
+            DeliveryError::new(
+                DeliveryErrorKind::Network,
+                context(),
+                format!(
+                    "feishu_lark provider `{}` failed to read tenant access token response for project room prompt",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(true)
+            .with_source(error.without_url())
+        })?;
+        if !status.is_success() {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                context(),
+                format!(
+                    "tenant access token request for Feishu/Lark project room prompt returned HTTP status {}",
+                    status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                context(),
+                "tenant access token response for Feishu/Lark project room prompt was invalid JSON",
+            )
+            .with_http_status(status_code)
+            .with_source(error)
+            })?;
+        if provider_response.code != 0 {
+            let provider_code = provider_response.code.to_string();
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderRejected,
+                context(),
+                format!(
+                    "tenant access token request for Feishu/Lark project room prompt returned code {}: {}",
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+            .with_http_status(status_code)
+            .with_provider_code(provider_code));
+        }
+        let token = present_owned(provider_response.tenant_access_token).ok_or_else(|| {
+            DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                context(),
+                "tenant access token response for Feishu/Lark project room prompt did not include a token",
+            )
+            .with_http_status(status_code)
+        })?;
+        if provider_response.expire.unwrap_or_default() <= 0 {
+            return Err(DeliveryError::new(
+                DeliveryErrorKind::ProviderResponse,
+                context(),
+                "tenant access token response for Feishu/Lark project room prompt had an invalid expiry",
+            )
+            .with_http_status(status_code));
+        }
+
+        Ok(token)
+    }
+
     async fn fetch_tenant_access_token_for_thread_reply(
         &self,
         request: &ProviderThreadReplyRequest,
@@ -1038,6 +1445,67 @@ impl FeishuLarkProvider {
         );
         Ok(token)
     }
+
+    async fn fetch_tenant_access_token_for_project_room_create(
+        &self,
+        request: &FeishuLarkCreateProjectRoomRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> anyhow::Result<String> {
+        let token_request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&token_request)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to fetch tenant access token for Feishu/Lark project room `{}`: {}",
+                    request.project_path,
+                    error.without_url()
+                )
+            })?;
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            anyhow!(
+                "failed to read tenant access token response for Feishu/Lark project room `{}`: {}",
+                request.project_path,
+                error.without_url()
+            )
+        })?;
+        ensure!(
+            status.is_success(),
+            "tenant access token request for Feishu/Lark project room create returned HTTP status {}",
+            status
+        );
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse =
+            serde_json::from_str(&response_body).context(
+                "tenant access token response for Feishu/Lark project room create was invalid JSON",
+            )?;
+        ensure!(
+            provider_response.code == 0,
+            "tenant access token request for Feishu/Lark project room create returned code {}: {}",
+            provider_response.code,
+            provider_response
+                .msg
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+        let token = present_owned(provider_response.tenant_access_token).context(
+            "tenant access token response for Feishu/Lark project room create did not include a token",
+        )?;
+        ensure!(
+            provider_response.expire.unwrap_or_default() > 0,
+            "tenant access token response for Feishu/Lark project room create had an invalid expiry"
+        );
+        Ok(token)
+    }
 }
 
 fn runtime_custom_bot(
@@ -1086,6 +1554,7 @@ fn runtime_app_bot(
         api_base_url: app_bot_api_base_url(detail.domain).to_string(),
         app_id: detail.app_id.clone(),
         app_secret,
+        operator_open_id: detail.operator_open_id.clone(),
         tenant_key: detail.tenant_key.clone(),
         chat_id: detail.chat_id.clone(),
         computer_name,
@@ -1148,6 +1617,80 @@ impl FeishuLarkCard {
     }
 }
 
+fn project_room_prompt_card(request: &ProjectRoomPromptRequest) -> FeishuLarkCard {
+    FeishuLarkCard {
+        config: FeishuLarkCardConfig {
+            wide_screen_mode: true,
+        },
+        header: FeishuLarkCardHeader {
+            template: "blue",
+            title: FeishuLarkPlainText {
+                tag: "plain_text",
+                content: "Connect this Codex project?".to_string(),
+            },
+        },
+        elements: vec![
+            FeishuLarkCardElement::Markdown {
+                content: lark_card_markdown(format!(
+                    "**{}**\nCodex just finished work in this project, but no Feishu/Lark room is connected yet.",
+                    request.project_name
+                )),
+            },
+            FeishuLarkCardElement::Markdown {
+                content: lark_card_markdown(format!("Project folder:\n`{}`", request.project_path)),
+            },
+            FeishuLarkCardElement::Markdown {
+                content: lark_card_markdown(
+                    "Choose what should happen to future updates from this project.".to_string(),
+                ),
+            },
+            FeishuLarkCardElement::Action {
+                actions: vec![
+                    project_room_prompt_button(
+                        "Create a room",
+                        "create_project_room",
+                        &request.proposal_id,
+                        "primary",
+                    ),
+                    project_room_prompt_button(
+                        "Use existing room",
+                        "use_existing_room",
+                        &request.proposal_id,
+                        "default",
+                    ),
+                    project_room_prompt_button(
+                        "Ignore",
+                        "ignore_project",
+                        &request.proposal_id,
+                        "default",
+                    ),
+                ],
+            },
+        ],
+    }
+}
+
+fn project_room_prompt_button(
+    label: &str,
+    action: &str,
+    proposal_id: &str,
+    button_type: &'static str,
+) -> FeishuLarkCardAction {
+    FeishuLarkCardAction {
+        tag: "button",
+        text: FeishuLarkPlainText {
+            tag: "plain_text",
+            content: label.to_string(),
+        },
+        url: None,
+        value: Some(json!({
+            "action": action,
+            "proposal_id": proposal_id,
+        })),
+        button_type,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FeishuLarkCardConfig {
     wide_screen_mode: bool,
@@ -1203,7 +1746,10 @@ struct FeishuLarkCardColumn {
 struct FeishuLarkCardAction {
     tag: &'static str,
     text: FeishuLarkPlainText,
-    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
     #[serde(rename = "type")]
     button_type: &'static str,
 }
@@ -1248,11 +1794,36 @@ struct FeishuLarkTextMessageContent<'a> {
     text: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct FeishuLarkCreateChatRequest {
+    name: String,
+    description: String,
+    owner_id: String,
+    user_id_list: Vec<String>,
+    group_message_type: &'static str,
+    chat_mode: &'static str,
+    chat_type: &'static str,
+    join_message_visibility: &'static str,
+    leave_message_visibility: &'static str,
+}
+
 #[derive(Debug, Deserialize)]
 struct FeishuLarkAppBotSendMessageResponse {
     code: i64,
     msg: Option<String>,
     data: Option<FeishuLarkAppBotMessageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCreateChatResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuLarkCreateChatData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCreateChatData {
+    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1510,6 +2081,74 @@ fn validate_app_bot_conversation_text_request(
     Ok(())
 }
 
+fn validate_app_bot_create_project_room_request(
+    request: &FeishuLarkCreateProjectRoomRequest,
+    provider_id: &str,
+    runtime: &FeishuLarkAppBotRuntime,
+) -> anyhow::Result<()> {
+    ensure!(
+        request.provider_id == provider_id,
+        "Feishu/Lark project room create provider_id did not match adapter"
+    );
+    ensure!(
+        request.provider_type == ProviderType::FeishuLark.as_str(),
+        "Feishu/Lark project room create provider_type did not match adapter"
+    );
+    if let Some(configured_tenant_key) = runtime.tenant_key.as_deref() {
+        ensure!(
+            request.provider_account_id == configured_tenant_key,
+            "Feishu/Lark project room create tenant did not match app config"
+        );
+    }
+    ensure!(
+        present(Some(request.provider_account_id.as_str())).is_some(),
+        "Feishu/Lark project room create did not include provider_account_id"
+    );
+    ensure!(
+        present(Some(request.operator_open_id.as_str())).is_some(),
+        "Feishu/Lark project room create did not include operator_open_id"
+    );
+    ensure!(
+        present(Some(request.project_name.as_str())).is_some(),
+        "Feishu/Lark project room create did not include project_name"
+    );
+    ensure!(
+        present(Some(request.project_path.as_str())).is_some(),
+        "Feishu/Lark project room create did not include project_path"
+    );
+    ensure!(
+        present(Some(request.proposal_id.as_str())).is_some(),
+        "Feishu/Lark project room create did not include proposal_id"
+    );
+    Ok(())
+}
+
+fn project_room_name(project_name: &str) -> String {
+    let project_name = project_name.trim();
+    if project_name.is_empty() {
+        "Codex project".to_string()
+    } else {
+        format!("Codex · {project_name}")
+    }
+}
+
+fn project_room_description(project_path: &str) -> String {
+    format!("Codex updates from {project_path}")
+}
+
+fn project_room_create_uuid(proposal_id: &str, proposal_created_at: DateTime<Utc>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(proposal_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(proposal_created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+    let digest = hasher.finalize();
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("prc_{}", &hash[..24])
+}
+
 fn required_thread_reply_response_field(
     request: &ProviderThreadReplyRequest,
     field: &'static str,
@@ -1622,7 +2261,8 @@ fn format_signal_card_elements(card_body: FeishuLarkCardBody) -> Vec<FeishuLarkC
                     tag: "plain_text",
                     content: open_link.label,
                 },
-                url: open_link.url,
+                url: Some(open_link.url),
+                value: None,
                 button_type: "primary",
             }],
         });

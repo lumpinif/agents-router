@@ -9,13 +9,14 @@ agents-router setup
 -> Feishu/Lark
 -> Personal Agent App
 -> scan the QR code
--> direct chat: /bind /absolute/project/path, then send any message
+-> direct chat: /new /absolute/project/path what you want Codex to do
+-> direct chat: /bind /absolute/project/path to choose a project room
 -> project room: add the Personal Agent, mention it, then send /bind /absolute/project/path
 ```
 
-Direct chat is for starting new Codex threads from Lark. Set a default project with `/bind /absolute/project/path`, then send any plain message to start a new Codex thread in that project.
+Direct chat is for starting new Codex threads and managing project rooms from Lark. Use `/new /absolute/project/path what you want Codex to do` to start a new Codex session in a specific folder. Use `/bind /absolute/project/path` to choose where that project's future updates should go.
 
-Project rooms are for project updates and team control. After `/bind`, new Codex Desktop updates from that project land in the bound room. One Codex thread maps to one Feishu/Lark thread. In shared rooms and threads, mention the Personal Agent to continue the same Codex thread through the Experimental reply path. In a one-on-one chat with the Personal Agent, no mention is needed.
+Project rooms are for project updates and team control. In a project room, `/bind` connects the current room to the project. After that, new Codex Desktop updates from that project land in the bound room. One Codex thread maps to one Feishu/Lark thread. In shared rooms and threads, mention the Personal Agent to continue the same Codex thread through the Experimental reply path. In a one-on-one chat with the Personal Agent, no mention is needed.
 
 There is no history backfill. Old Codex sessions and old Feishu/Lark messages are not copied into Lark. Agents Router only sends new updates after the room is connected.
 
@@ -29,6 +30,8 @@ This guide uses Long Connection / WebSocket. You do not need a public webhook UR
 - Feishu Developer Console: <https://open.feishu.cn/app>
 - Lark long connection guide: <https://open.larksuite.com/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/use-websocket>
 - Lark send message API: <https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/create>
+- Lark create chat API: <https://open.larksuite.com/document/server-docs/group/chat/create>
+- Lark card action callback: <https://open.larksuite.com/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-callback-communication>
 
 ## Default Setup
 
@@ -55,10 +58,18 @@ For direct chat:
 2. Send:
 
 ```text
+/new /Users/you/path/to/project what you want Codex to do
+```
+
+Agents Router starts a new Codex thread in that folder. Direct chat does not keep a hidden default project.
+
+To choose where a project's future updates should go, send:
+
+```text
 /bind /Users/you/path/to/project
 ```
 
-3. After that, send any plain message to start a new Codex thread in that project.
+Agents Router shows the project room menu. From there you can create a room, use an existing room, or ignore that project. If you ignored a project earlier, sending `/bind` again reopens the same menu.
 
 For a project room:
 
@@ -74,6 +85,8 @@ Use a real absolute folder path on this computer. The first version does not sca
 
 After `/bind`, new updates from that project are sent to that room. If a new Codex Desktop thread creates an update, Agents Router creates or reuses the matching Feishu/Lark thread for that Codex thread. Mention the Personal Agent in that Feishu/Lark thread to continue the same Codex thread.
 
+If Codex produces a new update from a project that is not connected to any room yet, Agents Router sends the same project room menu to the setup owner in direct chat. The menu lets you create a new project room, use an existing room, or ignore that project. Agents Router does not silently create rooms, and it does not backfill the update that triggered the menu; the room receives future updates after you connect it.
+
 ## Commands
 
 In shared rooms and threads, mention the Personal Agent before each command. In a one-on-one chat with the Personal Agent, no mention is needed.
@@ -83,10 +96,8 @@ Direct chat:
 ```text
 /help
 /status
-/bind /absolute/project/path
-/new what you want Codex to do
 /new /absolute/project/path what you want Codex to do
-/unbind
+/bind /absolute/project/path
 ```
 
 Room:
@@ -100,7 +111,7 @@ Room:
 /unbind
 ```
 
-Use `/help` to list the commands. Use `/status` in direct chat to see the default project. Use `/status` in a project room to see which local projects are connected to that room. Use `/unbind` in direct chat to clear the default project. Use `/unbind /absolute/project/path` in a room to disconnect one project from the room, or `/unbind` to disconnect all projects from that room.
+Use `/help` to list the commands. Use `/status` in direct chat to see the direct-chat guide and connected project rooms. Use `/bind /absolute/project/path` in direct chat to open the project room menu. Use `/status` in a project room to see which local projects are connected to that room. Use `/unbind /absolute/project/path` in a room to disconnect one project from the room, or `/unbind` to disconnect all projects from that room.
 
 ## What Setup Writes
 
@@ -117,7 +128,7 @@ app_secret = "..."
 app_registration_source = "agents-router"
 ```
 
-That is intentional. Direct chat default projects and project rooms are selected by `/bind`, not by a single global `chat_id`.
+That is intentional. Direct chat chooses the working folder on each `/new` command. Direct chat `/bind` opens the project room menu. Room `/bind` connects that room to a project. Project rooms are not configured through a single global `chat_id`.
 `mode = "app_bot"` is the internal Feishu/Lark API mode. It does not mean you chose the advanced fixed-room setup.
 The `app_registration_source` line records which local Agents Router runtime created the Personal Agent. It is local metadata, not proof that Feishu/Lark events are arriving. The real check is sending a command in direct chat or in a project room.
 
@@ -152,12 +163,15 @@ Enable these permissions:
 im:message:send_as_bot
 im:message.group_msg:readonly
 im:chat:readonly
+im:chat:create
 ```
 
 Subscribe to:
 
 ```text
 im.message.receive_v1
+im.chat.member.bot.added_v1
+card.action.trigger
 ```
 
 Choose:
@@ -202,6 +216,9 @@ For Existing Self-built App, also check:
 - The app has `im:message:send_as_bot`.
 - The app has `im:message.group_msg:readonly`.
 - The app has `im:chat:readonly`.
+- The app has `im:chat:create` if you want the project-room card to create rooms.
 - Event subscription uses Long Connection / WebSocket.
 - `im.message.receive_v1` is subscribed.
+- `im.chat.member.bot.added_v1` is subscribed.
+- `card.action.trigger` is subscribed if you want project-room card buttons to work.
 - `tenant_key` and `chat_id` are from the same workspace and room.

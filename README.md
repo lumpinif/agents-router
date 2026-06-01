@@ -140,7 +140,7 @@ Then setup asks for three choices:
 2. Where should notifications go?
 3. Which completed tasks should send notifications?
 
-Then it writes config and starts the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent does not choose a single room during setup: scan the QR code, then either use direct chat with `/bind /absolute/project/path` to start new Codex threads, or add the Personal Agent to a room and mention it with `/bind /absolute/project/path` to create a project room.
+Then it writes config and starts the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent does not choose a single room during setup: scan the QR code, then use direct chat with `/new /absolute/project/path what you want Codex to do` to start a new Codex thread, or use `/bind /absolute/project/path` to choose where that project should send updates. You can also add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path` to connect that room directly. If Codex later updates an unconnected project, Agents Router can ask you in direct chat whether to create a room, use an existing room, or ignore that project.
 
 For optional settings such as answer detail, prompt inclusion, and advanced project filters, see [Setup](docs/setup.md).
 

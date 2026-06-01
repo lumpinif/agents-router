@@ -7,7 +7,8 @@ use super::*;
 use tempfile::tempdir;
 
 use crate::bridge_binding_ledger::{
-    BridgeBindingLedgerStore, RoomProjectBindingInput, ThreadSessionBindingInput,
+    BridgeBindingLedgerStore, OwnerDirectChatInput, RoomProjectBindingInput,
+    ThreadSessionBindingInput,
 };
 use crate::config::{
     CliConfig, LogConfig, NotificationConfig, ProviderType, RawConfig, RawProviderConfig,
@@ -27,6 +28,7 @@ struct TestProvider {
     calls: Arc<Mutex<Vec<String>>>,
     dynamic_calls: Option<Arc<Mutex<Vec<String>>>>,
     thread_calls: Option<Arc<Mutex<Vec<String>>>>,
+    project_room_prompt_calls: Option<Arc<Mutex<Vec<ProjectRoomPromptRequest>>>>,
     result: Result<(), DeliveryErrorKind>,
     delivery_receipt: Option<ProviderDeliveryReceipt>,
 }
@@ -39,6 +41,7 @@ impl TestProvider {
             calls,
             dynamic_calls: None,
             thread_calls: None,
+            project_room_prompt_calls: None,
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -55,6 +58,7 @@ impl TestProvider {
             calls,
             dynamic_calls: Some(dynamic_calls),
             thread_calls: None,
+            project_room_prompt_calls: None,
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -73,6 +77,25 @@ impl TestProvider {
             calls,
             dynamic_calls: Some(dynamic_calls),
             thread_calls: Some(thread_calls),
+            project_room_prompt_calls: None,
+            result: Ok(()),
+            delivery_receipt: None,
+        }
+    }
+
+    fn succeeding_with_project_room_prompts(
+        id: &str,
+        provider_type: &str,
+        calls: Arc<Mutex<Vec<String>>>,
+        prompt_calls: Arc<Mutex<Vec<ProjectRoomPromptRequest>>>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            provider_type: provider_type.to_string(),
+            calls,
+            dynamic_calls: None,
+            thread_calls: None,
+            project_room_prompt_calls: Some(prompt_calls),
             result: Ok(()),
             delivery_receipt: None,
         }
@@ -90,6 +113,7 @@ impl TestProvider {
             calls,
             dynamic_calls: None,
             thread_calls: None,
+            project_room_prompt_calls: None,
             result: Ok(()),
             delivery_receipt: Some(delivery_receipt),
         }
@@ -102,6 +126,7 @@ impl TestProvider {
             calls,
             dynamic_calls: None,
             thread_calls: None,
+            project_room_prompt_calls: None,
             result: Err(kind),
             delivery_receipt: None,
         }
@@ -154,6 +179,25 @@ impl Provider for TestProvider {
                 &self.provider_type,
                 signal,
             ))
+        }))
+    }
+
+    fn can_prompt_for_project_room(&self) -> bool {
+        self.project_room_prompt_calls.is_some()
+    }
+
+    fn send_project_room_prompt<'a>(
+        &'a self,
+        request: ProjectRoomPromptRequest,
+    ) -> Option<ProjectRoomPromptFuture<'a>> {
+        let prompt_calls = self.project_room_prompt_calls.as_ref()?;
+        Some(Box::pin(async move {
+            prompt_calls.lock().unwrap().push(request.clone());
+            Ok(ProjectRoomPromptResult {
+                provider_account_id: Some("tenant-1".to_string()),
+                provider_conversation_id: Some("oc_owner_direct".to_string()),
+                provider_message_id: Some(format!("om_{}", request.proposal_id)),
+            })
         }))
     }
 
@@ -552,6 +596,109 @@ async fn personal_agent_without_default_room_waits_for_project_binding() {
 }
 
 #[tokio::test]
+async fn personal_agent_without_bound_room_prompts_owner_once_for_project_room() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_project_room_prompts(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        Arc::clone(&prompt_calls),
+    );
+    let signal = codex_desktop_signal_with_session_and_project_path();
+
+    let first_report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("missing project room should prompt owner instead of failing");
+    let second_report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("pending prompt should not prompt owner again");
+
+    assert_eq!(first_report.attempted, 0);
+    assert_eq!(first_report.succeeded, 0);
+    assert_eq!(second_report.attempted, 0);
+    assert_eq!(second_report.succeeded, 0);
+    assert!(calls.lock().unwrap().is_empty());
+    let prompt_calls = prompt_calls.lock().unwrap();
+    assert_eq!(prompt_calls.len(), 1);
+    assert_eq!(
+        prompt_calls[0].project_path,
+        "/Users/tester/projects/agents-router"
+    );
+    assert_eq!(prompt_calls[0].project_name, "agents-router");
+}
+
+#[tokio::test]
+async fn personal_agent_unbound_project_prompt_uses_known_owner_direct_chat() {
+    let temp = tempdir().expect("temp dir should exist");
+    let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
+        .expect("bridge binding store should build");
+    bridge_binding_ledger
+        .update(|ledger| {
+            ledger.remember_owner_direct_chat_at(
+                OwnerDirectChatInput {
+                    provider_id: "work_chat".to_string(),
+                    provider_type: ProviderType::FeishuLark.as_str().to_string(),
+                    provider_account_id: "tenant-1".to_string(),
+                    provider_conversation_id: "oc_known_direct_chat".to_string(),
+                },
+                Utc::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("owner direct chat should persist");
+    let config = lark_personal_agent_response_surface_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = TestProvider::succeeding_with_project_room_prompts(
+        "work_chat",
+        ProviderType::FeishuLark.as_str(),
+        Arc::clone(&calls),
+        Arc::clone(&prompt_calls),
+    );
+    let signal = codex_desktop_signal_with_session_and_project_path();
+
+    let report = Router::new(&config)
+        .route_with_safety_and_response_surfaces(
+            &signal,
+            &[&provider],
+            None,
+            None,
+            Some(&bridge_binding_ledger),
+        )
+        .await
+        .expect("missing project room should prompt owner instead of failing");
+
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.succeeded, 0);
+    let prompt_calls = prompt_calls.lock().unwrap();
+    assert_eq!(prompt_calls.len(), 1);
+    assert_eq!(
+        prompt_calls[0].prompt_conversation_id.as_deref(),
+        Some("oc_known_direct_chat")
+    );
+}
+
+#[tokio::test]
 async fn personal_agent_bound_project_routes_to_project_room() {
     let temp = tempdir().expect("temp dir should exist");
     let bridge_binding_ledger = BridgeBindingLedgerStore::new(temp.path().join("bindings.json"))
@@ -581,6 +728,7 @@ async fn personal_agent_bound_project_routes_to_project_room() {
         calls: Arc::clone(&calls),
         dynamic_calls: Some(Arc::clone(&dynamic_calls)),
         thread_calls: None,
+        project_room_prompt_calls: None,
         result: Ok(()),
         delivery_receipt: None,
     };

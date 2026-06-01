@@ -71,6 +71,16 @@ impl DeliveryErrorContext {
             phase: DeliveryPhase::ProviderSend,
         }
     }
+
+    pub fn provider_control(operation_id: &str, provider_id: &str, provider_type: &str) -> Self {
+        Self {
+            signal_id: operation_id.to_string(),
+            source_id: "bridge_project_room_discovery".to_string(),
+            provider_id: Some(provider_id.to_string()),
+            provider_type: Some(provider_type.to_string()),
+            phase: DeliveryPhase::ProviderSend,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

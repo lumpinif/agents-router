@@ -59,6 +59,7 @@ pub fn build_feishu_lark_personal_agent_config(
     domain: &str,
     app_id: &str,
     app_secret: &str,
+    operator_open_id: Option<&str>,
 ) -> RawConfig {
     let mut config = build_feishu_lark_app_bot_config_with_optional_room(
         agent,
@@ -77,6 +78,7 @@ pub fn build_feishu_lark_personal_agent_config(
     {
         provider.app_registration_source =
             Some(lark_personal_agent_channel::REGISTRATION_SOURCE.to_string());
+        provider.operator_open_id = operator_open_id.map(ToOwned::to_owned);
     }
     config
 }

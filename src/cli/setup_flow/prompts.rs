@@ -483,14 +483,14 @@ pub(in crate::cli) fn feishu_lark_mode_option_description(
             {
                 localized(
                     i18n,
-                    "Scan a QR code. Direct chat can start new Codex threads after `/bind`; rooms use @ plus `/bind` for project updates.",
-                    "扫码创建 agent。私聊 `/bind` 后可以开新 Codex thread；群里用 @ 加 `/bind` 接收项目更新。",
+                    "Scan a QR code. Direct chat uses `/new` for Codex tasks and `/bind` for project room choices.",
+                    "扫码创建 agent。私聊用 `/new` 开 Codex 任务，用 `/bind` 选择项目群。",
                 )
             } else {
                 localized(
                     i18n,
-                    "Scan a QR code. Direct chat can use `/bind`; rooms use @ plus `/bind` for project updates.",
-                    "扫码创建 agent。私聊可以 `/bind`；群里用 @ 加 `/bind` 接收项目更新。",
+                    "Scan a QR code. Rooms use @ plus `/bind` for project updates.",
+                    "扫码创建 agent。群里用 @ 加 `/bind` 接收项目更新。",
                 )
             }
         }

@@ -141,7 +141,7 @@ agents-router setup
 3. 哪些完成的任务需要发送通知？
 4. 如果选择 Feishu/Lark，要使用哪种模式？
 
-然后它会写入配置并启动 service。带固定目标群的 provider 会发送一条测试通知。Feishu/Lark Personal Agent 使用项目群：setup 会显示 QR code，扫码创建 Personal Agent 后，把它拉进群，@ 它并发送 `/bind /absolute/project/path`。
+然后它会写入配置并启动 service。带固定目标群的 provider 会发送一条测试通知。Feishu/Lark Personal Agent 使用两个清晰入口：私聊里用 `/new /absolute/project/path what you want Codex to do` 启动新 Codex thread，用 `/bind /absolute/project/path` 选择这个项目要不要建群、使用已有群或忽略；项目群里把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path` 直接连接当前群。如果之后 Codex 从一个还没连接过的项目产生新更新，Agents Router 会在私聊里给出同一套选择。
 
 Answer detail、是否包含 prompt、高级项目过滤等设置见 [Setup](setup.zh-CN.md)。
 

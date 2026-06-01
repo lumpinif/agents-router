@@ -109,7 +109,7 @@ When you choose Feishu/Lark, setup asks for the mode:
 
 ```text
 Personal Agent App — Experimental
-  Scan a QR code. Direct chat can start new Codex threads after `/bind`; rooms use @ plus `/bind` for project updates.
+  Scan a QR code. Direct chat uses `/new` for Codex tasks and `/bind` for project room choices.
 
 Existing Self-built App — Advanced
   Use an existing self-built app with one fixed room. Advanced setup; Personal Agent is recommended. Codex Desktop thread replies are experimental.
@@ -118,9 +118,9 @@ Incoming Webhook — One-way fallback
   Send one-way notifications to one group. No replies or project rooms.
 ```
 
-Personal Agent App is the recommended default for the two-way Codex Desktop setup. Setup shows a QR code, asks you to scan it and finish creating the Personal Agent app on the page that opens, and stores the app credentials locally. After that, direct chat can use `/bind /absolute/project/path` and then plain messages to start new Codex threads. Project rooms work by adding the Personal Agent to a room, mentioning it, and sending `/bind /absolute/project/path`. Keep the setup terminal open after scanning; setup continues automatically after the app is created.
+Personal Agent App is the recommended default for the two-way Codex Desktop setup. Setup shows a QR code, asks you to scan it and finish creating the Personal Agent app on the page that opens, and stores the app credentials locally. After that, direct chat can start a new Codex thread with `/new /absolute/project/path what you want Codex to do`. Direct chat can also open the project room menu with `/bind /absolute/project/path`, so you can create a room, use an existing room, or ignore that project. Project rooms also work by adding the Personal Agent to a room, mentioning it, and sending `/bind /absolute/project/path`. If a new Codex update comes from an unconnected project, Agents Router can send the setup owner the same project room menu. Keep the setup terminal open after scanning; setup continues automatically after the app is created.
 
-Use Existing Self-built App only when you already manage a self-built app and want one fixed room. It requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, Tenant Key, Room Chat ID, and a published app version. Setup links to the full [Feishu/Lark Personal Agent guide](providers/feishu-lark-app-bot.md).
+Use Existing Self-built App only when you already manage a self-built app and want one fixed room. It requires Bot capability, message permissions including `im:chat:create`, `im.message.receive_v1`, `im.chat.member.bot.added_v1`, `card.action.trigger`, Long Connection / WebSocket, Tenant Key, Room Chat ID, and a published app version. Setup links to the full [Feishu/Lark Personal Agent guide](providers/feishu-lark-app-bot.md).
 
 Use Incoming Webhook only when you want a simple one-way fallback.
 
@@ -207,8 +207,9 @@ If a route has both `minimum_task_duration_minutes` and `only_forward_from_proje
 filters must match before the notification is sent.
 
 Feishu/Lark Personal Agent project rooms do not use `only_forward_from_project_paths` during setup.
-For that mode, `/bind /absolute/project/path` is the project selector. This keeps project-room
-routing in one place: the local room binding ledger.
+For that mode, room `/bind /absolute/project/path` connects a project to that room. Direct chat
+starts new Codex threads with `/new /absolute/project/path what you want Codex to do`, and direct
+chat `/bind /absolute/project/path` opens the project room menu for that project.
 
 ## Answer Detail
 
@@ -330,7 +331,7 @@ Default behavior:
 
 - If `only_forward_from_project_paths` is not set or is an empty array, notifications are not filtered by project path.
 - Setup does not ask for this option. Add it manually when you want a route to forward only selected projects.
-- Feishu/Lark Personal Agent setup clears this filter for the selected agent route. Use `/bind` in Lark or Feishu rooms to choose project destinations.
+- Feishu/Lark Personal Agent setup clears this filter for the selected agent route. Use direct chat `/bind /absolute/project/path` to choose a project room, or room `/bind /absolute/project/path` to connect the current room.
 - The value is an array, so one route can allow multiple project paths.
 - Paths must be absolute, non-empty, and must not contain `.` or `..` path components.
 - Matching uses path components, not string prefixes. For example, `/Users/me/app` matches `/Users/me/app/api`, but does not match `/Users/me/app-copy`.

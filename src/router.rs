@@ -9,7 +9,8 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::bridge_binding_ledger::{
-    BridgeBindingLedgerStore, RoomProjectBindingRecord, SourceSessionThreadBindingQuery,
+    BridgeBindingLedgerStore, ProjectRoomProposalInput, ProjectRoomProposalPromptDecision,
+    ProjectRoomProposalSkipReason, RoomProjectBindingRecord, SourceSessionThreadBindingQuery,
     ThreadSessionBindingInput,
 };
 use crate::config::{
@@ -35,10 +36,39 @@ use crate::signal::Signal;
 pub type ProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProviderSendResult, DeliveryError>> + Send + 'a>>;
 
+pub type ProjectRoomPromptFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProjectRoomPromptResult, DeliveryError>> + Send + 'a>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRoomPromptRequest {
+    pub proposal_id: String,
+    pub project_path: String,
+    pub project_name: String,
+    pub prompt_conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRoomPromptResult {
+    pub provider_account_id: Option<String>,
+    pub provider_conversation_id: Option<String>,
+    pub provider_message_id: Option<String>,
+}
+
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn provider_type(&self) -> &str;
     fn send<'a>(&'a self, signal: &'a Signal) -> ProviderFuture<'a>;
+
+    fn can_prompt_for_project_room(&self) -> bool {
+        false
+    }
+
+    fn send_project_room_prompt<'a>(
+        &'a self,
+        _request: ProjectRoomPromptRequest,
+    ) -> Option<ProjectRoomPromptFuture<'a>> {
+        None
+    }
 
     fn send_to_provider_conversation<'a>(
         &'a self,
@@ -410,6 +440,13 @@ impl<'a> Router<'a> {
             if let Some(config_provider) = self.config.provider(provider.id())
                 && !provider_has_static_delivery_target(config_provider)
             {
+                self.prompt_project_room_for_unbound_project(
+                    signal,
+                    provider,
+                    project_path,
+                    bridge_binding_ledger,
+                )
+                .await?;
                 info!(
                     signal.id = %signal.id,
                     source.id = %signal.source_id(),
@@ -424,6 +461,175 @@ impl<'a> Router<'a> {
         } else {
             Ok(targets)
         }
+    }
+
+    async fn prompt_project_room_for_unbound_project(
+        &self,
+        signal: &Signal,
+        provider: &dyn Provider,
+        project_path: &str,
+        bridge_binding_ledger: &BridgeBindingLedgerStore,
+    ) -> Result<(), ProviderFailure> {
+        if !provider.can_prompt_for_project_room() {
+            debug!(
+                signal.id = %signal.id,
+                source.id = %signal.source_id(),
+                provider.id = %provider.id(),
+                provider.type = %provider.provider_type(),
+                project.path = %project_path,
+                event = "bridge_binding.project_room_proposal.skipped",
+                reason = "provider_cannot_prompt",
+            );
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        let (decision, owner_direct_chat) = bridge_binding_ledger
+            .update(|ledger| {
+                let decision = ledger.begin_project_room_proposal_prompt_at(
+                    ProjectRoomProposalInput {
+                        provider_id: provider.id().to_string(),
+                        provider_type: provider.provider_type().to_string(),
+                        project_path: project_path.to_string(),
+                    },
+                    now,
+                )?;
+                let owner_direct_chat = ledger
+                    .owner_direct_chat_for_provider(provider.id(), provider.provider_type())?;
+                Ok((decision, owner_direct_chat))
+            })
+            .await
+            .map_err(|error| ProviderFailure {
+                signal_id: signal.id.clone(),
+                source_id: signal.source_id().to_string(),
+                provider_id: provider.id().to_string(),
+                provider_type: provider.provider_type().to_string(),
+                kind: DeliveryErrorKind::Internal,
+                message: format!("bridge binding project room proposal lookup failed: {error}"),
+                http_status: None,
+                provider_code: None,
+                retriable: false,
+            })?;
+
+        let record = match decision {
+            ProjectRoomProposalPromptDecision::Prompt(record) => record,
+            ProjectRoomProposalPromptDecision::Skip(reason) => {
+                debug!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    project.path = %project_path,
+                    proposal.skip_reason = %project_room_proposal_skip_reason(reason),
+                    event = "bridge_binding.project_room_proposal.skipped",
+                );
+                return Ok(());
+            }
+        };
+
+        info!(
+            signal.id = %signal.id,
+            source.id = %signal.source_id(),
+            provider.id = %provider.id(),
+            provider.type = %provider.provider_type(),
+            project.path = %record.project_path,
+            project.name = %record.project_name,
+            proposal.id = %record.proposal_id,
+            event = "bridge_binding.project_room_proposal.prompt.started",
+        );
+
+        let Some(prompt) = provider.send_project_room_prompt(ProjectRoomPromptRequest {
+            proposal_id: record.proposal_id.clone(),
+            project_path: record.project_path.clone(),
+            project_name: record.project_name.clone(),
+            prompt_conversation_id: owner_direct_chat.map(|chat| chat.provider_conversation_id),
+        }) else {
+            let _ = bridge_binding_ledger
+                .update(|ledger| {
+                    ledger.mark_project_room_proposal_prompt_failed_at(
+                        &record.proposal_id,
+                        Utc::now(),
+                    )
+                })
+                .await;
+            warn!(
+                signal.id = %signal.id,
+                source.id = %signal.source_id(),
+                provider.id = %provider.id(),
+                provider.type = %provider.provider_type(),
+                project.path = %record.project_path,
+                proposal.id = %record.proposal_id,
+                event = "bridge_binding.project_room_proposal.prompt.failed",
+                error = "provider returned no prompt future",
+            );
+            return Ok(());
+        };
+
+        match prompt.await {
+            Ok(result) => {
+                bridge_binding_ledger
+                    .update(|ledger| {
+                        ledger.record_project_room_proposal_prompt_sent_at(
+                            &record.proposal_id,
+                            result.provider_account_id.clone(),
+                            result.provider_conversation_id.clone(),
+                            result.provider_message_id.clone(),
+                            Utc::now(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| ProviderFailure {
+                        signal_id: signal.id.clone(),
+                        source_id: signal.source_id().to_string(),
+                        provider_id: provider.id().to_string(),
+                        provider_type: provider.provider_type().to_string(),
+                        kind: DeliveryErrorKind::Internal,
+                        message: format!(
+                            "bridge binding project room proposal update failed: {error}"
+                        ),
+                        http_status: None,
+                        provider_code: None,
+                        retriable: false,
+                    })?;
+                info!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    project.path = %record.project_path,
+                    proposal.id = %record.proposal_id,
+                    provider.conversation.id = result.provider_conversation_id.as_deref(),
+                    provider.message.id = result.provider_message_id.as_deref(),
+                    event = "bridge_binding.project_room_proposal.prompt.succeeded",
+                );
+            }
+            Err(error) => {
+                let _ = bridge_binding_ledger
+                    .update(|ledger| {
+                        ledger.mark_project_room_proposal_prompt_failed_at(
+                            &record.proposal_id,
+                            Utc::now(),
+                        )
+                    })
+                    .await;
+                warn!(
+                    signal.id = %signal.id,
+                    source.id = %signal.source_id(),
+                    provider.id = %provider.id(),
+                    provider.type = %provider.provider_type(),
+                    project.path = %record.project_path,
+                    proposal.id = %record.proposal_id,
+                    error.kind = %error.kind.as_str(),
+                    error.retriable = error.retriable,
+                    http.status = error.http_status,
+                    provider.code = error.provider_code.as_deref(),
+                    error = %error.message,
+                    event = "bridge_binding.project_room_proposal.prompt.failed",
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn delivery_target_for_bound_room(
@@ -841,6 +1047,15 @@ fn response_surface_delivery_receipt(
         provider_conversation_id: receipt.provider_conversation_id.clone(),
         provider_message_id: receipt.provider_message_id.clone(),
         provider_thread_id: receipt.provider_thread_id.clone(),
+    }
+}
+
+fn project_room_proposal_skip_reason(reason: ProjectRoomProposalSkipReason) -> &'static str {
+    match reason {
+        ProjectRoomProposalSkipReason::AlreadyPending => "already_pending",
+        ProjectRoomProposalSkipReason::Ignored => "ignored",
+        ProjectRoomProposalSkipReason::RoomCreated => "room_created",
+        ProjectRoomProposalSkipReason::BoundToExisting => "bound_to_existing",
     }
 }
 

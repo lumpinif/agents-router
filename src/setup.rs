@@ -65,6 +65,7 @@ pub struct FeishuLarkAppBotTarget {
     pub app_id: String,
     pub app_secret_configured: bool,
     pub app_registration_source: Option<String>,
+    pub operator_open_id: Option<String>,
     pub tenant_key: Option<String>,
     pub chat_id: Option<String>,
 }

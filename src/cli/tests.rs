@@ -709,6 +709,7 @@ fn setup_provider_summary_reports_personal_agent_without_fixed_room() {
         "lark",
         "cli_9f5343c580712544",
         "test-app-secret",
+        Some("ou_operator"),
     );
 
     let summary = single_setup_provider_summary(&config);
@@ -722,7 +723,7 @@ fn setup_provider_summary_reports_personal_agent_without_fixed_room() {
 }
 
 #[test]
-fn personal_agent_setup_uses_bind_as_the_project_filter() {
+fn personal_agent_setup_leaves_project_filtering_to_room_bindings() {
     let route_filters = SetupRouteFilters {
         minimum_task_duration_minutes: Some(5),
         only_forward_from_project_paths: vec![
@@ -793,7 +794,7 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
 }
 
 #[test]
-fn setup_defaults_reuse_personal_agent_without_source_marker() {
+fn setup_defaults_requires_personal_agent_owner_before_reuse() {
     let config = RawConfig::from_toml_str(
         r#"
 schema_version = 1
@@ -826,14 +827,7 @@ providers = ["feishu_lark"]
         defaults.feishu_lark_mode,
         Some(FeishuLarkSetupMode::PersonalAgentApp)
     );
-    assert_eq!(
-        existing_personal_agent_credentials(&defaults).map(|credentials| (
-            credentials.domain,
-            credentials.app_id,
-            credentials.app_secret
-        )),
-        Some(("lark", "cli_9f5343c580712544", "test-app-secret"))
-    );
+    assert!(existing_personal_agent_credentials(&defaults).is_none());
 }
 
 #[test]
@@ -845,6 +839,7 @@ fn setup_defaults_accept_current_personal_agent_room_event_registration() {
         "lark",
         "cli_9f5343c580712544",
         "test-app-secret",
+        Some("ou_operator"),
     );
 
     let defaults = SetupDefaults::from_config(&config);
@@ -858,7 +853,9 @@ fn setup_defaults_accept_current_personal_agent_room_event_registration() {
         provider.app_registration_source.as_deref(),
         Some(lark_personal_agent_channel::REGISTRATION_SOURCE)
     );
-    assert!(existing_personal_agent_credentials(&defaults).is_some());
+    let credentials = existing_personal_agent_credentials(&defaults)
+        .expect("current Personal Agent config should be reusable");
+    assert_eq!(credentials.operator_open_id, "ou_operator");
 }
 
 #[test]
@@ -962,7 +959,7 @@ fn feishu_lark_mode_options_are_localized() {
             setup::AgentIntegrationId::CodexDesktop,
             I18n::new(CliLanguage::English),
         )
-        .contains("Direct chat can start new Codex threads")
+        .contains("Direct chat uses `/new` for Codex tasks and `/bind` for project room choices")
     );
 }
 

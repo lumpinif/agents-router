@@ -21,6 +21,7 @@ const SLACK_MESSAGE_EVENT_TYPE: &str = "message";
 const FEISHU_LARK_EVENT_SCHEMA: &str = "2.0";
 const FEISHU_LARK_MESSAGE_RECEIVE_EVENT_TYPE: &str = "im.message.receive_v1";
 const FEISHU_LARK_BOT_ADDED_EVENT_TYPE: &str = "im.chat.member.bot.added_v1";
+const FEISHU_LARK_CARD_ACTION_EVENT_TYPE: &str = "card.action.trigger";
 const FEISHU_LARK_TEXT_MESSAGE_TYPE: &str = "text";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,11 +67,24 @@ pub struct NormalizedProviderRoomEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedProviderProjectRoomAction {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_mode: ProviderMode,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_event_id: String,
+    pub proposal_id: String,
+    pub operator_open_id: Option<String>,
+    pub action: ProviderProjectRoomAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderControlCommand {
     BindProject {
         project_path: String,
     },
-    DirectBindProject {
+    DirectProjectRoomPrompt {
         project_path: String,
     },
     DirectChatGuidance,
@@ -80,7 +94,7 @@ pub enum ProviderControlCommand {
         prompt: String,
     },
     DirectStatus,
-    DirectUnbindProject,
+    DirectUnbindProjectGuidance,
     Help,
     NewSession {
         project_path: Option<String>,
@@ -101,6 +115,13 @@ pub enum ProviderRoomEvent {
     BotAddedToChat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProjectRoomAction {
+    CreateProjectRoom,
+    UseExistingRoom,
+    IgnoreProject,
+}
+
 impl ProviderControlCommand {
     fn requires_project_room(&self) -> bool {
         matches!(
@@ -116,10 +137,10 @@ impl ProviderControlCommand {
         matches!(
             self,
             Self::BindProject { .. }
-                | Self::DirectBindProject { .. }
+                | Self::DirectProjectRoomPrompt { .. }
                 | Self::DirectNewSession { .. }
                 | Self::NewSession { .. }
-                | Self::DirectUnbindProject
+                | Self::DirectUnbindProjectGuidance
                 | Self::UnbindProject { .. }
         )
     }
@@ -129,6 +150,7 @@ impl ProviderControlCommand {
 pub enum ProviderControlNormalizeResult {
     ControlCommand(Box<NormalizedProviderControlCommand>),
     RoomEvent(Box<NormalizedProviderRoomEvent>),
+    ProjectRoomAction(Box<NormalizedProviderProjectRoomAction>),
     Skip(ProviderControlSkipReason),
 }
 
@@ -379,6 +401,9 @@ pub fn normalize_feishu_lark_long_connection_control_command(
         .header
         .context("Feishu/Lark event is missing header")?;
     let event_type = optional_field(header.event_type.as_deref());
+    if event_type == Some(FEISHU_LARK_CARD_ACTION_EVENT_TYPE) {
+        return normalize_feishu_lark_project_room_action(provider_id, header, envelope.event);
+    }
     if event_type == Some(FEISHU_LARK_BOT_ADDED_EVENT_TYPE) {
         let tenant_key = required_owned(
             "feishu_lark header.tenant_key",
@@ -460,10 +485,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     }
     let command = match parse_provider_control_command(&text) {
         Some(command) => command,
-        None if is_direct_chat && !is_thread_reply => ProviderControlCommand::DirectNewSession {
-            project_path: None,
-            prompt: text,
-        },
+        None if is_direct_chat && !is_thread_reply => ProviderControlCommand::DirectChatGuidance,
         None if !is_direct_chat && !is_thread_reply => ProviderControlCommand::RoomGuidance,
         None => {
             return Ok(ProviderControlNormalizeResult::Skip(
@@ -481,7 +503,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     } else if is_direct_chat {
         match command {
             ProviderControlCommand::BindProject { project_path } => {
-                ProviderControlCommand::DirectBindProject { project_path }
+                ProviderControlCommand::DirectProjectRoomPrompt { project_path }
             }
             ProviderControlCommand::Help => ProviderControlCommand::DirectHelp,
             ProviderControlCommand::Status => ProviderControlCommand::DirectStatus,
@@ -493,15 +515,15 @@ pub fn normalize_feishu_lark_long_connection_control_command(
                 prompt,
             },
             ProviderControlCommand::UnbindProject { project_path: None } => {
-                ProviderControlCommand::DirectUnbindProject
+                ProviderControlCommand::DirectUnbindProjectGuidance
             }
             ProviderControlCommand::UnbindProject {
                 project_path: Some(_),
             } => ProviderControlCommand::Invalid {
-                message: "Use `/unbind` in direct chat to clear the default project.".to_string(),
+                message: "Direct chat does not bind a project folder. Use `/new /path/to/project what you want Codex to do` to start a new session, or use `/unbind` in a group room to disconnect that room.".to_string(),
             },
             command if command.requires_project_room() => ProviderControlCommand::Invalid {
-                message: "That command is for group rooms. In direct chat, use `/bind /path/to/project`, `/new ...`, `/status`, or `/help`.".to_string(),
+                message: "That command is for group rooms. In direct chat, start a new Codex session with `/new /path/to/project what you want Codex to do`.".to_string(),
             },
             command => command,
         }
@@ -519,6 +541,60 @@ pub fn normalize_feishu_lark_long_connection_control_command(
             provider_thread_id,
             provider_event_id: message_id,
             command,
+        },
+    )))
+}
+
+fn normalize_feishu_lark_project_room_action(
+    provider_id: &str,
+    header: FeishuLarkEventHeader,
+    event: Option<FeishuLarkEventBody>,
+) -> anyhow::Result<ProviderControlNormalizeResult> {
+    let tenant_key = required_owned(
+        "feishu_lark header.tenant_key",
+        header.tenant_key.as_deref(),
+    )?;
+    let event_id = required_owned("feishu_lark header.event_id", header.event_id.as_deref())?;
+    let event = event.context("Feishu/Lark card action event is missing event")?;
+    let context = event
+        .context
+        .context("Feishu/Lark card action event is missing context")?;
+    let chat_id = required_owned(
+        "feishu_lark card context.open_chat_id",
+        context.open_chat_id.as_deref(),
+    )?;
+    let action = event
+        .action
+        .context("Feishu/Lark card action event is missing action")?;
+    let value = action
+        .value
+        .context("Feishu/Lark card action event is missing action value")?;
+    let proposal_id = required_owned(
+        "feishu_lark card action.value.proposal_id",
+        value.proposal_id.as_deref(),
+    )?;
+    let action = match optional_field(value.action.as_deref()) {
+        Some("create_project_room") => ProviderProjectRoomAction::CreateProjectRoom,
+        Some("use_existing_room") => ProviderProjectRoomAction::UseExistingRoom,
+        Some("ignore_project") => ProviderProjectRoomAction::IgnoreProject,
+        _ => {
+            return Ok(ProviderControlNormalizeResult::Skip(
+                ProviderControlSkipReason::NotControlCommand,
+            ));
+        }
+    };
+
+    Ok(ProviderControlNormalizeResult::ProjectRoomAction(Box::new(
+        NormalizedProviderProjectRoomAction {
+            provider_id: provider_id.to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_mode: ProviderMode::FeishuLarkAppBot,
+            provider_account_id: tenant_key,
+            provider_conversation_id: chat_id,
+            provider_event_id: event_id,
+            proposal_id,
+            operator_open_id: event.operator.and_then(|operator| operator.open_id),
+            action,
         },
     )))
 }
@@ -901,6 +977,9 @@ struct FeishuLarkEventBody {
     sender: Option<FeishuLarkEventSender>,
     message: Option<FeishuLarkEventMessage>,
     chat_id: Option<String>,
+    operator: Option<FeishuLarkCardOperator>,
+    action: Option<FeishuLarkCardAction>,
+    context: Option<FeishuLarkCardContext>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,6 +1014,27 @@ struct FeishuLarkTextContent {
     text: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardOperator {
+    open_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardAction {
+    value: Option<FeishuLarkProjectRoomActionValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkProjectRoomActionValue {
+    action: Option<String>,
+    proposal_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardContext {
+    open_chat_id: Option<String>,
+}
+
 fn required_owned(field: &'static str, value: Option<&str>) -> anyhow::Result<String> {
     Ok(required_trimmed(field, value)?.to_string())
 }
@@ -967,7 +1067,7 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             let project_path = rest.trim();
             if project_path.is_empty() {
                 return Some(ProviderControlCommand::Invalid {
-                    message: "Use the full path to a folder on your Mac.\n\nDirect chat:\n`/bind /path/to/project`\n\nGroup room:\n`@your-bot /bind /path/to/project`\n\nUse Lark's @ menu to select me. Do not type the @ name as plain text."
+                    message: "Use `/bind` in a group room to connect that room to a project folder.\n\nGroup room:\n`@your-bot /bind /path/to/project`\n\nDirect chat:\n`/new /path/to/project what you want Codex to do`\n\nUse Lark's @ menu to select me in group rooms."
                         .to_string(),
                 });
             }
@@ -1009,7 +1109,7 @@ fn parse_new_session_command(rest: &str) -> ProviderControlCommand {
     let rest = rest.trim();
     if rest.is_empty() {
         return ProviderControlCommand::Invalid {
-            message: "Tell Codex what to do.\n\nDirect chat:\n`/new what you want Codex to do`\n\nGroup room:\n`@your-bot /new what you want Codex to do`\n\nUse Lark's @ menu to select me in group rooms.".to_string(),
+            message: "Tell Codex what to do.\n\nDirect chat:\n`/new /path/to/project what you want Codex to do`\n\nGroup room:\n`@your-bot /new what you want Codex to do`\n\nUse Lark's @ menu to select me in group rooms.".to_string(),
         };
     }
 
@@ -1661,6 +1761,55 @@ mod tests {
     }
 
     #[test]
+    fn feishu_lark_project_room_button_action_normalizes() {
+        let raw = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "event-card-action",
+                "event_type": "card.action.trigger",
+                "tenant_key": "2ca1d211f64f6438"
+            },
+            "event": {
+                "operator": {
+                    "open_id": "ou_operator"
+                },
+                "action": {
+                    "value": {
+                        "action": "create_project_room",
+                        "proposal_id": "prp_test"
+                    }
+                },
+                "context": {
+                    "open_chat_id": "oc_owner_direct",
+                    "open_message_id": "om_prompt"
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_feishu_lark_long_connection_control_command(
+                "lark-app",
+                TEST_LARK_BOT_OPEN_ID,
+                raw,
+            )
+            .expect("Feishu/Lark card action should parse"),
+            ProviderControlNormalizeResult::ProjectRoomAction(Box::new(
+                NormalizedProviderProjectRoomAction {
+                    provider_id: "lark-app".to_string(),
+                    provider_type: "feishu_lark".to_string(),
+                    provider_mode: ProviderMode::FeishuLarkAppBot,
+                    provider_account_id: "2ca1d211f64f6438".to_string(),
+                    provider_conversation_id: "oc_owner_direct".to_string(),
+                    provider_event_id: "event-card-action".to_string(),
+                    proposal_id: "prp_test".to_string(),
+                    operator_open_id: Some("ou_operator".to_string()),
+                    action: ProviderProjectRoomAction::CreateProjectRoom,
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn feishu_lark_shared_root_plain_mention_returns_room_guidance() {
         let raw = br#"{
             "schema": "2.0",
@@ -1711,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn feishu_lark_direct_chat_bind_sets_direct_project() {
+    fn feishu_lark_direct_chat_bind_normalizes_to_project_room_prompt() {
         let raw = br#"{
             "schema": "2.0",
             "header": {
@@ -1747,7 +1896,7 @@ mod tests {
                 provider_conversation_id: "oc_direct_chat".to_string(),
                 provider_thread_id: "om_bind_message_id".to_string(),
                 provider_event_id: "om_bind_message_id".to_string(),
-                command: ProviderControlCommand::DirectBindProject {
+                command: ProviderControlCommand::DirectProjectRoomPrompt {
                     project_path: "/Users/felix/Desktop/felix-projects/agents-router".to_string(),
                 },
             })
@@ -1755,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn feishu_lark_direct_chat_plain_text_starts_new_session() {
+    fn feishu_lark_direct_chat_plain_text_shows_guidance() {
         let raw = br#"{
             "schema": "2.0",
             "header": {
@@ -1791,10 +1940,7 @@ mod tests {
                 provider_conversation_id: "oc_direct_chat".to_string(),
                 provider_thread_id: "om_direct_message_id".to_string(),
                 provider_event_id: "om_direct_message_id".to_string(),
-                command: ProviderControlCommand::DirectNewSession {
-                    project_path: None,
-                    prompt: "what is the time".to_string(),
-                },
+                command: ProviderControlCommand::DirectChatGuidance,
             })
         );
     }

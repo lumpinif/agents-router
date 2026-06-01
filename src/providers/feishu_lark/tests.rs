@@ -339,6 +339,244 @@ async fn app_bot_sends_plain_text_to_room_for_control_guidance() {
 }
 
 #[tokio::test]
+async fn app_bot_sends_project_room_prompt_to_operator_direct_chat() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("receive_id_type", "open_id"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "receive_id": "ou_operator",
+            "msg_type": "interactive"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_project_prompt",
+                "chat_id": "oc_owner_direct",
+                "sender": {
+                    "tenant_key": "2ca1d211f64f6438"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .send_project_room_prompt(ProjectRoomPromptRequest {
+            proposal_id: "prp_test".to_string(),
+            project_path: "/Users/tester/projects/agents-router".to_string(),
+            project_name: "agents-router".to_string(),
+            prompt_conversation_id: None,
+        })
+        .expect("App Bot should support project room prompts")
+        .await
+        .expect("project room prompt should succeed");
+
+    assert_eq!(
+        result.provider_conversation_id.as_deref(),
+        Some("oc_owner_direct")
+    );
+    assert_eq!(
+        result.provider_message_id.as_deref(),
+        Some("om_project_prompt")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let send_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages")
+        .expect("project room prompt request should be recorded");
+    let body: serde_json::Value = send_request
+        .body_json()
+        .expect("prompt body should be JSON");
+    let card: serde_json::Value = serde_json::from_str(
+        body["content"]
+            .as_str()
+            .expect("interactive content should be a JSON string"),
+    )
+    .expect("prompt card should be JSON");
+    let actions = card["elements"]
+        .as_array()
+        .expect("card elements should be an array")
+        .iter()
+        .find_map(|element| element["actions"].as_array())
+        .expect("prompt card should include buttons");
+    assert!(actions.iter().any(|action| {
+        action["text"]["content"] == "Create a room"
+            && action["value"]["action"] == "create_project_room"
+            && action["value"]["proposal_id"] == "prp_test"
+    }));
+    assert!(actions.iter().any(|action| {
+        action["text"]["content"] == "Use existing room"
+            && action["value"]["action"] == "use_existing_room"
+    }));
+    assert!(actions.iter().any(|action| {
+        action["text"]["content"] == "Ignore" && action["value"]["action"] == "ignore_project"
+    }));
+}
+
+#[tokio::test]
+async fn app_bot_sends_project_room_prompt_to_known_direct_chat_without_operator_open_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("receive_id_type", "chat_id"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "receive_id": "oc_known_direct_chat",
+            "msg_type": "interactive"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_project_prompt",
+                "chat_id": "oc_known_direct_chat",
+                "sender": {
+                    "tenant_key": "2ca1d211f64f6438"
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut provider = test_app_bot_provider(server.uri());
+    let FeishuLarkProviderRuntime::AppBot(runtime) = &mut provider.runtime else {
+        panic!("test provider should use App Bot runtime");
+    };
+    runtime.operator_open_id = None;
+
+    let result = provider
+        .send_project_room_prompt(ProjectRoomPromptRequest {
+            proposal_id: "prp_test".to_string(),
+            project_path: "/Users/tester/projects/agent-transport-system".to_string(),
+            project_name: "agent-transport-system".to_string(),
+            prompt_conversation_id: Some("oc_known_direct_chat".to_string()),
+        })
+        .expect("App Bot should support project room prompts")
+        .await
+        .expect("project room prompt should succeed");
+
+    assert_eq!(
+        result.provider_conversation_id.as_deref(),
+        Some("oc_known_direct_chat")
+    );
+    assert_eq!(
+        result.provider_message_id.as_deref(),
+        Some("om_project_prompt")
+    );
+}
+
+#[tokio::test]
+async fn app_bot_can_create_regular_project_room() {
+    let server = MockServer::start().await;
+    let proposal_created_at = Utc.with_ymd_and_hms(2026, 6, 2, 1, 0, 0).unwrap();
+    let create_uuid = project_room_create_uuid("prp_test", proposal_created_at);
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/chats"))
+        .and(query_param("user_id_type", "open_id"))
+        .and(query_param("set_bot_manager", "true"))
+        .and(query_param("uuid", create_uuid.as_str()))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "name": "Codex · agents-router",
+            "owner_id": "ou_operator",
+            "user_id_list": ["ou_operator"],
+            "group_message_type": "chat"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "chat_id": "oc_new_project_room"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let result = provider
+        .create_project_room(FeishuLarkCreateProjectRoomRequest {
+            provider_id: "work_chat".to_string(),
+            provider_type: "feishu_lark".to_string(),
+            provider_account_id: "2ca1d211f64f6438".to_string(),
+            operator_open_id: "ou_operator".to_string(),
+            project_name: "agents-router".to_string(),
+            project_path: "/Users/tester/projects/agents-router".to_string(),
+            proposal_id: "prp_test".to_string(),
+            proposal_created_at,
+        })
+        .await
+        .expect("project room create should succeed");
+
+    assert_eq!(result.provider_conversation_id, "oc_new_project_room");
+}
+
+#[test]
+fn project_room_create_uuid_is_stable_per_prompt_but_changes_for_new_prompt() {
+    let first_prompt = Utc.with_ymd_and_hms(2026, 6, 2, 1, 0, 0).unwrap();
+    let second_prompt = Utc.with_ymd_and_hms(2026, 6, 2, 1, 1, 0).unwrap();
+
+    let first_uuid = project_room_create_uuid("prp_test", first_prompt);
+
+    assert_eq!(
+        first_uuid,
+        project_room_create_uuid("prp_test", first_prompt)
+    );
+    assert_ne!(
+        first_uuid,
+        project_room_create_uuid("prp_test", second_prompt)
+    );
+}
+
+#[tokio::test]
 async fn app_bot_sends_project_update_to_existing_thread() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1201,7 +1439,8 @@ fn formats_codex_desktop_message_with_clickable_open_link() {
                         tag: "plain_text",
                         content: "Open in Codex".to_string()
                     },
-                    url: "http://127.0.0.1:17674/open/codex/thread/session-1".to_string(),
+                    url: Some("http://127.0.0.1:17674/open/codex/thread/session-1".to_string()),
+                    value: None,
                     button_type: "primary"
                 }]
             },
@@ -1635,6 +1874,7 @@ fn test_app_bot_provider(api_base_url: String) -> FeishuLarkProvider {
             api_base_url,
             app_id: "cli_test".to_string(),
             app_secret: "test-app-secret".to_string(),
+            operator_open_id: Some("ou_operator".to_string()),
             tenant_key: Some("2ca1d211f64f6438".to_string()),
             chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
             computer_name: "Test Mac".to_string(),
@@ -1650,6 +1890,7 @@ fn test_personal_agent_provider(api_base_url: String) -> FeishuLarkProvider {
             api_base_url,
             app_id: "cli_test".to_string(),
             app_secret: "test-app-secret".to_string(),
+            operator_open_id: Some("ou_operator".to_string()),
             tenant_key: None,
             chat_id: None,
             computer_name: "Test Mac".to_string(),
@@ -1747,6 +1988,7 @@ fn lark_hidden_e2e_provider_config() -> ProviderConfig {
                 app_id: "cli_test".to_string(),
                 app_secret: SecretSource::Inline("test-app-secret".to_string()),
                 app_registration_source: None,
+                operator_open_id: Some("ou_operator".to_string()),
                 tenant_key: Some("2ca1d211f64f6438".to_string()),
                 chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
             },

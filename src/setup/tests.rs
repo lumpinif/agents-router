@@ -267,6 +267,7 @@ fn writes_parseable_feishu_lark_personal_agent_config_without_default_room() {
         "lark",
         "cli_9f5343c580712544",
         "test-app-secret",
+        Some("ou_operator"),
     );
 
     write_config(&path, &config).expect("config should be written");
@@ -279,6 +280,7 @@ fn writes_parseable_feishu_lark_personal_agent_config_without_default_room() {
     assert_eq!(provider.domain.as_deref(), Some("lark"));
     assert_eq!(provider.app_id.as_deref(), Some("cli_9f5343c580712544"));
     assert_eq!(provider.app_secret.as_deref(), Some("test-app-secret"));
+    assert_eq!(provider.operator_open_id.as_deref(), Some("ou_operator"));
     assert!(provider.tenant_key.is_none());
     assert!(provider.chat_id.is_none());
     assert_eq!(parsed.routes[0].sources, vec!["codex_desktop".to_string()]);

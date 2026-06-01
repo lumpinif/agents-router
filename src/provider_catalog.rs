@@ -858,6 +858,7 @@ mod tests {
                     app_id: "cli_9f5343c580712544".to_string(),
                     app_secret: SecretSource::Env("AGENTS_ROUTER_LARK_APP_SECRET".to_string()),
                     app_registration_source: None,
+                    operator_open_id: None,
                     tenant_key: Some("2ca1d211f64f6438".to_string()),
                     chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
                 },

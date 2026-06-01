@@ -73,6 +73,7 @@ pub fn feishu_lark_app_bot_targets(config: &RawConfig) -> Vec<FeishuLarkAppBotTa
                         .as_deref()
                         .is_some_and(|value| !value.trim().is_empty()),
                 app_registration_source: provider.app_registration_source.clone(),
+                operator_open_id: provider.operator_open_id.clone(),
                 tenant_key: provider.tenant_key.clone(),
                 chat_id: provider.chat_id.clone(),
             })

@@ -1109,6 +1109,7 @@ providers = ["work_lark_app"]
                 app_id,
                 app_secret: SecretSource::Env(app_secret_env),
                 app_registration_source: None,
+                operator_open_id: None,
                 tenant_key,
                 chat_id,
             }

@@ -26,8 +26,8 @@ use crate::agent_integration_catalog::agent_integration_for_source;
 use crate::bridge_binding_ledger::ThreadSessionBindingInput;
 use crate::bridge_binding_ledger::{BridgeBindingLedger, BridgeBindingLedgerStore};
 use crate::bridge_control::{
-    BridgeControlOutcome, BridgeControlReply, BridgeRoomMessage, disconnected_lark_thread_reply,
-    handle_provider_control_command, handle_provider_room_event,
+    BridgeControlOutcome, BridgeControlReply, BridgeProjectRoomPrompt, BridgeRoomMessage,
+    disconnected_lark_thread_reply, handle_provider_control_command, handle_provider_room_event,
 };
 use crate::config::{
     FeishuLarkAppDomain, FeishuLarkProviderConfig, ProviderConfig, ProviderConfigDetail,
@@ -42,17 +42,18 @@ use crate::provider_catalog::{
     ProviderMode, provider_config_mode_capability, provider_mode_capability,
 };
 use crate::provider_inbound::{
-    NormalizedProviderControlCommand, ProviderControlCommand, ProviderControlNormalizeResult,
-    ProviderControlSkipReason, ProviderInboundDecision, ProviderInboundNormalizeResult,
-    ProviderInboundReady, ProviderInboundSkipReason, lookup_and_claim_provider_surface_reply,
-    lookup_and_claim_provider_thread_session_reply,
+    NormalizedProviderControlCommand, NormalizedProviderProjectRoomAction, ProviderControlCommand,
+    ProviderControlNormalizeResult, ProviderControlSkipReason, ProviderInboundDecision,
+    ProviderInboundNormalizeResult, ProviderInboundReady, ProviderInboundSkipReason,
+    lookup_and_claim_provider_surface_reply, lookup_and_claim_provider_thread_session_reply,
     normalize_feishu_lark_long_connection_control_command,
     normalize_feishu_lark_long_connection_surface_reply, provider_event_id_stable_hash,
     thread_binding_query_for_reply,
 };
 use crate::providers::feishu_lark_continuation::FeishuLarkContinuationDispatcher;
 use crate::providers::feishu_lark_control::{
-    dispatch_feishu_lark_control_reply, dispatch_feishu_lark_room_message,
+    dispatch_feishu_lark_control_reply, dispatch_feishu_lark_project_room_action,
+    dispatch_feishu_lark_project_room_prompt, dispatch_feishu_lark_room_message,
 };
 use crate::providers::feishu_lark_new_session::FeishuLarkNewSessionDispatcher;
 use crate::response_surface_exposure::evaluate_response_surface_exposure;
@@ -184,6 +185,8 @@ pub(crate) enum FeishuLarkLongConnectionDecision {
     ReadyAfterLocalClaim(Box<ProviderInboundReady>),
     ControlReply(BridgeControlReply),
     RoomMessage(BridgeRoomMessage),
+    ProjectRoomPrompt(Box<BridgeProjectRoomPrompt>),
+    ProjectRoomAction(Box<NormalizedProviderProjectRoomAction>),
     NewSession(Box<crate::bridge_control::BridgeNewSessionCommand>),
     Skip(ProviderInboundSkipReason),
     ControlSkip(ProviderControlSkipReason),
@@ -448,6 +451,9 @@ impl FeishuLarkLongConnectionRuntime {
             ProviderControlNormalizeResult::RoomEvent(event) => {
                 return self.handle_room_event_before_platform_ack(*event);
             }
+            ProviderControlNormalizeResult::ProjectRoomAction(action) => {
+                return self.handle_project_room_action_before_platform_ack(*action);
+            }
             ProviderControlNormalizeResult::Skip(ProviderControlSkipReason::NotControlCommand) => {}
             ProviderControlNormalizeResult::Skip(reason) => {
                 return Ok(FeishuLarkLongConnectionDecision::ControlSkip(reason));
@@ -557,6 +563,9 @@ impl FeishuLarkLongConnectionRuntime {
             BridgeControlOutcome::RoomMessage(message) => {
                 Ok(FeishuLarkLongConnectionDecision::RoomMessage(message))
             }
+            BridgeControlOutcome::ProjectRoomPrompt(prompt) => Ok(
+                FeishuLarkLongConnectionDecision::ProjectRoomPrompt(Box::new(prompt)),
+            ),
             BridgeControlOutcome::NewSession(command) => Ok(
                 FeishuLarkLongConnectionDecision::NewSession(Box::new(command)),
             ),
@@ -581,10 +590,30 @@ impl FeishuLarkLongConnectionRuntime {
             BridgeControlOutcome::Reply(reply) => {
                 Ok(FeishuLarkLongConnectionDecision::ControlReply(reply))
             }
+            BridgeControlOutcome::ProjectRoomPrompt(prompt) => Ok(
+                FeishuLarkLongConnectionDecision::ProjectRoomPrompt(Box::new(prompt)),
+            ),
             BridgeControlOutcome::NewSession(command) => Ok(
                 FeishuLarkLongConnectionDecision::NewSession(Box::new(command)),
             ),
         }
+    }
+
+    fn handle_project_room_action_before_platform_ack(
+        &self,
+        action: NormalizedProviderProjectRoomAction,
+    ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
+        info!(
+            provider.id = %action.provider_id,
+            provider.conversation.id = %action.provider_conversation_id,
+            event.hash = %provider_event_id_stable_hash(&action.provider_event_id),
+            proposal.id = %action.proposal_id,
+            action.kind = ?action.action,
+            event = "feishu_lark.long_connection.live.project_room_action.accepted",
+        );
+        Ok(FeishuLarkLongConnectionDecision::ProjectRoomAction(
+            Box::new(action),
+        ))
     }
 
     #[cfg(test)]
@@ -802,6 +831,10 @@ async fn run_live_lark_long_connection_provider(
     let dispatcher = FeishuLarkContinuationDispatcher::new(runtime_state.clone());
     let control_reply_dispatcher = LiveFeishuLarkControlReplyDispatcher::new(runtime_state.clone());
     let room_message_dispatcher = LiveFeishuLarkRoomMessageDispatcher::new(runtime_state.clone());
+    let project_room_prompt_dispatcher =
+        LiveFeishuLarkProjectRoomPromptDispatcher::new(runtime_state.clone());
+    let project_room_action_dispatcher =
+        LiveFeishuLarkProjectRoomActionDispatcher::new(runtime_state.clone());
     let new_session_dispatcher = FeishuLarkNewSessionDispatcher::new(runtime_state.clone());
 
     info!(
@@ -818,6 +851,8 @@ async fn run_live_lark_long_connection_provider(
             dispatcher: &dispatcher,
             control_reply_dispatcher: &control_reply_dispatcher,
             room_message_dispatcher: &room_message_dispatcher,
+            project_room_prompt_dispatcher: &project_room_prompt_dispatcher,
+            project_room_action_dispatcher: &project_room_action_dispatcher,
             new_session_dispatcher: &new_session_dispatcher,
         };
         receive_and_dispatch_live_lark_event_hidden(
@@ -836,6 +871,8 @@ struct FeishuLarkLiveDispatchContext<'a> {
     dispatcher: &'a dyn ContinuationDispatcher,
     control_reply_dispatcher: &'a dyn FeishuLarkControlReplyDispatcher,
     room_message_dispatcher: &'a dyn FeishuLarkRoomMessageDispatcher,
+    project_room_prompt_dispatcher: &'a dyn FeishuLarkProjectRoomPromptDispatcher,
+    project_room_action_dispatcher: &'a dyn FeishuLarkProjectRoomActionDispatcher,
     new_session_dispatcher: &'a dyn NewSessionDispatcher,
 }
 
@@ -878,6 +915,16 @@ async fn receive_and_dispatch_live_lark_event_hidden(
         FeishuLarkLongConnectionDecision::RoomMessage(message) => {
             dispatch_context.room_message_dispatcher.dispatch(message)?;
         }
+        FeishuLarkLongConnectionDecision::ProjectRoomPrompt(prompt) => {
+            dispatch_context
+                .project_room_prompt_dispatcher
+                .dispatch(*prompt)?;
+        }
+        FeishuLarkLongConnectionDecision::ProjectRoomAction(action) => {
+            dispatch_context
+                .project_room_action_dispatcher
+                .dispatch(*action)?;
+        }
         FeishuLarkLongConnectionDecision::NewSession(command) => {
             dispatch_context
                 .new_session_dispatcher
@@ -900,6 +947,14 @@ trait FeishuLarkControlReplyDispatcher: Send + Sync {
 
 trait FeishuLarkRoomMessageDispatcher: Send + Sync {
     fn dispatch(&self, message: BridgeRoomMessage) -> anyhow::Result<()>;
+}
+
+trait FeishuLarkProjectRoomPromptDispatcher: Send + Sync {
+    fn dispatch(&self, prompt: BridgeProjectRoomPrompt) -> anyhow::Result<()>;
+}
+
+trait FeishuLarkProjectRoomActionDispatcher: Send + Sync {
+    fn dispatch(&self, action: NormalizedProviderProjectRoomAction) -> anyhow::Result<()>;
 }
 
 #[derive(Clone)]
@@ -934,6 +989,42 @@ impl LiveFeishuLarkRoomMessageDispatcher {
 impl FeishuLarkRoomMessageDispatcher for LiveFeishuLarkRoomMessageDispatcher {
     fn dispatch(&self, message: BridgeRoomMessage) -> anyhow::Result<()> {
         dispatch_feishu_lark_room_message(self.runtime_state.clone(), message);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LiveFeishuLarkProjectRoomPromptDispatcher {
+    runtime_state: RuntimeState,
+}
+
+impl LiveFeishuLarkProjectRoomPromptDispatcher {
+    fn new(runtime_state: RuntimeState) -> Self {
+        Self { runtime_state }
+    }
+}
+
+impl FeishuLarkProjectRoomPromptDispatcher for LiveFeishuLarkProjectRoomPromptDispatcher {
+    fn dispatch(&self, prompt: BridgeProjectRoomPrompt) -> anyhow::Result<()> {
+        dispatch_feishu_lark_project_room_prompt(self.runtime_state.clone(), prompt);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LiveFeishuLarkProjectRoomActionDispatcher {
+    runtime_state: RuntimeState,
+}
+
+impl LiveFeishuLarkProjectRoomActionDispatcher {
+    fn new(runtime_state: RuntimeState) -> Self {
+        Self { runtime_state }
+    }
+}
+
+impl FeishuLarkProjectRoomActionDispatcher for LiveFeishuLarkProjectRoomActionDispatcher {
+    fn dispatch(&self, action: NormalizedProviderProjectRoomAction) -> anyhow::Result<()> {
+        dispatch_feishu_lark_project_room_action(self.runtime_state.clone(), action);
         Ok(())
     }
 }
@@ -1011,6 +1102,27 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
+        FeishuLarkLongConnectionDecision::ProjectRoomPrompt(prompt) => {
+            info!(
+                provider.id = %provider_id,
+                provider.conversation.id = %prompt.provider_conversation_id,
+                provider.thread.id = %prompt.provider_thread_id,
+                proposal.id = %prompt.proposal_id,
+                project.path = %prompt.project_path,
+                event.hash = %prompt.provider_event_id_hash,
+                event = "feishu_lark.long_connection.live.platform_ack.sent",
+            );
+        }
+        FeishuLarkLongConnectionDecision::ProjectRoomAction(action) => {
+            info!(
+                provider.id = %provider_id,
+                provider.conversation.id = %action.provider_conversation_id,
+                proposal.id = %action.proposal_id,
+                action.kind = ?action.action,
+                event.hash = %provider_event_id_stable_hash(&action.provider_event_id),
+                event = "feishu_lark.long_connection.live.platform_ack.sent",
+            );
+        }
         FeishuLarkLongConnectionDecision::NewSession(command) => {
             info!(
                 provider.id = %provider_id,
@@ -1034,12 +1146,12 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
 fn control_command_name(command: &ProviderControlCommand) -> &'static str {
     match command {
         ProviderControlCommand::BindProject { .. } => "bind",
-        ProviderControlCommand::DirectBindProject { .. } => "direct_bind",
+        ProviderControlCommand::DirectProjectRoomPrompt { .. } => "direct_project_room_prompt",
         ProviderControlCommand::DirectChatGuidance => "direct_guidance",
         ProviderControlCommand::DirectHelp => "direct_help",
         ProviderControlCommand::DirectNewSession { .. } => "direct_new",
         ProviderControlCommand::DirectStatus => "direct_status",
-        ProviderControlCommand::DirectUnbindProject => "direct_unbind",
+        ProviderControlCommand::DirectUnbindProjectGuidance => "direct_unbind_guidance",
         ProviderControlCommand::Help => "help",
         ProviderControlCommand::NewSession { .. } => "new",
         ProviderControlCommand::RoomGuidance => "room_guidance",
@@ -1051,12 +1163,12 @@ fn control_command_name(command: &ProviderControlCommand) -> &'static str {
 
 fn control_command_surface(command: &ProviderControlCommand) -> &'static str {
     match command {
-        ProviderControlCommand::DirectBindProject { .. }
+        ProviderControlCommand::DirectProjectRoomPrompt { .. }
         | ProviderControlCommand::DirectChatGuidance
         | ProviderControlCommand::DirectHelp
         | ProviderControlCommand::DirectNewSession { .. }
         | ProviderControlCommand::DirectStatus
-        | ProviderControlCommand::DirectUnbindProject => "direct_chat",
+        | ProviderControlCommand::DirectUnbindProjectGuidance => "direct_chat",
         ProviderControlCommand::BindProject { .. }
         | ProviderControlCommand::Help
         | ProviderControlCommand::NewSession { .. }
@@ -1771,6 +1883,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1783,6 +1897,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1801,6 +1917,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1835,6 +1953,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1847,6 +1967,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1880,6 +2002,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_transport_dispatches_direct_bind_project_room_prompt() {
+        let dir = tempdir().expect("temp dir should exist");
+        let project_dir = tempdir().expect("project dir should exist");
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
+            .expect("ledger store should build");
+        let bridge_binding_ledger_store =
+            BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
+                .expect("binding ledger store should build");
+        let runtime = app_bot_runtime();
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_direct_payload(
+                "om_direct_bind_message_id",
+                &format!("/bind {project_path}"),
+            ))),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+        let dispatcher = RecordingContinuationDispatcher::default();
+        let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
+        let new_session_dispatcher = RecordingNewSessionDispatcher::default();
+
+        receive_and_dispatch_live_lark_event_hidden(
+            &runtime,
+            &mut transport,
+            &mut payload_buffer,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+                &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
+                &new_session_dispatcher,
+            ),
+        )
+        .await
+        .expect("direct bind should ack and dispatch project room prompt");
+
+        assert_eq!(transport.sent_messages().len(), 1);
+        assert!(control_reply_dispatcher.dispatched().is_empty());
+        assert!(dispatcher.dispatched().is_empty());
+        assert!(new_session_dispatcher.dispatched().is_empty());
+        let prompts = project_room_prompt_dispatcher.dispatched();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].provider_conversation_id, "oc_owner_direct");
+        assert_eq!(prompts[0].provider_thread_id, "om_direct_bind_message_id");
+        assert_eq!(prompts[0].project_path, project_path);
+    }
+
+    #[tokio::test]
     async fn hidden_transport_dispatches_room_welcome_for_bot_added_event() {
         let dir = tempdir().expect("temp dir should exist");
         let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
@@ -1908,6 +2084,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1920,6 +2098,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -1940,6 +2120,73 @@ mod tests {
                 .contains("`@your-bot /bind /path/to/project`")
         );
         assert!(messages[0].text.contains("Use Lark's @ menu to select me"));
+    }
+
+    #[tokio::test]
+    async fn hidden_transport_dispatches_project_room_card_action() {
+        let dir = tempdir().expect("temp dir should exist");
+        let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
+            .expect("ledger store should build");
+        let bridge_binding_ledger_store =
+            BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
+                .expect("binding ledger store should build");
+        let runtime = app_bot_runtime();
+        let mut transport = RecordingTransport::with_messages(vec![
+            FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
+                br#"{
+                    "schema": "2.0",
+                    "header": {
+                        "event_id": "event-card-action",
+                        "event_type": "card.action.trigger",
+                        "tenant_key": "2ca1d211f64f6438"
+                    },
+                    "event": {
+                        "operator": { "open_id": "ou_operator" },
+                        "action": {
+                            "value": {
+                                "action": "ignore_project",
+                                "proposal_id": "prp_test"
+                            }
+                        },
+                        "context": {
+                            "open_chat_id": "oc_owner_direct"
+                        }
+                    }
+                }"#
+                .to_vec(),
+            )),
+        ]);
+        let mut payload_buffer = FeishuLarkLongConnectionPayloadBuffer::default();
+        let dispatcher = RecordingContinuationDispatcher::default();
+        let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
+        let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
+        let new_session_dispatcher = RecordingNewSessionDispatcher::default();
+
+        receive_and_dispatch_live_lark_event_hidden(
+            &runtime,
+            &mut transport,
+            &mut payload_buffer,
+            test_dispatch_context(
+                &ledger_store,
+                &bridge_binding_ledger_store,
+                &dispatcher,
+                &control_reply_dispatcher,
+                &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
+                &new_session_dispatcher,
+            ),
+        )
+        .await
+        .expect("card action should ack and dispatch");
+
+        let dispatched = project_room_action_dispatcher.dispatched();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].proposal_id, "prp_test");
+        assert_eq!(dispatched[0].provider_conversation_id, "oc_owner_direct");
+        assert_eq!(transport.sent_messages().len(), 1);
     }
 
     #[tokio::test]
@@ -1979,6 +2226,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -1991,6 +2240,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -2050,6 +2301,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -2062,6 +2315,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -2105,6 +2360,8 @@ mod tests {
         let dispatcher = RecordingContinuationDispatcher::default();
         let control_reply_dispatcher = RecordingControlReplyDispatcher::default();
         let room_message_dispatcher = RecordingRoomMessageDispatcher::default();
+        let project_room_prompt_dispatcher = RecordingProjectRoomPromptDispatcher::default();
+        let project_room_action_dispatcher = RecordingProjectRoomActionDispatcher::default();
         let new_session_dispatcher = RecordingNewSessionDispatcher::default();
 
         receive_and_dispatch_live_lark_event_hidden(
@@ -2117,6 +2374,8 @@ mod tests {
                 &dispatcher,
                 &control_reply_dispatcher,
                 &room_message_dispatcher,
+                &project_room_prompt_dispatcher,
+                &project_room_action_dispatcher,
                 &new_session_dispatcher,
             ),
         )
@@ -2232,6 +2491,7 @@ mod tests {
                     app_id: "cli_test_app".to_string(),
                     app_secret: SecretSource::Inline("test-secret".to_string()),
                     app_registration_source: None,
+                    operator_open_id: Some("ou_operator".to_string()),
                     tenant_key: Some("2ca1d211f64f6438".to_string()),
                     chat_id: Some("oc_5ce6d572455d361153b7xx51da133945".to_string()),
                 },
@@ -2263,6 +2523,7 @@ mod tests {
                     app_registration_source: Some(
                         lark_personal_agent_channel::REGISTRATION_SOURCE.to_string(),
                     ),
+                    operator_open_id: Some("ou_operator".to_string()),
                     tenant_key: None,
                     chat_id: None,
                 },
@@ -2397,6 +2658,20 @@ mod tests {
         serde_json::to_vec(&payload).expect("payload should serialize")
     }
 
+    fn lark_direct_payload(message_id: &str, text: &str) -> Vec<u8> {
+        let mut payload = serde_json::from_slice::<serde_json::Value>(include_bytes!(
+            "../../tests/fixtures/provider_inbound/feishu_lark_surface_reply.json"
+        ))
+        .expect("fixture should be valid JSON");
+        payload["event"]["message"]["message_id"] = serde_json::json!(message_id);
+        payload["event"]["message"]["root_id"] = serde_json::json!("");
+        payload["event"]["message"]["chat_id"] = serde_json::json!("oc_owner_direct");
+        payload["event"]["message"]["chat_type"] = serde_json::json!("p2p");
+        payload["event"]["message"]["content"] =
+            serde_json::json!(serde_json::json!({ "text": text }).to_string());
+        serde_json::to_vec(&payload).expect("payload should serialize")
+    }
+
     fn test_time() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 20, 1, 2, 3)
             .single()
@@ -2476,6 +2751,54 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RecordingProjectRoomActionDispatcher {
+        dispatched: Arc<Mutex<Vec<NormalizedProviderProjectRoomAction>>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingProjectRoomPromptDispatcher {
+        dispatched: Arc<Mutex<Vec<BridgeProjectRoomPrompt>>>,
+    }
+
+    impl RecordingProjectRoomPromptDispatcher {
+        fn dispatched(&self) -> Vec<BridgeProjectRoomPrompt> {
+            self.dispatched
+                .lock()
+                .expect("project room prompt dispatcher record lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl FeishuLarkProjectRoomPromptDispatcher for RecordingProjectRoomPromptDispatcher {
+        fn dispatch(&self, prompt: BridgeProjectRoomPrompt) -> anyhow::Result<()> {
+            self.dispatched
+                .lock()
+                .expect("project room prompt dispatcher record lock should not be poisoned")
+                .push(prompt);
+            Ok(())
+        }
+    }
+
+    impl RecordingProjectRoomActionDispatcher {
+        fn dispatched(&self) -> Vec<NormalizedProviderProjectRoomAction> {
+            self.dispatched
+                .lock()
+                .expect("project room action dispatcher record lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl FeishuLarkProjectRoomActionDispatcher for RecordingProjectRoomActionDispatcher {
+        fn dispatch(&self, action: NormalizedProviderProjectRoomAction) -> anyhow::Result<()> {
+            self.dispatched
+                .lock()
+                .expect("project room action dispatcher record lock should not be poisoned")
+                .push(action);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingNewSessionDispatcher {
         dispatched: Arc<Mutex<Vec<NewSessionWork>>>,
     }
@@ -2505,6 +2828,8 @@ mod tests {
         dispatcher: &'a RecordingContinuationDispatcher,
         control_reply_dispatcher: &'a RecordingControlReplyDispatcher,
         room_message_dispatcher: &'a RecordingRoomMessageDispatcher,
+        project_room_prompt_dispatcher: &'a RecordingProjectRoomPromptDispatcher,
+        project_room_action_dispatcher: &'a RecordingProjectRoomActionDispatcher,
         new_session_dispatcher: &'a RecordingNewSessionDispatcher,
     ) -> FeishuLarkLiveDispatchContext<'a> {
         FeishuLarkLiveDispatchContext {
@@ -2513,6 +2838,8 @@ mod tests {
             dispatcher,
             control_reply_dispatcher,
             room_message_dispatcher,
+            project_room_prompt_dispatcher,
+            project_room_action_dispatcher,
             new_session_dispatcher,
         }
     }
