@@ -77,6 +77,43 @@ fn stable_service_binary_install_replaces_symlink_with_real_file() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn parses_first_valid_macos_codesign_identity() {
+    let output = r#"
+  1) CAB519C644B66B6093C5E261A10B0BC2CC7986D5 "Apple Development: tester@example.com (TEAMID1234)"
+     1 valid identities found
+"#;
+
+    assert_eq!(
+        parse_macos_codesign_identity(output),
+        Some("Apple Development: tester@example.com (TEAMID1234)".to_string())
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn missing_macos_codesign_identity_is_not_selected() {
+    assert_eq!(
+        parse_macos_codesign_identity("     0 valid identities found\n"),
+        None
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn detects_macho_binary_magic_without_trusting_file_extension() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let binary = dir.path().join("agents-router");
+    let text = dir.path().join("agents-router.txt");
+
+    std::fs::write(&binary, [0xcf, 0xfa, 0xed, 0xfe]).expect("binary fixture should be written");
+    std::fs::write(&text, b"not a Mach-O binary").expect("text fixture should be written");
+
+    assert!(looks_like_macho_binary(&binary));
+    assert!(!looks_like_macho_binary(&text));
+}
+
 #[test]
 fn uninstall_keeps_npm_managed_binary_paths() {
     assert!(!should_remove_current_binary_for_install_method(

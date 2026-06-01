@@ -2,6 +2,8 @@ use std::fmt::Display;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -533,6 +535,7 @@ fn install_stable_service_binary(current_binary: &Path, home: &Path) -> anyhow::
                 stable_binary.display()
             )
         })?;
+        sign_macos_service_binary_if_possible(&stable_binary);
         Ok(())
     })();
 
@@ -542,6 +545,103 @@ fn install_stable_service_binary(current_binary: &Path, home: &Path) -> anyhow::
     install_result?;
 
     Ok(stable_binary)
+}
+
+#[cfg(target_os = "macos")]
+fn sign_macos_service_binary_if_possible(stable_binary: &Path) {
+    if !looks_like_macho_binary(stable_binary) {
+        return;
+    }
+
+    let Some(identity) = macos_codesign_identity() else {
+        return;
+    };
+
+    let output = ProcessCommand::new("codesign")
+        .args([
+            "--force",
+            "--sign",
+            &identity,
+            "--identifier",
+            "com.agents-router.service",
+        ])
+        .arg(stable_binary)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "Warning: failed to sign service binary `{}` with `{}`: {}",
+                stable_binary.display(),
+                identity,
+                stderr.trim()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: failed to run codesign for service binary `{}` with `{}`: {}",
+                stable_binary.display(),
+                identity,
+                error
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sign_macos_service_binary_if_possible(_stable_binary: &Path) {}
+
+#[cfg(target_os = "macos")]
+fn macos_codesign_identity() -> Option<String> {
+    let output = ProcessCommand::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_macos_codesign_identity(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_codesign_identity(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let start = line.find('"')?;
+        let rest = &line[start + 1..];
+        let end = rest.find('"')?;
+        let identity = &rest[..end];
+        if identity.trim().is_empty() || line.contains("0 valid identities found") {
+            None
+        } else {
+            Some(identity.to_string())
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn looks_like_macho_binary(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+
+    let mut magic = [0_u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+
+    matches!(
+        magic,
+        [0xfe, 0xed, 0xfa, 0xce]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+    )
 }
 
 #[cfg(not(windows))]
