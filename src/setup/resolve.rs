@@ -37,7 +37,7 @@ pub fn resolve_feishu_lark_app_domain(input: &str) -> anyhow::Result<String> {
     match input.trim() {
         "feishu" => Ok("feishu".to_string()),
         "lark" => Ok("lark".to_string()),
-        _ => anyhow::bail!("Feishu/Lark App Bot domain must be `feishu` or `lark`"),
+        _ => anyhow::bail!("Feishu/Lark app domain must be `feishu` or `lark`"),
     }
 }
 
@@ -54,7 +54,7 @@ pub fn resolve_feishu_lark_tenant_key(input: &str) -> anyhow::Result<String> {
 }
 
 pub fn resolve_feishu_lark_chat_id(input: &str) -> anyhow::Result<String> {
-    resolve_non_empty_no_whitespace("Feishu/Lark chat_id", input)
+    resolve_non_empty_no_whitespace("Feishu/Lark room chat_id", input)
 }
 
 pub fn resolve_webhook_url(input: &str) -> anyhow::Result<String> {

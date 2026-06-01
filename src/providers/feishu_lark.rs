@@ -281,7 +281,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Config,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` has no default room; use direct chat with `/bind /absolute/project/path`, add the Personal Agent to a room and mention it with `/bind /absolute/project/path`, or set `chat_id` in config",
+                    "feishu_lark provider `{}` has no fixed room configured; use `/bind /absolute/project/path` in direct chat or a project room, or set `chat_id` only for the advanced fixed-room setup",
                     self.id
                 ),
             )
@@ -290,14 +290,14 @@ impl FeishuLarkProvider {
             serde_json::to_string(&FeishuLarkCard::from_signal(signal, &runtime.computer_name))
                 .map_err(|error| {
                     DeliveryError::new(
-                        DeliveryErrorKind::Internal,
-                        DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
-                        format!(
-                            "feishu_lark provider `{}` failed to serialize App Bot message content",
-                            self.id
-                        ),
-                    )
-                    .with_source(error)
+                DeliveryErrorKind::Internal,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` failed to serialize Feishu/Lark app message content",
+                    self.id
+                ),
+            )
+            .with_source(error)
                 })?;
         let request = FeishuLarkAppBotSendMessageRequest {
             receive_id: chat_id,
@@ -332,7 +332,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Network,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` failed to read App Bot send response",
+                    "feishu_lark provider `{}` failed to read Feishu/Lark app send response",
                     self.id
                 ),
             )
@@ -346,7 +346,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderRejected,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` returned HTTP status {} while sending App Bot message",
+                    "feishu_lark provider `{}` returned HTTP status {} while sending Feishu/Lark app message",
                     self.id, status
                 ),
             )
@@ -357,15 +357,15 @@ impl FeishuLarkProvider {
         let provider_response: FeishuLarkAppBotSendMessageResponse =
             serde_json::from_str(&response_body).map_err(|error| {
                 DeliveryError::new(
-                    DeliveryErrorKind::ProviderResponse,
-                    DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
-                    format!(
-                        "feishu_lark provider `{}` returned invalid App Bot send response JSON",
-                        self.id
-                    ),
-                )
-                .with_http_status(status_code)
-                .with_source(error)
+                DeliveryErrorKind::ProviderResponse,
+                DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
+                format!(
+                    "feishu_lark provider `{}` returned invalid Feishu/Lark app send response JSON",
+                    self.id
+                ),
+            )
+            .with_http_status(status_code)
+            .with_source(error)
             })?;
 
         if provider_response.code != 0 {
@@ -374,7 +374,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderRejected,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` returned code {} while sending App Bot message: {}",
+                    "feishu_lark provider `{}` returned code {} while sending Feishu/Lark app message: {}",
                     self.id,
                     provider_response.code,
                     provider_response
@@ -391,7 +391,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderResponse,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` App Bot send response did not include message data",
+                    "feishu_lark provider `{}` Feishu/Lark app send response did not include message data",
                     self.id
                 ),
             )
@@ -426,7 +426,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Internal,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` failed to serialize App Bot thread message content",
+                    "feishu_lark provider `{}` failed to serialize Feishu/Lark thread message content",
                     self.id
                 ),
             )
@@ -468,7 +468,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Network,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` failed to read App Bot thread message response",
+                    "feishu_lark provider `{}` failed to read Feishu/Lark thread message response",
                     self.id
                 ),
             )
@@ -482,7 +482,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderRejected,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` returned HTTP status {} while sending App Bot thread message",
+                    "feishu_lark provider `{}` returned HTTP status {} while sending Feishu/Lark thread message",
                     self.id, status
                 ),
             )
@@ -496,7 +496,7 @@ impl FeishuLarkProvider {
                     DeliveryErrorKind::ProviderResponse,
                     DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                     format!(
-                        "feishu_lark provider `{}` returned invalid App Bot thread message response JSON",
+                        "feishu_lark provider `{}` returned invalid Feishu/Lark thread message response JSON",
                         self.id
                     ),
                 )
@@ -509,7 +509,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderRejected,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` returned code {} while sending App Bot thread message: {}",
+                    "feishu_lark provider `{}` returned code {} while sending Feishu/Lark thread message: {}",
                     self.id,
                     provider_response.code,
                     provider_response
@@ -526,7 +526,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::ProviderResponse,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` App Bot thread message response did not include message data",
+                    "feishu_lark provider `{}` Feishu/Lark thread message response did not include message data",
                     self.id
                 ),
             )
@@ -710,7 +710,7 @@ impl FeishuLarkProvider {
                 thread_reply_error(
                     &request,
                     format!(
-                        "failed to send Feishu/Lark App Bot thread reply: {}",
+                        "failed to send Feishu/Lark thread reply: {}",
                         error.without_url()
                     ),
                 )
@@ -722,7 +722,7 @@ impl FeishuLarkProvider {
             thread_reply_error(
                 &request,
                 format!(
-                    "failed to read Feishu/Lark App Bot thread reply response: {}",
+                    "failed to read Feishu/Lark thread reply response: {}",
                     error.without_url()
                 ),
             )
@@ -732,10 +732,7 @@ impl FeishuLarkProvider {
             let status_code = status.as_u16();
             return Err(thread_reply_error(
                 &request,
-                format!(
-                    "Feishu/Lark App Bot thread reply returned HTTP status {}",
-                    status
-                ),
+                format!("Feishu/Lark thread reply returned HTTP status {}", status),
             )
             .with_http_status(status_code)
             .with_retriable(is_retriable_http_status(status_code)));
@@ -745,14 +742,14 @@ impl FeishuLarkProvider {
             serde_json::from_str(&response_body).map_err(|error| {
                 thread_reply_error(
                     &request,
-                    format!("Feishu/Lark App Bot thread reply returned invalid JSON: {error}"),
+                    format!("Feishu/Lark thread reply returned invalid JSON: {error}"),
                 )
             })?;
         if provider_response.code != 0 {
             return Err(thread_reply_error(
                 &request,
                 format!(
-                    "Feishu/Lark App Bot thread reply returned code {}: {}",
+                    "Feishu/Lark thread reply returned code {}: {}",
                     provider_response.code,
                     provider_response
                         .msg
@@ -764,7 +761,7 @@ impl FeishuLarkProvider {
         let data = provider_response.data.ok_or_else(|| {
             thread_reply_error(
                 &request,
-                "Feishu/Lark App Bot thread reply did not include message data",
+                "Feishu/Lark thread reply did not include message data",
             )
         })?;
         let provider_reply_message_id =
@@ -773,7 +770,7 @@ impl FeishuLarkProvider {
         if root_id != request.provider_thread_id {
             return Err(thread_reply_error(
                 &request,
-                "Feishu/Lark App Bot thread reply root_id did not match the response surface thread",
+                "Feishu/Lark thread reply root_id did not match the response surface thread",
             ));
         }
 
@@ -1141,7 +1138,7 @@ fn app_bot_surface_ready_receipt(
             signal,
             provider_id,
             provider_type,
-            "App Bot send response chat_id did not match provider config",
+            "Feishu/Lark app send response chat_id did not match provider config",
         ));
     }
 
@@ -1150,7 +1147,7 @@ fn app_bot_surface_ready_receipt(
             signal,
             provider_id,
             provider_type,
-            "App Bot send response did not include sender",
+            "Feishu/Lark app send response did not include sender",
         )
     })?;
     let tenant_key = required_app_bot_response_field(
@@ -1169,7 +1166,7 @@ fn app_bot_surface_ready_receipt(
             signal,
             provider_id,
             provider_type,
-            "App Bot send response tenant_key did not match provider config",
+            "Feishu/Lark app send response tenant_key did not match provider config",
         ));
     }
 
@@ -1209,7 +1206,7 @@ fn app_bot_thread_surface_ready_receipt(
             signal,
             provider_id,
             provider_type,
-            "App Bot thread message response root_id did not match target thread",
+            "Feishu/Lark thread message response root_id did not match target thread",
         ));
     }
 
@@ -1233,7 +1230,7 @@ fn required_app_bot_response_field(
             signal,
             provider_id,
             provider_type,
-            format!("App Bot send response did not include {field}"),
+            format!("Feishu/Lark app send response did not include {field}"),
         )
     })
 }
@@ -1248,7 +1245,7 @@ fn app_bot_response_error(
         DeliveryErrorKind::ProviderResponse,
         DeliveryErrorContext::provider_send(signal, provider_id, provider_type),
         format!(
-            "feishu_lark provider `{provider_id}` returned invalid App Bot send response: {}",
+            "feishu_lark provider `{provider_id}` returned invalid Feishu/Lark app send response: {}",
             message.into()
         ),
     ))
@@ -1278,7 +1275,7 @@ fn validate_app_bot_thread_reply_request(
     {
         return Err(thread_reply_error(
             request,
-            "provider thread reply request tenant did not match App Bot config",
+            "provider thread reply request tenant did not match Feishu/Lark app config",
         ));
     }
     if present(Some(request.provider_conversation_id.as_str())).is_none() {
@@ -1311,7 +1308,7 @@ fn required_thread_reply_response_field(
     present_owned(value).ok_or_else(|| {
         thread_reply_error(
             request,
-            format!("Feishu/Lark App Bot thread reply response did not include {field}"),
+            format!("Feishu/Lark thread reply response did not include {field}"),
         )
     })
 }

@@ -662,7 +662,7 @@ fn setup_provider_summary_reports_signature_without_exposing_secret() {
 }
 
 #[test]
-fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
+fn setup_provider_summary_reports_self_built_app_without_exposing_secret_value() {
     let config = setup::build_feishu_lark_app_bot_config(
         setup::AgentIntegrationId::CodexDesktop,
         AnswerDetail::Preview,
@@ -679,7 +679,7 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
     assert_eq!(
         summary,
         SetupProviderSummary {
-            provider_name: "Feishu/Lark App Bot",
+            provider_name: "Feishu/Lark Self-built App",
             fields: vec![
                 plain_summary_field("domain", "lark".to_string()),
                 plain_summary_field("app id", "cli_9f5343c580712544".to_string()),
@@ -689,7 +689,7 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
                     tone: SetupProviderSummaryTone::Success,
                 },
                 plain_summary_field(
-                    "default room",
+                    "fixed room",
                     "oc_5ce6d572455d361153b7xx51da133945".to_string(),
                 ),
                 plain_summary_field("tenant key", "2ca1d211f64f6438".to_string()),
@@ -701,7 +701,7 @@ fn setup_provider_summary_reports_app_bot_without_exposing_secret_value() {
 }
 
 #[test]
-fn setup_provider_summary_reports_personal_agent_without_default_room() {
+fn setup_provider_summary_reports_personal_agent_without_fixed_room() {
     let config = setup::build_feishu_lark_personal_agent_config(
         setup::AgentIntegrationId::CodexDesktop,
         AnswerDetail::Preview,
@@ -715,53 +715,7 @@ fn setup_provider_summary_reports_personal_agent_without_default_room() {
 
     assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
     assert!(summary.fields.iter().any(|field| {
-        field.label == "default room"
-            && field.value == "no global room; use direct chat or project rooms"
-    }));
-    assert!(summary.fields.iter().any(|field| {
-        field.label == "room events"
-            && field.value == "configured"
-            && field.tone == SetupProviderSummaryTone::Success
-    }));
-    let rendered = format!("{summary:?}");
-    assert!(!rendered.contains("test-app-secret"));
-}
-
-#[test]
-fn setup_provider_summary_reports_personal_agent_room_events_need_smoke() {
-    let config = RawConfig::from_toml_str(
-        r#"
-schema_version = 1
-
-[notification]
-answer_detail = "preview"
-
-[[providers]]
-id = "feishu_lark"
-type = "feishu_lark"
-mode = "app_bot"
-domain = "lark"
-app_id = "cli_9f5343c580712544"
-app_secret = "test-app-secret"
-
-[[sources]]
-id = "codex_desktop"
-type = "codex_desktop"
-
-[[routes]]
-sources = ["codex_desktop"]
-providers = ["feishu_lark"]
-"#,
-    )
-    .expect("old Personal Agent config should parse");
-
-    let summary = single_setup_provider_summary(&config);
-
-    assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
-    assert!(summary.fields.iter().any(|field| {
-        field.label == "room events"
-            && field.value == "configured; run a direct chat or room smoke"
-            && field.tone == SetupProviderSummaryTone::Warning
+        field.label == "routing" && field.value == "direct chat and project rooms"
     }));
     let rendered = format!("{summary:?}");
     assert!(!rendered.contains("test-app-secret"));
@@ -779,8 +733,10 @@ fn personal_agent_setup_uses_bind_as_the_project_filter() {
 
     let personal_agent_filters =
         feishu_lark_route_filters_for_mode(FeishuLarkSetupMode::PersonalAgentApp, &route_filters);
-    let app_bot_filters =
-        feishu_lark_route_filters_for_mode(FeishuLarkSetupMode::AppBotCredentials, &route_filters);
+    let app_bot_filters = feishu_lark_route_filters_for_mode(
+        FeishuLarkSetupMode::ExistingSelfBuiltApp,
+        &route_filters,
+    );
 
     assert_eq!(
         personal_agent_filters.minimum_task_duration_minutes,
@@ -815,7 +771,7 @@ fn setup_defaults_preserve_existing_app_bot_mode_and_fields() {
 
     assert_eq!(
         defaults.feishu_lark_mode,
-        Some(FeishuLarkSetupMode::AppBotCredentials)
+        Some(FeishuLarkSetupMode::ExistingSelfBuiltApp)
     );
     assert_eq!(defaults.feishu_lark_app_domain.as_deref(), Some("lark"));
     assert_eq!(
@@ -943,7 +899,7 @@ providers = ["feishu_lark"]
 
     assert_eq!(
         defaults.feishu_lark_mode,
-        Some(FeishuLarkSetupMode::AppBotCredentials)
+        Some(FeishuLarkSetupMode::ExistingSelfBuiltApp)
     );
     assert_eq!(defaults.feishu_lark_app_secret, None);
 }
@@ -1011,7 +967,7 @@ fn feishu_lark_mode_options_are_localized() {
 }
 
 #[test]
-fn app_bot_test_notification_body_explains_real_thread_reply_test() {
+fn self_built_app_test_notification_body_explains_real_thread_reply_test() {
     let config = setup::build_feishu_lark_app_bot_config(
         setup::AgentIntegrationId::CodexDesktop,
         AnswerDetail::Preview,
@@ -1025,14 +981,14 @@ fn app_bot_test_notification_body_explains_real_thread_reply_test() {
 
     let body = test_notification_body_for_config(&config);
 
-    assert!(body.contains("confirms the App Bot can send messages"));
+    assert!(body.contains("confirms your self-built app can send messages"));
     assert!(body.contains("Lark thread replies are Experimental"));
-    assert!(body.contains("Feishu App Bot uses the same setup shape"));
+    assert!(body.contains("Feishu uses the same app setup shape"));
     assert!(body.contains("Replies to this test message will not continue Codex"));
 }
 
 #[test]
-fn app_bot_test_notification_does_not_advertise_replies_for_unsupported_agents() {
+fn self_built_app_test_notification_does_not_advertise_replies_for_unsupported_agents() {
     let config = setup::build_feishu_lark_app_bot_config(
         setup::AgentIntegrationId::ClaudeCode,
         AnswerDetail::Preview,
@@ -1046,7 +1002,7 @@ fn app_bot_test_notification_does_not_advertise_replies_for_unsupported_agents()
 
     let body = test_notification_body_for_config(&config);
 
-    assert!(body.contains("confirms the App Bot can send messages"));
+    assert!(body.contains("confirms your self-built app can send messages"));
     assert!(body.contains("Replies are only available for Codex Desktop"));
     assert!(!body.contains("Lark thread replies are Experimental"));
 }

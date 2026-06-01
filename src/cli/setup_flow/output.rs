@@ -320,17 +320,11 @@ fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProv
                     ),
                 ];
                 fields.push(match present_summary_str(provider.chat_id.as_deref()) {
-                    Some(chat_id) => plain_summary_field("default room", chat_id.to_string()),
-                    None => plain_summary_field(
-                        "default room",
-                        "no global room; use direct chat or project rooms".to_string(),
-                    ),
+                    Some(chat_id) => plain_summary_field("fixed room", chat_id.to_string()),
+                    None => {
+                        plain_summary_field("routing", "direct chat and project rooms".to_string())
+                    }
                 });
-                if present_summary_str(provider.chat_id.as_deref()).is_none() {
-                    fields.push(personal_agent_room_events_summary_field(
-                        provider.app_registration_source.as_deref(),
-                    ));
-                }
                 if let Some(tenant_key) = present_summary_str(provider.tenant_key.as_deref()) {
                     fields.push(plain_summary_field("tenant key", tenant_key.to_string()));
                 }
@@ -351,35 +345,9 @@ fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProv
     }
 }
 
-fn personal_agent_room_events_summary_field(source: Option<&str>) -> SetupProviderSummaryField {
-    match lark_personal_agent_channel::registration_source_status(source) {
-        lark_personal_agent_channel::RegistrationSourceStatus::Current => {
-            SetupProviderSummaryField {
-                label: "room events",
-                value: "configured".to_string(),
-                tone: SetupProviderSummaryTone::Success,
-            }
-        }
-        lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
-            SetupProviderSummaryField {
-                label: "room events",
-                value: "configured; run a direct chat or room smoke".to_string(),
-                tone: SetupProviderSummaryTone::Warning,
-            }
-        }
-        lark_personal_agent_channel::RegistrationSourceStatus::Mismatch => {
-            SetupProviderSummaryField {
-                label: "room events",
-                value: "configured; source marker differs from this build".to_string(),
-                tone: SetupProviderSummaryTone::Warning,
-            }
-        }
-    }
-}
-
 fn feishu_lark_app_provider_summary_name(provider: &RawProviderConfig) -> &'static str {
     if present_summary_str(provider.chat_id.as_deref()).is_some() {
-        "Feishu/Lark App Bot"
+        "Feishu/Lark Self-built App"
     } else {
         "Feishu/Lark Personal Agent"
     }

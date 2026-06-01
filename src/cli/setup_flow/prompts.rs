@@ -391,7 +391,7 @@ pub(in crate::cli) fn prompt_for_feishu_lark_mode(
     let effective_default = default.unwrap_or_default();
     let options = [
         FeishuLarkSetupMode::PersonalAgentApp,
-        FeishuLarkSetupMode::AppBotCredentials,
+        FeishuLarkSetupMode::ExistingSelfBuiltApp,
         FeishuLarkSetupMode::CustomBotWebhook,
     ];
     let default_index = options
@@ -445,29 +445,16 @@ pub(in crate::cli) fn feishu_lark_mode_option_label(
                 "Personal Agent App".to_string()
             }
         }
-        FeishuLarkSetupMode::AppBotCredentials => {
-            if let Some(release_stage) =
-                agent.descriptor().continuation_capability().release_stage()
-            {
-                localized_string(
-                    i18n,
-                    format!(
-                        "Existing App Bot Credentials — {}",
-                        continuation_release_stage_label(release_stage, i18n)
-                    ),
-                    format!(
-                        "Existing App Bot Credentials — {}",
-                        continuation_release_stage_label(release_stage, i18n)
-                    ),
-                )
-            } else {
-                "Existing App Bot Credentials".to_string()
-            }
-        }
+        FeishuLarkSetupMode::ExistingSelfBuiltApp => localized(
+            i18n,
+            "Existing Self-built App — Advanced",
+            "已有自建应用 — 高级",
+        )
+        .to_string(),
         FeishuLarkSetupMode::CustomBotWebhook => localized(
             i18n,
-            "Custom Bot Webhook — Fallback",
-            "Custom Bot Webhook — 备用",
+            "Incoming Webhook — One-way fallback",
+            "群 Webhook — 单向备用",
         )
         .to_string(),
     };
@@ -507,7 +494,7 @@ pub(in crate::cli) fn feishu_lark_mode_option_description(
                 )
             }
         }
-        FeishuLarkSetupMode::AppBotCredentials => {
+        FeishuLarkSetupMode::ExistingSelfBuiltApp => {
             if agent
                 .descriptor()
                 .continuation_capability()
@@ -516,14 +503,14 @@ pub(in crate::cli) fn feishu_lark_mode_option_description(
             {
                 localized(
                     i18n,
-                    "Use an existing self-built app and a default room Chat ID. Lark thread replies can continue Codex Desktop sessions.",
-                    "使用已有自建应用和默认群 Chat ID。Lark thread 回复可以继续 Codex Desktop session。",
+                    "Use an existing self-built app with one fixed room. Advanced setup; Personal Agent is recommended. Codex Desktop thread replies are experimental.",
+                    "使用已有自建应用连接一个固定群。高级配置；默认推荐 Personal Agent。Codex Desktop thread 回复仍是实验性。",
                 )
             } else {
                 localized(
                     i18n,
-                    "Use an existing self-built app and a default room Chat ID.",
-                    "使用已有自建应用和默认群 Chat ID。",
+                    "Use an existing self-built app with one fixed room. Advanced setup; Personal Agent is recommended.",
+                    "使用已有自建应用连接一个固定群。高级配置；默认推荐 Personal Agent。",
                 )
             }
         }
@@ -684,7 +671,7 @@ pub(in crate::cli) fn prompt_for_feishu_lark_app_domain(
         .items(&items)
         .default(default_index)
         .interact()
-        .context("failed to read Feishu/Lark App Bot domain")?;
+        .context("failed to read Feishu/Lark app domain")?;
 
     setup::resolve_feishu_lark_app_domain(options[selection])
 }
@@ -742,10 +729,10 @@ pub(in crate::cli) fn prompt_for_feishu_lark_chat_id(
     current_chat_id: Option<&str>,
 ) -> anyhow::Result<String> {
     prompt_for_required_feishu_lark_app_bot_field(
-        "Chat ID",
+        "Room Chat ID",
         current_chat_id,
         setup::resolve_feishu_lark_chat_id,
-        "failed to read Feishu/Lark chat_id",
+        "failed to read Feishu/Lark room chat_id",
     )
 }
 

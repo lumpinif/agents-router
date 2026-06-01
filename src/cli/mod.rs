@@ -33,6 +33,7 @@ use agents_router::config::{
 };
 use agents_router::delivery_safety::DeliverySafetyGuard;
 use agents_router::i18n::{I18n, Text};
+#[cfg(test)]
 use agents_router::lark_personal_agent_channel;
 use agents_router::legacy;
 use agents_router::local_ingress::{self, LocalSignalEvent};
@@ -771,7 +772,7 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
         {
             "Feishu/Lark Personal Agent"
         } else {
-            "Feishu/Lark App Bot"
+            "Feishu/Lark Self-built App"
         };
         print_section(section_title);
         for target in &feishu_lark_app_bot_targets {
@@ -787,19 +788,18 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
                 },
             );
             print_field(
-                "default room",
+                if target.chat_id.is_some() {
+                    "fixed room"
+                } else {
+                    "routing"
+                },
                 target
                     .chat_id
                     .as_deref()
                     .map(|chat_id| style(chat_id).green().to_string())
-                    .unwrap_or_else(|| {
-                        "no global room; use direct chat or project rooms".to_string()
-                    }),
+                    .unwrap_or_else(|| "direct chat and project rooms".to_string()),
             );
             if target.chat_id.is_none() {
-                print_personal_agent_room_event_registration_status(
-                    target.app_registration_source.as_deref(),
-                );
                 print_personal_agent_project_rooms_status(&target.provider_id);
             }
             if let Some(tenant_key) = target.tenant_key.as_deref() {
@@ -1003,26 +1003,6 @@ fn print_status_notification_targets(config_path: &Path) {
     }
 }
 
-fn print_personal_agent_room_event_registration_status(source: Option<&str>) {
-    match lark_personal_agent_channel::registration_source_status(source) {
-        lark_personal_agent_channel::RegistrationSourceStatus::Current => {
-            print_field("room events", style("ready").green());
-        }
-        lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
-            print_field(
-                "room events",
-                style("configured; run a direct chat or room smoke").yellow(),
-            );
-        }
-        lark_personal_agent_channel::RegistrationSourceStatus::Mismatch => {
-            print_field(
-                "room events",
-                style("configured; source marker differs from this build").yellow(),
-            );
-        }
-    }
-}
-
 fn print_personal_agent_project_rooms_status(provider_id: &str) {
     let status = bridge_binding_ledger_path()
         .and_then(BridgeBindingLedger::load)
@@ -1204,7 +1184,7 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
                 FeishuLarkSetupMode::CustomBotWebhook => {
                     wait_for_enter(i18n.text(Text::SendTestPromptFeishuLark))?;
                 }
-                FeishuLarkSetupMode::AppBotCredentials => {
+                FeishuLarkSetupMode::ExistingSelfBuiltApp => {
                     let prompt =
                         localized(i18n, "Send a test message now?", "现在发送一条测试消息？");
                     if !prompt_confirm(prompt, true)? {
@@ -1213,7 +1193,7 @@ async fn finish_guided_setup(setup: GuidedSetup, i18n: I18n) -> anyhow::Result<(
                         println!("{}", style(i18n.text(Text::SetupComplete)).green());
                         return Ok(());
                     }
-                    test_body = feishu_lark_app_bot_test_notification_body(
+                    test_body = feishu_lark_self_built_app_test_notification_body(
                         agent.descriptor().continuation_capability().release_stage(),
                     );
                 }
@@ -1578,23 +1558,23 @@ fn test_notification_body_for_config(config: &RawConfig) -> String {
         provider.provider_type == ProviderType::FeishuLark
             && provider.mode.as_deref() == Some("app_bot")
     }) {
-        feishu_lark_app_bot_test_notification_body(response_surface_release_stage_for_config(
-            config,
-        ))
+        feishu_lark_self_built_app_test_notification_body(
+            response_surface_release_stage_for_config(config),
+        )
     } else {
         default_test_notification_body()
     }
 }
 
-fn feishu_lark_app_bot_test_notification_body(
+fn feishu_lark_self_built_app_test_notification_body(
     release_stage: Option<ContinuationReleaseStage>,
 ) -> String {
     match release_stage {
         Some(stage) => format!(
-            "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nLark thread replies are {}; Feishu App Bot uses the same setup shape, but validate replies in your workspace before relying on them. To test replies, wait for a new real Codex Desktop completion notification here. In that notification's thread, mention the bot; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex.",
+            "Agents Router Lark test.\n\nThis confirms your self-built app can send messages to this Lark/Feishu group.\n\nLark thread replies are {}; Feishu uses the same app setup shape, but validate replies in your workspace before relying on them. To test replies, wait for a new real Codex Desktop completion notification here. In that notification's thread, mention the Personal Agent; Codex will send the result back in the same thread.\n\nReplies to this test message will not continue Codex.",
             release_stage_sentence_label(stage)
         ),
-        None => "Agents Router App Bot test.\n\nThis confirms the App Bot can send messages to this Lark/Feishu group.\n\nReplies are only available for Codex Desktop when continuation support is available.\n\nReplies to this test message will not continue Codex.".to_string(),
+        None => "Agents Router Lark test.\n\nThis confirms your self-built app can send messages to this Lark/Feishu group.\n\nReplies are only available for Codex Desktop when continuation support is available.\n\nReplies to this test message will not continue Codex.".to_string(),
     }
 }
 

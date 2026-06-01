@@ -1095,7 +1095,8 @@ sources = ["codex_cli"]
 providers = ["work_lark_app"]
 "#;
 
-    let config = ValidatedConfig::from_toml_str(raw).expect("explicit App Bot config should parse");
+    let config =
+        ValidatedConfig::from_toml_str(raw).expect("explicit Feishu/Lark app config should parse");
     let provider = config
         .provider("work_lark_app")
         .expect("validated provider should exist");
@@ -1184,7 +1185,7 @@ providers = ["work_lark_app"]
 "#;
 
     let err = ValidatedConfig::from_toml_str(raw)
-        .expect_err("App Bot fields without explicit mode should fail");
+        .expect_err("Feishu/Lark app fields without explicit mode should fail");
 
     assert!(matches!(
         err,
@@ -1249,8 +1250,8 @@ sources = ["codex_cli"]
 providers = ["work_chat"]
 "#;
 
-    let err =
-        ValidatedConfig::from_toml_str(raw).expect_err("Custom Bot must not accept App Bot fields");
+    let err = ValidatedConfig::from_toml_str(raw)
+        .expect_err("incoming webhook must not accept Feishu/Lark app fields");
 
     assert!(matches!(
         err,
@@ -1313,7 +1314,7 @@ providers = ["work_lark_app"]
 "#;
 
     let err = ValidatedConfig::from_toml_str(raw)
-        .expect_err("unsupported Feishu/Lark App Bot domain should fail");
+        .expect_err("unsupported Feishu/Lark app domain should fail");
 
     assert!(matches!(
         err,

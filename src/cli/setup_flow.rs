@@ -77,7 +77,7 @@ pub(super) enum GuidedSetup {
 pub(super) enum FeishuLarkSetupMode {
     #[default]
     PersonalAgentApp,
-    AppBotCredentials,
+    ExistingSelfBuiltApp,
     CustomBotWebhook,
 }
 
@@ -254,7 +254,7 @@ impl SetupDefaults {
 
 fn feishu_lark_setup_mode_from_raw_provider(provider: &RawProviderConfig) -> FeishuLarkSetupMode {
     match provider.mode.as_deref() {
-        Some("app_bot") if provider.chat_id.is_some() => FeishuLarkSetupMode::AppBotCredentials,
+        Some("app_bot") if provider.chat_id.is_some() => FeishuLarkSetupMode::ExistingSelfBuiltApp,
         Some("app_bot") => FeishuLarkSetupMode::PersonalAgentApp,
         _ => FeishuLarkSetupMode::CustomBotWebhook,
     }
@@ -921,7 +921,7 @@ pub(super) async fn run_feishu_lark_setup(
                 secret,
             )
         }
-        FeishuLarkSetupMode::AppBotCredentials => {
+        FeishuLarkSetupMode::ExistingSelfBuiltApp => {
             print_feishu_lark_app_bot_setup_checklist(i18n);
             let domain = prompt_for_feishu_lark_app_domain(
                 defaults.feishu_lark_app_domain.as_deref(),
@@ -1097,7 +1097,7 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
     println!();
     match i18n.language() {
         CliLanguage::English => {
-            println!("App Bot checklist:");
+            println!("Self-built app checklist:");
             println!("- Add Bot capability.");
             println!(
                 "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly."
@@ -1112,7 +1112,7 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             );
         }
         CliLanguage::SimplifiedChinese => {
-            println!("App Bot 检查清单:");
+            println!("自建应用检查清单:");
             println!("- 添加 Bot 能力。");
             println!(
                 "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly。"

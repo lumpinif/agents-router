@@ -140,7 +140,7 @@ Then setup asks for three choices:
 2. Where should notifications go?
 3. Which completed tasks should send notifications?
 
-Then it writes config and starts the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent has no global default room: scan the QR code, then either use direct chat with `/bind /absolute/project/path` to start new Codex threads, or add the Personal Agent to a room and mention it with `/bind /absolute/project/path` to create a project room.
+Then it writes config and starts the service. Providers with a fixed destination send a test notification. Feishu/Lark Personal Agent does not choose a single room during setup: scan the QR code, then either use direct chat with `/bind /absolute/project/path` to start new Codex threads, or add the Personal Agent to a room and mention it with `/bind /absolute/project/path` to create a project room.
 
 For optional settings such as answer detail, prompt inclusion, and advanced project filters, see [Setup](docs/setup.md).
 

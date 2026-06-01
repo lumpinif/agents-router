@@ -240,7 +240,7 @@ fn writes_parseable_feishu_lark_app_bot_config_with_codex_reply_route() {
     let parsed = read_valid_written_config(&path);
     let provider = parsed
         .provider("feishu_lark")
-        .expect("App Bot provider should be configured");
+        .expect("Feishu/Lark app provider should be configured");
     assert_eq!(provider.mode.as_deref(), Some("app_bot"));
     assert_eq!(provider.domain.as_deref(), Some("lark"));
     assert_eq!(provider.app_secret.as_deref(), Some("test-app-secret"));

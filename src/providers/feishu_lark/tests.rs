@@ -646,7 +646,7 @@ async fn personal_agent_without_default_room_can_reply_to_bound_thread() {
             "Connected this room to:\n/Users/felix/Desktop/felix-projects/agents-router",
         ))
         .await
-        .expect("Personal Agent should reply to the inbound command thread without a default room");
+        .expect("Personal Agent should reply to the inbound command thread without a fixed room");
 
     assert_eq!(
         result.provider_reply_message_id.as_deref(),

@@ -669,19 +669,19 @@ pub enum ConfigError {
     #[error("feishu_lark provider `{provider_id}` has unsupported mode `{mode}`")]
     InvalidFeishuLarkMode { provider_id: String, mode: String },
     #[error(
-        "feishu_lark provider `{provider_id}` must set `mode = \"app_bot\"` before using App Bot fields"
+        "feishu_lark provider `{provider_id}` must set `mode = \"app_bot\"` before using Feishu/Lark app credential fields"
     )]
     MissingFeishuLarkAppBotMode { provider_id: String },
-    #[error("feishu_lark App Bot provider `{provider_id}` must not set Custom Bot webhook fields")]
+    #[error("feishu_lark app provider `{provider_id}` must not set incoming webhook fields")]
     InvalidFeishuLarkAppBotWebhookFields { provider_id: String },
     #[error(
-        "feishu_lark Custom Bot provider `{provider_id}` must not set App Bot credential or tenant fields"
+        "feishu_lark incoming webhook provider `{provider_id}` must not set Feishu/Lark app credential or tenant fields"
     )]
     InvalidFeishuLarkCustomBotAppFields { provider_id: String },
-    #[error("feishu_lark App Bot provider `{provider_id}` has unsupported domain `{domain}`")]
+    #[error("feishu_lark app provider `{provider_id}` has unsupported domain `{domain}`")]
     InvalidFeishuLarkAppBotDomain { provider_id: String, domain: String },
     #[error(
-        "feishu_lark App Bot provider `{provider_id}` must set exactly one of `app_secret` or `app_secret_env`"
+        "feishu_lark app provider `{provider_id}` must set exactly one of `app_secret` or `app_secret_env`"
     )]
     InvalidFeishuLarkAppSecretSource { provider_id: String },
     #[error(

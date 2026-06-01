@@ -100,7 +100,9 @@ impl FeishuLarkLongConnectionConfig {
         let ProviderConfigDetail::FeishuLark(FeishuLarkProviderConfig::AppBot(detail)) =
             &provider.detail
         else {
-            anyhow::bail!("Feishu/Lark long connection runtime requires explicit App Bot mode");
+            anyhow::bail!(
+                "Feishu/Lark long connection runtime requires `mode = \"app_bot\"` app credentials"
+            );
         };
 
         let app_secret = detail
@@ -110,7 +112,7 @@ impl FeishuLarkLongConnectionConfig {
                 ProviderType::FeishuLark.as_str(),
                 "app_secret",
             )
-            .context("failed to resolve Feishu/Lark App Bot app_secret")?;
+            .context("failed to resolve Feishu/Lark app secret")?;
 
         ensure!(
             !detail.app_id.trim().is_empty(),
@@ -704,7 +706,7 @@ impl FeishuLarkLongConnectionRuntime {
         );
         ensure!(
             ready.reply.provider_mode == ProviderMode::FeishuLarkAppBot,
-            "claimed Feishu/Lark event must come from App Bot mode"
+            "claimed Feishu/Lark event must come from `mode = \"app_bot\"` app credentials"
         );
         Ok(())
     }
@@ -1440,7 +1442,7 @@ mod tests {
         })
         .expect_err("Custom Bot must not enter long connection runtime");
 
-        assert!(error.to_string().contains("explicit App Bot mode"));
+        assert!(error.to_string().contains("mode = \"app_bot\""));
     }
 
     #[test]
@@ -2135,7 +2137,7 @@ mod tests {
             routes: vec![route],
         }
         .validate()
-        .expect("Personal Agent config should validate without a default room")
+        .expect("Personal Agent config should validate without a fixed room")
     }
 
     fn ledger_with_lark_surface(now: DateTime<Utc>) -> ResponseSurfaceLedger {

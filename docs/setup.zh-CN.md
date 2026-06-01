@@ -110,16 +110,16 @@ Provider 教程：
 Personal Agent App — Experimental
   扫码创建 Personal Agent，把它拉进 Lark 或飞书群，然后 @ 它并发送 `/bind` 连接项目群。
 
-Existing App Bot Credentials — Experimental
-  使用已有自建应用和默认群 Chat ID。Lark thread replies 可以继续 Codex Desktop session；依赖 Feishu replies 前请先在自己的 workspace 验证。
+已有自建应用 — 高级
+  使用已有自建应用连接一个固定群。高级配置；默认推荐 Personal Agent。Codex Desktop thread 回复仍是实验性。
 
-Custom Bot Webhook — Fallback
+群 Webhook — 单向备用
   单向发送通知到一个群。不支持回复或项目群。
 ```
 
 Personal Agent App 是默认推荐选项，因为它支持双向 project room 体验：扫码 setup、`/bind`、一个 Codex thread 对应一个 Lark thread。setup 会显示 QR code，扫码创建 Personal Agent app，并在完成后提示你把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。
 
-如果你已经有自建应用并且明确想配置固定默认群，请选择 Existing App Bot Credentials。如果你只想要一个简单的单向 fallback，请选择 Custom Bot Webhook。
+如果你已经有自建应用并且明确想连接一个固定群，请选择“已有自建应用”。如果你只想要一个简单的单向 fallback，请选择“群 Webhook”。
 
 ## Provider ID
 

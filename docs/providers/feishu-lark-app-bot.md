@@ -104,7 +104,7 @@ Use `/help` to list the commands. Use `/status` in direct chat to see the defaul
 
 ## What Setup Writes
 
-Personal Agent setup writes an app-bot provider without a default room:
+Personal Agent setup writes Feishu/Lark app credentials without choosing one fixed room:
 
 ```toml
 [[providers]]
@@ -118,37 +118,22 @@ app_registration_source = "agents-router"
 ```
 
 That is intentional. Direct chat default projects and project rooms are selected by `/bind`, not by a single global `chat_id`.
-The `app_registration_source` line records which local Agents Router runtime created the Personal Agent. It is local metadata, not proof that Feishu/Lark events are arriving. The real check is a direct chat or room smoke.
+`mode = "app_bot"` is the internal Feishu/Lark API mode. It does not mean you chose the advanced fixed-room setup.
+The `app_registration_source` line records which local Agents Router runtime created the Personal Agent. It is local metadata, not proof that Feishu/Lark events are arriving. The real check is sending a command in direct chat or in a project room.
 
 Do not paste App Secret into chat, docs, screenshots, or issue reports. Setup stores it only in your local Agents Router config.
 
-## Test the Experience
-
-Personal Agent setup does not send a setup test message, because there is no global default room yet.
-
-To test the real path:
-
-1. Direct chat: send `/bind /absolute/project/path`.
-2. Direct chat: send a harmless prompt, such as `Reply exactly OK.` It should start a new Codex Desktop thread and reply in the same direct chat thread.
-3. Project room: add the Personal Agent to a room.
-4. Project room: mention the Personal Agent and send `/bind /absolute/project/path`.
-5. Create a new Codex Desktop update from that project.
-6. Open the Feishu/Lark thread created by Agents Router.
-7. Mention the Personal Agent in that thread.
-
-The reply should continue the same Codex Desktop thread and the result should come back to the same Feishu/Lark thread.
-
 Old notifications, setup test messages, and messages outside a bound thread are not continuation surfaces.
 
-## Existing App Bot Credentials
+## Existing Self-built App
 
-Use this mode only when you already manage a self-built app and want a fixed default room.
+Use this mode only when you already manage a self-built app and want one fixed room.
 
 Choose:
 
 ```text
 Feishu/Lark
-Existing App Bot Credentials
+Existing Self-built App
 ```
 
 You need:
@@ -158,8 +143,8 @@ You need:
 - App ID.
 - App Secret from the app console.
 - Tenant Key.
-- Chat ID for the default room.
-- The bot added to the default room.
+- Room Chat ID.
+- The bot added to that room.
 
 Enable these permissions:
 
@@ -190,10 +175,10 @@ domain: lark
 App ID: cli_...
 App Secret: paste from the app console
 Tenant Key: ...
-Chat ID: oc_...
+Room Chat ID: oc_...
 ```
 
-Existing App Bot Credentials can send a setup test message because it has a fixed default room. That test message only confirms send permission. It is not a Codex continuation surface.
+Existing Self-built App can send a setup test message because it has one fixed room. That test message only confirms send permission. It is not a Codex continuation surface.
 
 ## Troubleshooting
 
@@ -202,13 +187,13 @@ Check these first:
 - The Personal Agent was added to the room.
 - `/bind` used an absolute folder path on this computer.
 - The local Agents Router service is running.
-- `agents-router status` shows `room events: ready` for the Personal Agent.
+- `agents-router status` shows the Personal Agent and the expected project room binding.
 - The project path in `/bind` matches the project that produced the Codex Desktop update.
 - In shared rooms and threads, the Feishu/Lark reply mentions the Personal Agent.
 - The Feishu/Lark reply is inside the Agents Router thread, not a new root message.
 - App Secret is present in the local config, or `app_secret_env` is configured manually.
 
-For Existing App Bot Credentials, also check:
+For Existing Self-built App, also check:
 
 - The app version was published after permission or event changes.
 - Admin approval is complete, if required by your workspace.
