@@ -109,7 +109,7 @@ When you choose Feishu/Lark, setup asks for the mode:
 
 ```text
 Personal Agent App — Experimental
-  Scan a QR code, add the Personal Agent to Lark or Feishu rooms, then mention it and send `/bind` to connect project rooms.
+  Scan a QR code. Direct chat can start new Codex threads after `/bind`; rooms use @ plus `/bind` for project updates.
 
 Existing App Bot Credentials
   Use an existing self-built app and a default room Chat ID. Lark thread replies can continue Codex Desktop sessions as an Experimental path.
@@ -118,7 +118,7 @@ Custom Bot Webhook — Fallback
   Send one-way notifications to one group. No replies or project rooms.
 ```
 
-Personal Agent App is the recommended default for the two-way Codex Desktop setup. Setup shows a QR code, asks you to scan it and finish creating the Personal Agent app on the page that opens, stores the app credentials locally, and then tells you to add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`. Keep the setup terminal open after scanning; setup continues automatically after the app is created.
+Personal Agent App is the recommended default for the two-way Codex Desktop setup. Setup shows a QR code, asks you to scan it and finish creating the Personal Agent app on the page that opens, and stores the app credentials locally. After that, direct chat can use `/bind /absolute/project/path` and then plain messages to start new Codex threads. Project rooms work by adding the Personal Agent to a room, mentioning it, and sending `/bind /absolute/project/path`. Keep the setup terminal open after scanning; setup continues automatically after the app is created.
 
 Use Existing App Bot Credentials only when you already manage a self-built app and want a fixed default room. It requires Bot capability, message permissions, `im.message.receive_v1`, Long Connection / WebSocket, Tenant Key, Chat ID, and a published app version. Setup links to the full [Feishu/Lark Personal Agent guide](providers/feishu-lark-app-bot.md).
 

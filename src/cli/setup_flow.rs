@@ -1035,14 +1035,20 @@ fn print_existing_personal_agent_reuse_notice(i18n: I18n) {
             println!("Personal Agent setup:");
             println!("- Reusing the Personal Agent app already saved in this config.");
             println!(
-                "- After setup, add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
+                "- Direct chat: send `/bind /absolute/project/path`, then send any message to start a new Codex thread."
+            );
+            println!(
+                "- Project rooms: add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
             );
         }
         CliLanguage::SimplifiedChinese => {
             println!("Personal Agent setup:");
             println!("- 复用当前 config 里已经保存的 Personal Agent app。");
             println!(
-                "- setup 结束后，把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
+                "- 私聊：发送 `/bind /absolute/project/path`，之后直接发消息就会启动新的 Codex thread。"
+            );
+            println!(
+                "- 项目群：把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
             );
         }
     }
@@ -1059,10 +1065,13 @@ fn print_feishu_lark_personal_agent_setup_intro(i18n: I18n) {
             );
             println!("- Keep this terminal open; setup continues automatically after creation.");
             println!(
-                "- After setup, add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
+                "- Direct chat: send `/bind /absolute/project/path`, then send any message to start a new Codex thread."
             );
             println!(
-                "- New Codex Desktop updates from that project will land in that room, with one Lark thread per Codex thread."
+                "- Project rooms: add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`."
+            );
+            println!(
+                "- New Codex Desktop updates from a bound project land in that room, with one Lark thread per Codex thread."
             );
         }
         CliLanguage::SimplifiedChinese => {
@@ -1071,10 +1080,13 @@ fn print_feishu_lark_personal_agent_setup_intro(i18n: I18n) {
             println!("- 用 Lark 或飞书扫码，然后在打开的页面里完成 Personal Agent app 创建。");
             println!("- 保持这个终端打开；创建成功后 setup 会自动继续。");
             println!(
-                "- setup 结束后，把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
+                "- 私聊：发送 `/bind /absolute/project/path`，之后直接发消息就会启动新的 Codex thread。"
             );
             println!(
-                "- 之后这个项目的新 Codex Desktop 更新会进入这个群，一个 Codex thread 对应一个 Lark thread。"
+                "- 项目群：把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。"
+            );
+            println!(
+                "- 绑定项目的新 Codex Desktop 更新会进入项目群，一个 Codex thread 对应一个 Lark thread。"
             );
         }
     }

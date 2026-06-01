@@ -793,7 +793,7 @@ fn print_notification_targets(config: &RawConfig, i18n: I18n) {
                     .as_deref()
                     .map(|chat_id| style(chat_id).green().to_string())
                     .unwrap_or_else(|| {
-                        "project rooms only; mention the agent and send `/bind` in Lark".to_string()
+                        "no global room; use direct chat or project rooms".to_string()
                     }),
             );
             if target.chat_id.is_none() {
@@ -1011,7 +1011,7 @@ fn print_personal_agent_room_event_registration_status(source: Option<&str>) {
         lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
             print_field(
                 "room events",
-                style("configured; run a room smoke to verify `/bind`").yellow(),
+                style("configured; run a direct chat or room smoke").yellow(),
             );
         }
         lark_personal_agent_channel::RegistrationSourceStatus::Mismatch => {
@@ -1353,21 +1353,27 @@ fn print_personal_agent_room_binding_next_steps(i18n: I18n) {
     match i18n.language() {
         CliLanguage::English => {
             println!("Next:");
-            println!("1. Add the Personal Agent to a Lark or Feishu room.");
             println!(
-                "2. In that room, mention the Personal Agent and send `/bind /absolute/project/path`."
+                "1. Direct chat: send `/bind /absolute/project/path`, then send any message to start a new Codex thread."
             );
-            println!("3. Wait for a new Codex Desktop update from that project.");
+            println!("2. Project room: add the Personal Agent to a Lark or Feishu room.");
             println!(
-                "4. In the Lark thread, mention the Personal Agent to continue the same Codex thread."
+                "3. In that room, mention the Personal Agent and send `/bind /absolute/project/path`."
+            );
+            println!("4. New Codex Desktop updates from that project will appear in the room.");
+            println!(
+                "5. In a Lark thread, mention the Personal Agent to continue that same Codex thread."
             );
         }
         CliLanguage::SimplifiedChinese => {
             println!("下一步：");
-            println!("1. 把 Personal Agent 拉进一个 Lark 或飞书群。");
-            println!("2. 在这个群里 @ Personal Agent，并发送 `/bind /absolute/project/path`。");
-            println!("3. 等这个项目产生新的 Codex Desktop 更新。");
-            println!("4. 在对应 Lark thread 里 @ Personal Agent，就会继续同一个 Codex thread。");
+            println!(
+                "1. 私聊：发送 `/bind /absolute/project/path`，之后直接发消息就会启动新的 Codex thread。"
+            );
+            println!("2. 项目群：把 Personal Agent 拉进一个 Lark 或飞书群。");
+            println!("3. 在这个群里 @ Personal Agent，并发送 `/bind /absolute/project/path`。");
+            println!("4. 之后这个项目的新 Codex Desktop 更新会进入这个群。");
+            println!("5. 在对应 Lark thread 里 @ Personal Agent，就会继续同一个 Codex thread。");
         }
     }
 }

@@ -716,7 +716,7 @@ fn setup_provider_summary_reports_personal_agent_without_default_room() {
     assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
     assert!(summary.fields.iter().any(|field| {
         field.label == "default room"
-            && field.value == "project rooms only; mention the agent and send `/bind` in Lark"
+            && field.value == "no global room; use direct chat or project rooms"
     }));
     assert!(summary.fields.iter().any(|field| {
         field.label == "room events"
@@ -760,7 +760,7 @@ providers = ["feishu_lark"]
     assert_eq!(summary.provider_name, "Feishu/Lark Personal Agent");
     assert!(summary.fields.iter().any(|field| {
         field.label == "room events"
-            && field.value == "configured; run a room smoke to verify `/bind`"
+            && field.value == "configured; run a direct chat or room smoke"
             && field.tone == SetupProviderSummaryTone::Warning
     }));
     let rendered = format!("{summary:?}");
@@ -1006,7 +1006,7 @@ fn feishu_lark_mode_options_are_localized() {
             setup::AgentIntegrationId::CodexDesktop,
             I18n::new(CliLanguage::English),
         )
-        .contains("mention it and send `/bind`")
+        .contains("Direct chat can start new Codex threads")
     );
 }
 

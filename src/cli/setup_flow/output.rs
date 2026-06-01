@@ -323,8 +323,7 @@ fn feishu_lark_setup_provider_summary(provider: &RawProviderConfig) -> SetupProv
                     Some(chat_id) => plain_summary_field("default room", chat_id.to_string()),
                     None => plain_summary_field(
                         "default room",
-                        "project rooms only; mention the agent and send `/bind` in Lark"
-                            .to_string(),
+                        "no global room; use direct chat or project rooms".to_string(),
                     ),
                 });
                 if present_summary_str(provider.chat_id.as_deref()).is_none() {
@@ -364,7 +363,7 @@ fn personal_agent_room_events_summary_field(source: Option<&str>) -> SetupProvid
         lark_personal_agent_channel::RegistrationSourceStatus::Missing => {
             SetupProviderSummaryField {
                 label: "room events",
-                value: "configured; run a room smoke to verify `/bind`".to_string(),
+                value: "configured; run a direct chat or room smoke".to_string(),
                 tone: SetupProviderSummaryTone::Warning,
             }
         }

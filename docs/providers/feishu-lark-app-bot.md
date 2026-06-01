@@ -9,11 +9,13 @@ agents-router setup
 -> Feishu/Lark
 -> Personal Agent App
 -> scan the QR code
--> add the Personal Agent to a room
--> mention the Personal Agent and send /bind /absolute/project/path in that room
+-> direct chat: /bind /absolute/project/path, then send any message
+-> project room: add the Personal Agent, mention it, then send /bind /absolute/project/path
 ```
 
-After that, new Codex Desktop updates from that project land in the bound room. One Codex thread maps to one Feishu/Lark thread. In shared rooms and threads, mention the Personal Agent to continue the same Codex thread through the Experimental reply path. In a one-on-one chat with the Personal Agent, no mention is needed.
+Direct chat is for starting new Codex threads from Lark. Set a default project with `/bind /absolute/project/path`, then send any plain message to start a new Codex thread in that project.
+
+Project rooms are for project updates and team control. After `/bind`, new Codex Desktop updates from that project land in the bound room. One Codex thread maps to one Feishu/Lark thread. In shared rooms and threads, mention the Personal Agent to continue the same Codex thread through the Experimental reply path. In a one-on-one chat with the Personal Agent, no mention is needed.
 
 There is no history backfill. Old Codex sessions and old Feishu/Lark messages are not copied into Lark. Agents Router only sends new updates after the room is connected.
 
@@ -45,7 +47,20 @@ Personal Agent App
 
 Setup shows a QR code in your terminal. Scan it with Feishu or Lark, then finish creating the Personal Agent app on the page that opens. Keep the terminal open after scanning; setup continues automatically after the app is created. Agents Router then stores the Personal Agent app credentials in your local config.
 
-Then open Feishu or Lark:
+Then choose how you want to use it.
+
+For direct chat:
+
+1. Open a one-on-one chat with the Personal Agent.
+2. Send:
+
+```text
+/bind /Users/you/path/to/project
+```
+
+3. After that, send any plain message to start a new Codex thread in that project.
+
+For a project room:
 
 1. Create or open the room you want to use for a project.
 2. Add the Personal Agent to that room.
@@ -59,19 +74,33 @@ Use a real absolute folder path on this computer. The first version does not sca
 
 After `/bind`, new updates from that project are sent to that room. If a new Codex Desktop thread creates an update, Agents Router creates or reuses the matching Feishu/Lark thread for that Codex thread. Mention the Personal Agent in that Feishu/Lark thread to continue the same Codex thread.
 
-## Room Commands
+## Commands
 
 In shared rooms and threads, mention the Personal Agent before each command. In a one-on-one chat with the Personal Agent, no mention is needed.
+
+Direct chat:
 
 ```text
 /help
 /status
 /bind /absolute/project/path
+/new what you want Codex to do
+/new /absolute/project/path what you want Codex to do
+/unbind
+```
+
+Room:
+
+```text
+/help
+/status
+/bind /absolute/project/path
+/new what you want Codex to do
 /unbind /absolute/project/path
 /unbind
 ```
 
-Use `/help` to list the commands. Use `/status` in a project room to see which local projects are connected to that room. Use `/unbind /absolute/project/path` to disconnect one project from the room, or `/unbind` to disconnect all projects from that room.
+Use `/help` to list the commands. Use `/status` in direct chat to see the default project. Use `/status` in a project room to see which local projects are connected to that room. Use `/unbind` in direct chat to clear the default project. Use `/unbind /absolute/project/path` in a room to disconnect one project from the room, or `/unbind` to disconnect all projects from that room.
 
 ## What Setup Writes
 
@@ -88,22 +117,24 @@ app_secret = "..."
 app_registration_source = "agents-router"
 ```
 
-That is intentional. Project rooms are selected by `/bind`, not by a single global `chat_id`.
-The `app_registration_source` line records which local Agents Router runtime created the Personal Agent. It is local metadata, not proof that Feishu/Lark room events are arriving. The real check is a room smoke: add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`.
+That is intentional. Direct chat default projects and project rooms are selected by `/bind`, not by a single global `chat_id`.
+The `app_registration_source` line records which local Agents Router runtime created the Personal Agent. It is local metadata, not proof that Feishu/Lark events are arriving. The real check is a direct chat or room smoke.
 
 Do not paste App Secret into chat, docs, screenshots, or issue reports. Setup stores it only in your local Agents Router config.
 
 ## Test the Experience
 
-Personal Agent setup does not send a setup test message, because there is no default room yet.
+Personal Agent setup does not send a setup test message, because there is no global default room yet.
 
 To test the real path:
 
-1. Add the Personal Agent to a room.
-2. Mention the Personal Agent and send `/bind /absolute/project/path` in that room.
-3. Create a new Codex Desktop update from that project.
-4. Open the Feishu/Lark thread created by Agents Router.
-5. Mention the Personal Agent in that thread.
+1. Direct chat: send `/bind /absolute/project/path`.
+2. Direct chat: send a harmless prompt, such as `Reply exactly OK.` It should start a new Codex Desktop thread and reply in the same direct chat thread.
+3. Project room: add the Personal Agent to a room.
+4. Project room: mention the Personal Agent and send `/bind /absolute/project/path`.
+5. Create a new Codex Desktop update from that project.
+6. Open the Feishu/Lark thread created by Agents Router.
+7. Mention the Personal Agent in that thread.
 
 The reply should continue the same Codex Desktop thread and the result should come back to the same Feishu/Lark thread.
 

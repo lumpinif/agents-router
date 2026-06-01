@@ -41,11 +41,13 @@ use crate::provider_catalog::{
     ProviderMode, provider_config_mode_capability, provider_mode_capability,
 };
 use crate::provider_inbound::{
-    ProviderControlNormalizeResult, ProviderControlSkipReason, ProviderInboundDecision,
-    ProviderInboundNormalizeResult, ProviderInboundReady, ProviderInboundSkipReason,
-    lookup_and_claim_provider_surface_reply, lookup_and_claim_provider_thread_session_reply,
+    NormalizedProviderControlCommand, ProviderControlCommand, ProviderControlNormalizeResult,
+    ProviderControlSkipReason, ProviderInboundDecision, ProviderInboundNormalizeResult,
+    ProviderInboundReady, ProviderInboundSkipReason, lookup_and_claim_provider_surface_reply,
+    lookup_and_claim_provider_thread_session_reply,
     normalize_feishu_lark_long_connection_control_command,
-    normalize_feishu_lark_long_connection_surface_reply, thread_binding_query_for_reply,
+    normalize_feishu_lark_long_connection_surface_reply, provider_event_id_stable_hash,
+    thread_binding_query_for_reply,
 };
 use crate::providers::feishu_lark_continuation::FeishuLarkContinuationDispatcher;
 use crate::providers::feishu_lark_control::dispatch_feishu_lark_control_reply;
@@ -522,9 +524,18 @@ impl FeishuLarkLongConnectionRuntime {
     fn handle_control_command_before_platform_ack(
         &self,
         ledger: &mut BridgeBindingLedger,
-        command: crate::provider_inbound::NormalizedProviderControlCommand,
+        command: NormalizedProviderControlCommand,
         received_at: DateTime<Utc>,
     ) -> anyhow::Result<FeishuLarkLongConnectionDecision> {
+        info!(
+            provider.id = %command.provider_id,
+            provider.conversation.id = %command.provider_conversation_id,
+            provider.thread.id = %command.provider_thread_id,
+            event.hash = %provider_event_id_stable_hash(&command.provider_event_id),
+            control.command = control_command_name(&command.command),
+            control.surface = control_command_surface(&command.command),
+            event = "feishu_lark.long_connection.live.control.accepted",
+        );
         match handle_provider_control_command(ledger, command, received_at)? {
             BridgeControlOutcome::Reply(reply) => {
                 Ok(FeishuLarkLongConnectionDecision::ControlReply(reply))
@@ -940,6 +951,40 @@ fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionD
                 event = "feishu_lark.long_connection.live.platform_ack.sent",
             );
         }
+    }
+}
+
+fn control_command_name(command: &ProviderControlCommand) -> &'static str {
+    match command {
+        ProviderControlCommand::BindProject { .. } => "bind",
+        ProviderControlCommand::DirectBindProject { .. } => "direct_bind",
+        ProviderControlCommand::DirectChatGuidance => "direct_guidance",
+        ProviderControlCommand::DirectHelp => "direct_help",
+        ProviderControlCommand::DirectNewSession { .. } => "direct_new",
+        ProviderControlCommand::DirectStatus => "direct_status",
+        ProviderControlCommand::DirectUnbindProject => "direct_unbind",
+        ProviderControlCommand::Help => "help",
+        ProviderControlCommand::NewSession { .. } => "new",
+        ProviderControlCommand::Status => "status",
+        ProviderControlCommand::UnbindProject { .. } => "unbind",
+        ProviderControlCommand::Invalid { .. } => "invalid",
+    }
+}
+
+fn control_command_surface(command: &ProviderControlCommand) -> &'static str {
+    match command {
+        ProviderControlCommand::DirectBindProject { .. }
+        | ProviderControlCommand::DirectChatGuidance
+        | ProviderControlCommand::DirectHelp
+        | ProviderControlCommand::DirectNewSession { .. }
+        | ProviderControlCommand::DirectStatus
+        | ProviderControlCommand::DirectUnbindProject => "direct_chat",
+        ProviderControlCommand::BindProject { .. }
+        | ProviderControlCommand::Help
+        | ProviderControlCommand::NewSession { .. }
+        | ProviderControlCommand::Status
+        | ProviderControlCommand::UnbindProject { .. } => "project_room",
+        ProviderControlCommand::Invalid { .. } => "invalid",
     }
 }
 

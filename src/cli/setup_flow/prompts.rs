@@ -496,14 +496,14 @@ pub(in crate::cli) fn feishu_lark_mode_option_description(
             {
                 localized(
                     i18n,
-                    "Scan a QR code, add the agent to Lark rooms, then mention it and send `/bind` to connect project rooms. One Codex thread maps to one Lark thread.",
-                    "扫码创建 agent，把它拉进 Lark 群，然后 @ 它并发送 `/bind` 连接项目群。一个 Codex thread 对应一个 Lark thread。",
+                    "Scan a QR code. Direct chat can start new Codex threads after `/bind`; rooms use @ plus `/bind` for project updates.",
+                    "扫码创建 agent。私聊 `/bind` 后可以开新 Codex thread；群里用 @ 加 `/bind` 接收项目更新。",
                 )
             } else {
                 localized(
                     i18n,
-                    "Scan a QR code, add the agent to rooms, then mention it and send `/bind` to connect project rooms.",
-                    "扫码创建 agent，把它拉进群，然后 @ 它并发送 `/bind` 连接项目群。",
+                    "Scan a QR code. Direct chat can use `/bind`; rooms use @ plus `/bind` for project updates.",
+                    "扫码创建 agent。私聊可以 `/bind`；群里用 @ 加 `/bind` 接收项目更新。",
                 )
             }
         }

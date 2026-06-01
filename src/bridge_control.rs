@@ -132,7 +132,9 @@ fn bind_project(
     now: DateTime<Utc>,
 ) -> anyhow::Result<String> {
     if !is_clean_absolute_project_path(project_path) {
-        return Ok("Use `/bind /absolute/project/path`.".to_string());
+        return Ok(
+            "Use a clean absolute folder path:\n`/bind /absolute/project/path`.".to_string(),
+        );
     }
     if !Path::new(project_path).is_dir() {
         return Ok(format!(
@@ -161,7 +163,10 @@ fn bind_direct_chat_project(
     now: DateTime<Utc>,
 ) -> anyhow::Result<String> {
     if !is_clean_absolute_project_path(project_path) {
-        return Ok("Use `/bind /absolute/project/path`.".to_string());
+        return Ok(
+            "Set this direct chat's default project with:\n`/bind /absolute/project/path`."
+                .to_string(),
+        );
     }
     if !Path::new(project_path).is_dir() {
         return Ok(format!(
@@ -253,7 +258,7 @@ fn resolve_new_session_command(
         return Ok(reply_outcome(
             command,
             provider_event_id_hash.to_string(),
-            "Use `/new what you want Codex to do`.".to_string(),
+            "Tell Codex what to do:\n`/new what you want Codex to do`.".to_string(),
         ));
     }
 
@@ -282,7 +287,7 @@ fn resolve_new_session_command(
                     command,
                     provider_event_id_hash.to_string(),
                     format!(
-                        "This room is not connected to:\n{project_path}\n\nUse `/bind {project_path}` first."
+                        "This room is not connected to:\n{project_path}\n\nIn the main room, mention me and send:\n`/bind {project_path}`"
                     ),
                 ));
             }
@@ -293,7 +298,7 @@ fn resolve_new_session_command(
                 return Ok(reply_outcome(
                     command,
                     provider_event_id_hash.to_string(),
-                    "Connect this room first with `/bind /absolute/project/path`.".to_string(),
+                    "This room is not connected to a project yet.\n\nIn the main room, mention me and send:\n`/bind /absolute/project/path`.".to_string(),
                 ));
             }
             [project] => project.project_path.clone(),
@@ -331,7 +336,7 @@ fn resolve_direct_new_session_command(
         return Ok(reply_outcome(
             command,
             provider_event_id_hash.to_string(),
-            "Use `/new what you want Codex to do`.".to_string(),
+            "Tell Codex what to do:\n`/new what you want Codex to do`.".to_string(),
         ));
     }
 
@@ -417,16 +422,17 @@ fn direct_chat_needs_project_text(
     let connected = unique_connected_projects_for_provider_account(ledger, command)?;
     if connected.is_empty() {
         return Ok([
-            "Set a project for this direct chat first:",
+            "Set a default project for this direct chat first:",
             "`/bind /absolute/project/path`",
             "",
-            "After that, send any message here to start a new Codex thread in that project.",
+            "After that, any plain message here starts a new Codex thread in that project.",
         ]
         .join("\n"));
     }
 
     let mut lines = vec![
-        "Choose a project for this direct chat:".to_string(),
+        "I found more than one connected project room.".to_string(),
+        "Set the default project for this direct chat:".to_string(),
         "`/bind /absolute/project/path`".to_string(),
         "".to_string(),
         "Connected project rooms:".to_string(),
@@ -467,10 +473,10 @@ fn room_status(ledger: &BridgeBindingLedger, command: &NormalizedProviderControl
             "",
             "No projects are connected yet.",
             "",
-            "Connect this room to a local project:",
+            "In the main room, mention me and send:",
             "`/bind /absolute/project/path`",
             "",
-            "After that, new Codex Desktop updates from that project will appear here, and `/new` can start a new Codex thread in that project.",
+            "After that, new Codex Desktop updates from that project will appear here. `/new ...` can start a new Codex thread in that project.",
         ]
         .join("\n");
     }
@@ -490,7 +496,7 @@ fn room_status(ledger: &BridgeBindingLedger, command: &NormalizedProviderControl
         "".to_string(),
         format!("Start a new Codex thread:\n{new_session_hint}"),
         "".to_string(),
-        "When a Codex update appears here, reply in that Lark thread and mention me to continue the same Codex thread.".to_string(),
+        "When a Codex update appears here, open its Lark thread, mention me, and reply there to continue the same Codex thread.".to_string(),
     ]
     .join("\n")
 }
@@ -511,8 +517,10 @@ fn direct_chat_status(
             "",
             "No default project is set.",
             "",
-            "Set a project for this direct chat:",
+            "Set a default project for this direct chat:",
             "`/bind /absolute/project/path`",
+            "",
+            "After that, any plain message here starts a new Codex thread in that project.",
         ]
         .join("\n"));
     }
@@ -522,8 +530,7 @@ fn direct_chat_status(
         lines.push("Default project:".to_string());
         lines.push(format!("- {}", project.project_path));
         lines.push("".to_string());
-        lines
-            .push("Send any message here to start a new Codex thread in that project.".to_string());
+        lines.push("Any plain message here starts a new Codex thread in that project.".to_string());
     } else {
         lines.push("No default project is set.".to_string());
         lines.push("Set one with `/bind /absolute/project/path`.".to_string());
@@ -538,7 +545,7 @@ fn direct_chat_status(
 
 fn help_text() -> String {
     [
-        "I connect this Lark room to local projects on your Mac.",
+        "I connect this room to local Codex projects on your Mac.",
         "",
         "Commands",
         "`/bind /absolute/project/path`",
@@ -559,15 +566,18 @@ fn help_text() -> String {
         "`/unbind`",
         "Disconnect all projects from this room.",
         "",
-        "In group chats and Lark threads, mention me before you send a command or reply.",
-        "`/bind`, `/new`, and `/unbind` work only in the room, not inside a Lark thread.",
+        "For shared rooms: mention me before each command.",
+        "For Lark threads: mention me only when you want to continue that Codex thread.",
+        "Run `/bind`, `/new`, and `/unbind` in the main room, not inside a thread.",
     ]
     .join("\n")
 }
 
 fn direct_help_text() -> String {
     [
-        "I connect Lark to local Codex on your Mac.",
+        "Direct chat with local Codex on your Mac.",
+        "",
+        "No mention is needed here.",
         "",
         "Direct chat",
         "`/help`",
@@ -594,19 +604,19 @@ fn direct_help_text() -> String {
         "",
         "After that, new Codex Desktop updates from that project will appear in the group, and `/new` can start a new Codex thread there.",
         "",
-        "In group chats and Lark threads, mention me before commands or replies.",
+        "In shared rooms and Lark threads, mention me before commands or replies.",
     ]
     .join("\n")
 }
 
 fn direct_chat_guidance_text() -> String {
     [
-        "I can help you control local Codex from Lark.",
+        "Direct chat is ready.",
         "",
-        "Set a project for this direct chat:",
+        "Set a default project first:",
         "`/bind /absolute/project/path`",
         "",
-        "After that, send any message here to start a new Codex thread in that project.",
+        "After that, any plain message here starts a new Codex thread in that project.",
     ]
     .join("\n")
 }
@@ -773,7 +783,7 @@ mod tests {
         assert_eq!(
             reply,
             format!(
-                "Room status\n\nConnected projects: 1\n- {path}\n\nStart a new Codex thread:\n`/new what you want Codex to do`\n\nWhen a Codex update appears here, reply in that Lark thread and mention me to continue the same Codex thread."
+                "Room status\n\nConnected projects: 1\n- {path}\n\nStart a new Codex thread:\n`/new what you want Codex to do`\n\nWhen a Codex update appears here, open its Lark thread, mention me, and reply there to continue the same Codex thread."
             )
         );
     }
@@ -792,7 +802,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "Room status\n\nNo projects are connected yet.\n\nConnect this room to a local project:\n`/bind /absolute/project/path`\n\nAfter that, new Codex Desktop updates from that project will appear here, and `/new` can start a new Codex thread in that project."
+            "Room status\n\nNo projects are connected yet.\n\nIn the main room, mention me and send:\n`/bind /absolute/project/path`\n\nAfter that, new Codex Desktop updates from that project will appear here. `/new ...` can start a new Codex thread in that project."
         );
     }
 
@@ -909,8 +919,8 @@ mod tests {
         assert!(reply.contains("`/new what you want Codex to do`"));
         assert!(reply.contains("`/status`"));
         assert!(reply.contains("`/unbind`"));
-        assert!(reply.contains("mention me before you send a command or reply"));
-        assert!(reply.contains("work only in the room"));
+        assert!(reply.contains("mention me before each command"));
+        assert!(reply.contains("main room, not inside a thread"));
     }
 
     #[test]
@@ -1014,7 +1024,7 @@ mod tests {
 
         assert!(reply.contains("Default project:"));
         assert!(reply.contains(&path));
-        assert!(reply.contains("Send any message here to start a new Codex thread"));
+        assert!(reply.contains("Any plain message here starts a new Codex thread"));
     }
 
     #[test]
@@ -1116,7 +1126,8 @@ mod tests {
             .expect("direct new should handle"),
         );
 
-        assert!(reply.contains("Choose a project for this direct chat"));
+        assert!(reply.contains("I found more than one connected project room"));
+        assert!(reply.contains("Set the default project for this direct chat"));
         assert!(reply.contains(&first_path));
         assert!(reply.contains(&second_path));
     }
@@ -1158,9 +1169,9 @@ mod tests {
             .expect("direct guidance should handle"),
         );
 
-        assert!(reply.contains("Set a project for this direct chat"));
+        assert!(reply.contains("Set a default project first"));
         assert!(reply.contains("`/bind /absolute/project/path`"));
-        assert!(reply.contains("send any message here"));
+        assert!(reply.contains("any plain message here"));
     }
 
     #[test]

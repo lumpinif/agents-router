@@ -434,8 +434,7 @@ pub fn normalize_feishu_lark_long_connection_control_command(
     let provider_thread_id = root_id.unwrap_or(message_id.as_str()).to_string();
     let command = if root_id.is_some() && command.requires_room_root() {
         ProviderControlCommand::Invalid {
-            message: "Run `/bind`, `/new`, or `/unbind` in the main chat, not inside a thread."
-                .to_string(),
+            message: "Run `/bind`, `/new`, or `/unbind` in the main room, not inside a Lark thread. Thread replies are only for continuing the Codex thread that created the message.".to_string(),
         }
     } else if is_direct_chat {
         match command {
@@ -454,9 +453,13 @@ pub fn normalize_feishu_lark_long_connection_control_command(
             ProviderControlCommand::UnbindProject { project_path: None } => {
                 ProviderControlCommand::DirectUnbindProject
             }
+            ProviderControlCommand::UnbindProject {
+                project_path: Some(_),
+            } => ProviderControlCommand::Invalid {
+                message: "Use `/unbind` in direct chat to clear the default project.".to_string(),
+            },
             command if command.requires_project_room() => ProviderControlCommand::Invalid {
-                message: "Use this command in a Lark or Feishu room, not in a direct chat."
-                    .to_string(),
+                message: "This command is for project rooms. In direct chat, use `/bind /absolute/project/path`, `/new ...`, `/status`, or `/help`.".to_string(),
             },
             command => command,
         }
@@ -779,6 +782,10 @@ pub fn thread_binding_query_for_reply(
     }
 }
 
+pub(crate) fn provider_event_id_stable_hash(provider_event_id: &str) -> String {
+    stable_hash(provider_event_id)
+}
+
 fn bridge_thread_surface_id(binding: &ThreadSessionBindingRecord) -> String {
     format!(
         "bridge-thread-{}",
@@ -917,7 +924,8 @@ fn parse_provider_control_command(text: &str) -> Option<ProviderControlCommand> 
             let project_path = rest.trim();
             if project_path.is_empty() {
                 return Some(ProviderControlCommand::Invalid {
-                    message: "Use `/bind /absolute/project/path`.".to_string(),
+                    message: "Use a clean absolute folder path:\n`/bind /absolute/project/path`."
+                        .to_string(),
                 });
             }
             Some(ProviderControlCommand::BindProject {

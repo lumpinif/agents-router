@@ -281,7 +281,7 @@ impl FeishuLarkProvider {
                 DeliveryErrorKind::Config,
                 DeliveryErrorContext::provider_send(signal, &self.id, provider_type),
                 format!(
-                    "feishu_lark provider `{}` has no default room; add the Personal Agent to a room, mention it, and send `/bind /absolute/project/path`, or set `chat_id` in config",
+                    "feishu_lark provider `{}` has no default room; use direct chat with `/bind /absolute/project/path`, add the Personal Agent to a room and mention it with `/bind /absolute/project/path`, or set `chat_id` in config",
                     self.id
                 ),
             )
