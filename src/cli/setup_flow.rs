@@ -1119,7 +1119,7 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!("Self-built app checklist:");
             println!("- Add Bot capability.");
             println!(
-                "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly, im:chat:create."
+                "- Enable permissions: im:message:send_as_bot, im:message.group_msg:readonly, im:chat:readonly, im:chat:create, cardkit:card:write."
             );
             println!(
                 "- Subscribe to im.message.receive_v1, im.chat.member.bot.added_v1, and card.action.trigger with Long Connection / WebSocket."
@@ -1136,7 +1136,7 @@ fn print_feishu_lark_app_bot_setup_checklist(i18n: I18n) {
             println!("自建应用检查清单:");
             println!("- 添加 Bot 能力。");
             println!(
-                "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly、im:chat:create。"
+                "- 开启权限：im:message:send_as_bot、im:message.group_msg:readonly、im:chat:readonly、im:chat:create、cardkit:card:write。"
             );
             println!(
                 "- 用 Long Connection / WebSocket 订阅 im.message.receive_v1、im.chat.member.bot.added_v1 和 card.action.trigger。"

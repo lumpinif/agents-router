@@ -1,3 +1,6 @@
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
+
 use anyhow::{Context, anyhow, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -8,8 +11,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::agent_controller::{
-    ProviderThreadReplyAdapter, ProviderThreadReplyError, ProviderThreadReplyFuture,
-    ProviderThreadReplyRequest, ProviderThreadReplySuccess,
+    AgentControllerProgressObserver, AgentControllerSubmitFuture, ProviderThreadReplyAdapter,
+    ProviderThreadReplyError, ProviderThreadReplyFuture, ProviderThreadReplyRequest,
+    ProviderThreadReplySuccess,
 };
 use crate::config::{
     FeishuLarkAppBotProviderConfig, FeishuLarkAppDomain, FeishuLarkCustomBotProviderConfig,
@@ -32,8 +36,10 @@ use crate::signal::Signal;
 
 type HmacSha256 = Hmac<Sha256>;
 const CODEX_CARD_TEMPLATE: &str = "purple";
+const STREAMING_REPLY_ELEMENT_ID: &str = "answer";
+const STREAMING_REPLY_INITIAL_TEXT: &str = "Codex is working...";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FeishuLarkProvider {
     id: String,
     runtime: FeishuLarkProviderRuntime,
@@ -70,6 +76,58 @@ pub(crate) struct FeishuLarkCreateProjectRoomRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FeishuLarkCreateProjectRoomSuccess {
     pub provider_conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuLarkStreamingThreadReplyRequest {
+    pub provider_id: String,
+    pub provider_type: String,
+    pub provider_account_id: String,
+    pub provider_conversation_id: String,
+    pub provider_thread_id: String,
+    pub surface_id: String,
+    pub provider_event_id_hash: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct FeishuLarkStreamingThreadReply {
+    client: reqwest::Client,
+    api_base_url: String,
+    token: String,
+    provider_id: String,
+    provider_type: String,
+    surface_id: String,
+    provider_event_id_hash: String,
+    card_id: String,
+    provider_reply_message_id: String,
+    sequence: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct FeishuLarkLazyStreamingThreadReplyParts {
+    provider: FeishuLarkProvider,
+    request: FeishuLarkStreamingThreadReplyRequest,
+    state: Arc<tokio::sync::Mutex<LazyStreamingThreadReplyState>>,
+    provider_id: String,
+    provider_type: String,
+}
+
+pub(crate) struct FeishuLarkLazyStreamingProgressObserver {
+    parts: FeishuLarkLazyStreamingThreadReplyParts,
+    state: Mutex<StreamingProgressState>,
+}
+
+#[derive(Debug)]
+enum LazyStreamingThreadReplyState {
+    Pending,
+    Ready(Box<FeishuLarkStreamingThreadReply>),
+    Disabled,
+}
+
+#[derive(Debug)]
+struct StreamingProgressState {
+    last_sent_len: usize,
+    next_update_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +202,22 @@ impl FeishuLarkProvider {
             }
             FeishuLarkProviderRuntime::AppBot(runtime) => {
                 self.create_app_bot_project_room(request, runtime).await
+            }
+        }
+    }
+
+    pub(crate) async fn start_streaming_thread_reply(
+        &self,
+        request: FeishuLarkStreamingThreadReplyRequest,
+    ) -> Result<FeishuLarkStreamingThreadReply, ProviderThreadReplyError> {
+        match &self.runtime {
+            FeishuLarkProviderRuntime::CustomBot(_) => Err(streaming_thread_reply_error(
+                &request,
+                "Feishu/Lark custom bot mode does not support streaming thread replies",
+            )),
+            FeishuLarkProviderRuntime::AppBot(runtime) => {
+                self.start_app_bot_streaming_thread_reply(request, runtime)
+                    .await
             }
         }
     }
@@ -257,6 +331,405 @@ impl ProviderThreadReplyAdapter for FeishuLarkProvider {
             }
         })
     }
+}
+
+impl FeishuLarkStreamingThreadReply {
+    pub(crate) async fn set_markdown(
+        &mut self,
+        markdown: &str,
+    ) -> Result<(), ProviderThreadReplyError> {
+        self.sequence += 1;
+        let content = if markdown.trim().is_empty() {
+            STREAMING_REPLY_INITIAL_TEXT
+        } else {
+            markdown
+        };
+        let request = FeishuLarkCardKitContentUpdateRequest {
+            content,
+            sequence: self.sequence,
+            uuid: streaming_card_update_uuid(&self.card_id, self.sequence),
+        };
+        let response = self
+            .client
+            .put(format!(
+                "{}/open-apis/cardkit/v1/cards/{}/elements/{}/content",
+                self.api_base_url, self.card_id, STREAMING_REPLY_ELEMENT_ID
+            ))
+            .bearer_auth(&self.token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.error(format!(
+                    "failed to update Feishu/Lark streaming reply card: {}",
+                    error.without_url()
+                ))
+                .with_retriable(true)
+            })?;
+        self.ensure_cardkit_update_response(response, "content update")
+            .await
+    }
+
+    pub(crate) async fn finish(
+        &mut self,
+        summary: Option<&str>,
+    ) -> Result<ProviderThreadReplySuccess, ProviderThreadReplyError> {
+        self.sequence += 1;
+        let settings = json!({
+            "config": {
+                "streaming_mode": false,
+                "summary": {
+                    "content": summary
+                        .map(short_card_summary)
+                        .unwrap_or_else(|| "Codex finished".to_string())
+                }
+            }
+        });
+        let request = FeishuLarkCardKitSettingsUpdateRequest {
+            settings: serde_json::to_string(&settings).map_err(|error| {
+                self.error(format!("failed to serialize card settings: {error}"))
+            })?,
+            sequence: self.sequence,
+            uuid: streaming_card_update_uuid(&self.card_id, self.sequence),
+        };
+        let response = self
+            .client
+            .patch(format!(
+                "{}/open-apis/cardkit/v1/cards/{}/settings",
+                self.api_base_url, self.card_id
+            ))
+            .bearer_auth(&self.token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.error(format!(
+                    "failed to finish Feishu/Lark streaming reply card: {}",
+                    error.without_url()
+                ))
+                .with_retriable(true)
+            })?;
+        self.ensure_cardkit_update_response(response, "settings update")
+            .await?;
+
+        Ok(ProviderThreadReplySuccess {
+            provider_reply_message_id: Some(self.provider_reply_message_id.clone()),
+        })
+    }
+
+    async fn ensure_cardkit_update_response(
+        &self,
+        response: reqwest::Response,
+        action: &'static str,
+    ) -> Result<(), ProviderThreadReplyError> {
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            self.error(format!(
+                "failed to read Feishu/Lark streaming reply card {action} response: {}",
+                error.without_url()
+            ))
+            .with_retriable(true)
+        })?;
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            return Err(self
+                .error(format!(
+                    "Feishu/Lark streaming reply card {action} returned HTTP status {}",
+                    status
+                ))
+                .with_http_status(status_code)
+                .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkCardKitUpdateResponse = serde_json::from_str(&body)
+            .map_err(|error| {
+                self.error(format!(
+                    "Feishu/Lark streaming reply card {action} returned invalid JSON: {error}"
+                ))
+            })?;
+        if provider_response.code != 0 {
+            return Err(self.error(format!(
+                "Feishu/Lark streaming reply card {action} returned code {}: {}",
+                provider_response.code,
+                provider_response
+                    .msg
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+        Ok(())
+    }
+
+    fn error(&self, message: impl Into<String>) -> ProviderThreadReplyError {
+        ProviderThreadReplyError {
+            provider_id: self.provider_id.clone(),
+            provider_type: self.provider_type.clone(),
+            surface_id: self.surface_id.clone(),
+            provider_event_id_hash: self.provider_event_id_hash.clone(),
+            message: message.into().into_boxed_str(),
+            http_status: None,
+            retriable: false,
+        }
+    }
+}
+
+impl FeishuLarkLazyStreamingThreadReplyParts {
+    pub(crate) fn new(
+        provider: FeishuLarkProvider,
+        request: FeishuLarkStreamingThreadReplyRequest,
+    ) -> Self {
+        let provider_id = request.provider_id.clone();
+        let provider_type = request.provider_type.clone();
+        Self {
+            provider,
+            request,
+            state: Arc::new(tokio::sync::Mutex::new(
+                LazyStreamingThreadReplyState::Pending,
+            )),
+            provider_id,
+            provider_type,
+        }
+    }
+
+    pub(crate) fn progress_observer(&self) -> FeishuLarkLazyStreamingProgressObserver {
+        FeishuLarkLazyStreamingProgressObserver {
+            parts: self.clone(),
+            state: Mutex::new(StreamingProgressState {
+                last_sent_len: 0,
+                next_update_at: Instant::now(),
+            }),
+        }
+    }
+
+    async fn set_markdown(&self, text: &str) -> Result<bool, ProviderThreadReplyError> {
+        if !self.ensure_started().await? {
+            return Ok(false);
+        }
+
+        let mut state = self.state.lock().await;
+        let LazyStreamingThreadReplyState::Ready(handle) = &mut *state else {
+            return Ok(false);
+        };
+        handle.set_markdown(text).await?;
+        tracing::debug!(
+            provider.id = %handle.provider_id,
+            provider.type = %handle.provider_type,
+            provider.reply.message_id = %handle.provider_reply_message_id,
+            card.id = %handle.card_id,
+            surface.id = %handle.surface_id,
+            event.hash = %handle.provider_event_id_hash,
+            text.chars = text.chars().count(),
+            event = "provider_thread_streaming_reply.updated",
+        );
+        Ok(true)
+    }
+
+    async fn finish_or_send_text(
+        &self,
+        request: ProviderThreadReplyRequest,
+    ) -> Result<ProviderThreadReplySuccess, ProviderThreadReplyError> {
+        match self.ensure_started().await {
+            Ok(true) => {
+                let streaming_result = {
+                    let mut state = self.state.lock().await;
+                    let LazyStreamingThreadReplyState::Ready(handle) = &mut *state else {
+                        tracing::warn!(
+                            provider.id = %request.provider_id,
+                            provider.type = %request.provider_type,
+                            provider.thread.id = %request.provider_thread_id,
+                            surface.id = %request.surface_id,
+                            event.hash = %request.provider_event_id_hash,
+                            event = "provider_thread_streaming_reply.text_fallback",
+                            reason = "streaming_state_not_ready",
+                        );
+                        return self.provider.send_thread_reply(request).await;
+                    };
+
+                    match handle.set_markdown(&request.text).await {
+                        Ok(()) => handle.finish(Some(&request.text)).await,
+                        Err(error) => Err(error),
+                    }
+                };
+
+                match streaming_result {
+                    Ok(success) => {
+                        tracing::info!(
+                            provider.id = %request.provider_id,
+                            provider.type = %request.provider_type,
+                            provider.thread.id = %request.provider_thread_id,
+                            provider.reply.message_id = success.provider_reply_message_id.as_deref(),
+                            surface.id = %request.surface_id,
+                            event.hash = %request.provider_event_id_hash,
+                            event = "provider_thread_streaming_reply.finished",
+                        );
+                        Ok(success)
+                    }
+                    Err(error) => {
+                        *self.state.lock().await = LazyStreamingThreadReplyState::Disabled;
+                        tracing::warn!(
+                            provider.id = %error.provider_id,
+                            provider.type = %error.provider_type,
+                            surface.id = %error.surface_id,
+                            event.hash = %error.provider_event_id_hash,
+                            http.status = error.http_status,
+                            error.retriable = error.retriable,
+                            error = %error.message,
+                            event = "provider_thread_streaming_reply.finish.failed",
+                        );
+                        tracing::info!(
+                            provider.id = %request.provider_id,
+                            provider.type = %request.provider_type,
+                            provider.thread.id = %request.provider_thread_id,
+                            surface.id = %request.surface_id,
+                            event.hash = %request.provider_event_id_hash,
+                            event = "provider_thread_streaming_reply.text_fallback",
+                            reason = "streaming_finish_failed",
+                        );
+                        self.provider.send_thread_reply(request).await
+                    }
+                }
+            }
+            Ok(false) => {
+                tracing::info!(
+                    provider.id = %request.provider_id,
+                    provider.type = %request.provider_type,
+                    provider.thread.id = %request.provider_thread_id,
+                    surface.id = %request.surface_id,
+                    event.hash = %request.provider_event_id_hash,
+                    event = "provider_thread_streaming_reply.text_fallback",
+                    reason = "streaming_disabled",
+                );
+                self.provider.send_thread_reply(request).await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider.id = %error.provider_id,
+                    provider.type = %error.provider_type,
+                    surface.id = %error.surface_id,
+                    event.hash = %error.provider_event_id_hash,
+                    http.status = error.http_status,
+                    error.retriable = error.retriable,
+                    error = %error.message,
+                    event = "provider_thread_streaming_reply.start.failed",
+                );
+                self.provider.send_thread_reply(request).await
+            }
+        }
+    }
+
+    async fn ensure_started(&self) -> Result<bool, ProviderThreadReplyError> {
+        let mut state = self.state.lock().await;
+        match &*state {
+            LazyStreamingThreadReplyState::Ready(_) => Ok(true),
+            LazyStreamingThreadReplyState::Disabled => Ok(false),
+            LazyStreamingThreadReplyState::Pending => {
+                match self
+                    .provider
+                    .start_streaming_thread_reply(self.request.clone())
+                    .await
+                {
+                    Ok(handle) => {
+                        tracing::info!(
+                            provider.id = %handle.provider_id,
+                            provider.type = %handle.provider_type,
+                            provider.reply.message_id = %handle.provider_reply_message_id,
+                            card.id = %handle.card_id,
+                            surface.id = %handle.surface_id,
+                            event.hash = %handle.provider_event_id_hash,
+                            event = "provider_thread_streaming_reply.started",
+                        );
+                        *state = LazyStreamingThreadReplyState::Ready(Box::new(handle));
+                        Ok(true)
+                    }
+                    Err(error) => {
+                        *state = LazyStreamingThreadReplyState::Disabled;
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ProviderThreadReplyAdapter for FeishuLarkLazyStreamingThreadReplyParts {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn provider_type(&self) -> &str {
+        &self.provider_type
+    }
+
+    fn send_thread_reply<'a>(
+        &'a self,
+        request: ProviderThreadReplyRequest,
+    ) -> ProviderThreadReplyFuture<'a> {
+        Box::pin(async move {
+            if request.provider_id != self.provider_id
+                || request.provider_type != self.provider_type
+            {
+                return Err(thread_reply_error(
+                    &request,
+                    "lazy streaming thread reply adapter does not match inbound provider",
+                ));
+            }
+            self.finish_or_send_text(request).await
+        })
+    }
+}
+
+impl AgentControllerProgressObserver for FeishuLarkLazyStreamingProgressObserver {
+    fn text_snapshot<'a>(&'a self, text: &'a str) -> AgentControllerSubmitFuture<'a> {
+        Box::pin(async move {
+            if !self.should_send(text) {
+                return Ok(());
+            }
+            if let Err(error) = self.parts.set_markdown(text).await {
+                tracing::warn!(
+                    provider.id = %error.provider_id,
+                    provider.type = %error.provider_type,
+                    surface.id = %error.surface_id,
+                    event.hash = %error.provider_event_id_hash,
+                    http.status = error.http_status,
+                    error.retriable = error.retriable,
+                    error = %error.message,
+                    event = "provider_thread_streaming_reply.progress_update.failed",
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
+impl FeishuLarkLazyStreamingProgressObserver {
+    fn should_send(&self, text: &str) -> bool {
+        should_send_streaming_progress(&self.state, text)
+    }
+}
+
+fn should_send_streaming_progress(state: &Mutex<StreamingProgressState>, text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+
+    let now = Instant::now();
+    let Ok(mut state) = state.lock() else {
+        return true;
+    };
+    let new_len = text.len();
+    if new_len <= state.last_sent_len {
+        return false;
+    }
+
+    let enough_new_content = new_len.saturating_sub(state.last_sent_len) >= 80;
+    let interval_elapsed = now >= state.next_update_at;
+    let paragraph_boundary = text.ends_with('\n');
+    if !(enough_new_content || interval_elapsed || paragraph_boundary) {
+        return false;
+    }
+
+    state.last_sent_len = new_len;
+    state.next_update_at = now + StdDuration::from_millis(750);
+    true
 }
 
 impl FeishuLarkProvider {
@@ -859,6 +1332,214 @@ impl FeishuLarkProvider {
         })
     }
 
+    async fn start_app_bot_streaming_thread_reply(
+        &self,
+        request: FeishuLarkStreamingThreadReplyRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<FeishuLarkStreamingThreadReply, ProviderThreadReplyError> {
+        validate_app_bot_streaming_thread_reply_request(&request, &self.id, runtime)?;
+
+        let token = self
+            .fetch_tenant_access_token_for_streaming_thread_reply(&request, runtime)
+            .await?;
+        let card = streaming_markdown_card(STREAMING_REPLY_INITIAL_TEXT, true);
+        let create_body = FeishuLarkCardKitCreateRequest {
+            card_type: "card_json",
+            data: serde_json::to_string(&card).map_err(|error| {
+                streaming_thread_reply_error(
+                    &request,
+                    format!("failed to serialize streaming reply card: {error}"),
+                )
+            })?,
+        };
+        let create_response = self
+            .client
+            .post(format!(
+                "{}/open-apis/cardkit/v1/cards",
+                runtime.api_base_url
+            ))
+            .bearer_auth(&token)
+            .json(&create_body)
+            .send()
+            .await
+            .map_err(|error| {
+                streaming_thread_reply_error(
+                    &request,
+                    format!(
+                        "failed to create Feishu/Lark streaming reply card: {}",
+                        error.without_url()
+                    ),
+                )
+                .with_retriable(true)
+            })?;
+        let create_status = create_response.status();
+        let create_body = create_response.text().await.map_err(|error| {
+            streaming_thread_reply_error(
+                &request,
+                format!(
+                    "failed to read Feishu/Lark streaming reply card create response: {}",
+                    error.without_url()
+                ),
+            )
+            .with_retriable(true)
+        })?;
+        if !create_status.is_success() {
+            let status_code = create_status.as_u16();
+            return Err(streaming_thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark streaming reply card create returned HTTP status {}",
+                    create_status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+        let create_response: FeishuLarkCardKitCreateResponse = serde_json::from_str(&create_body)
+            .map_err(|error| {
+            streaming_thread_reply_error(
+                &request,
+                format!("Feishu/Lark streaming reply card create returned invalid JSON: {error}"),
+            )
+        })?;
+        if create_response.code != 0 {
+            return Err(streaming_thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark streaming reply card create returned code {}: {}",
+                    create_response.code,
+                    create_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+        }
+        let card_id = create_response
+            .data
+            .and_then(|data| present_owned(data.card_id))
+            .ok_or_else(|| {
+                streaming_thread_reply_error(
+                    &request,
+                    "Feishu/Lark streaming reply card create did not include card_id",
+                )
+            })?;
+
+        let content = serde_json::to_string(&FeishuLarkCardReferenceContent {
+            content_type: "card",
+            data: FeishuLarkCardReferenceData {
+                card_id: card_id.as_str(),
+            },
+        })
+        .map_err(|error| {
+            streaming_thread_reply_error(
+                &request,
+                format!("failed to serialize streaming card reference: {error}"),
+            )
+        })?;
+        let reply_body = FeishuLarkAppBotReplyMessageRequest {
+            content,
+            msg_type: "interactive",
+            reply_in_thread: true,
+            uuid: streaming_thread_reply_uuid(&request.provider_event_id_hash),
+        };
+        let reply_response = self
+            .client
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{}/reply",
+                runtime.api_base_url, request.provider_thread_id
+            ))
+            .bearer_auth(&token)
+            .json(&reply_body)
+            .send()
+            .await
+            .map_err(|error| {
+                streaming_thread_reply_error(
+                    &request,
+                    format!(
+                        "failed to send Feishu/Lark streaming reply card: {}",
+                        error.without_url()
+                    ),
+                )
+                .with_retriable(true)
+            })?;
+        let reply_status = reply_response.status();
+        let reply_body = reply_response.text().await.map_err(|error| {
+            streaming_thread_reply_error(
+                &request,
+                format!(
+                    "failed to read Feishu/Lark streaming reply card message response: {}",
+                    error.without_url()
+                ),
+            )
+            .with_retriable(true)
+        })?;
+        if !reply_status.is_success() {
+            let status_code = reply_status.as_u16();
+            return Err(streaming_thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark streaming reply card message returned HTTP status {}",
+                    reply_status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+        let reply_response: FeishuLarkAppBotReplyMessageResponse =
+            serde_json::from_str(&reply_body).map_err(|error| {
+                streaming_thread_reply_error(
+                    &request,
+                    format!(
+                        "Feishu/Lark streaming reply card message returned invalid JSON: {error}"
+                    ),
+                )
+            })?;
+        if reply_response.code != 0 {
+            return Err(streaming_thread_reply_error(
+                &request,
+                format!(
+                    "Feishu/Lark streaming reply card message returned code {}: {}",
+                    reply_response.code,
+                    reply_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+        }
+        let data = reply_response.data.ok_or_else(|| {
+            streaming_thread_reply_error(
+                &request,
+                "Feishu/Lark streaming reply card message did not include message data",
+            )
+        })?;
+        let provider_reply_message_id = required_streaming_thread_reply_response_field(
+            &request,
+            "message_id",
+            data.message_id,
+        )?;
+        let root_id =
+            required_streaming_thread_reply_response_field(&request, "root_id", data.root_id)?;
+        if root_id != request.provider_thread_id {
+            return Err(streaming_thread_reply_error(
+                &request,
+                "Feishu/Lark streaming reply card root_id did not match the response surface thread",
+            ));
+        }
+
+        Ok(FeishuLarkStreamingThreadReply {
+            client: self.client.clone(),
+            api_base_url: runtime.api_base_url.clone(),
+            token,
+            provider_id: request.provider_id,
+            provider_type: request.provider_type,
+            surface_id: request.surface_id,
+            provider_event_id_hash: request.provider_event_id_hash,
+            card_id,
+            provider_reply_message_id,
+            sequence: 0,
+        })
+    }
+
     async fn send_app_bot_conversation_text(
         &self,
         request: FeishuLarkConversationTextRequest,
@@ -1385,6 +2066,94 @@ impl FeishuLarkProvider {
         Ok(token)
     }
 
+    async fn fetch_tenant_access_token_for_streaming_thread_reply(
+        &self,
+        request: &FeishuLarkStreamingThreadReplyRequest,
+        runtime: &FeishuLarkAppBotRuntime,
+    ) -> Result<String, ProviderThreadReplyError> {
+        let token_request = FeishuLarkTenantAccessTokenRequest {
+            app_id: &runtime.app_id,
+            app_secret: &runtime.app_secret,
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/open-apis/auth/v3/tenant_access_token/internal",
+                runtime.api_base_url
+            ))
+            .json(&token_request)
+            .send()
+            .await
+            .map_err(|error| {
+                streaming_thread_reply_error(
+                    request,
+                    format!(
+                        "failed to fetch tenant access token: {}",
+                        error.without_url()
+                    ),
+                )
+                .with_retriable(true)
+            })?;
+
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            streaming_thread_reply_error(
+                request,
+                format!(
+                    "failed to read tenant access token response: {}",
+                    error.without_url()
+                ),
+            )
+            .with_retriable(true)
+        })?;
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            return Err(streaming_thread_reply_error(
+                request,
+                format!(
+                    "tenant access token request returned HTTP status {}",
+                    status
+                ),
+            )
+            .with_http_status(status_code)
+            .with_retriable(is_retriable_http_status(status_code)));
+        }
+
+        let provider_response: FeishuLarkTenantAccessTokenResponse =
+            serde_json::from_str(&response_body).map_err(|error| {
+                streaming_thread_reply_error(
+                    request,
+                    format!("tenant access token response was invalid JSON: {error}"),
+                )
+            })?;
+        if provider_response.code != 0 {
+            return Err(streaming_thread_reply_error(
+                request,
+                format!(
+                    "tenant access token request returned code {}: {}",
+                    provider_response.code,
+                    provider_response
+                        .msg
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            ));
+        }
+        let Some(token) = present_owned(provider_response.tenant_access_token) else {
+            return Err(streaming_thread_reply_error(
+                request,
+                "tenant access token response did not include a token",
+            ));
+        };
+        if provider_response.expire.unwrap_or_default() <= 0 {
+            return Err(streaming_thread_reply_error(
+                request,
+                "tenant access token response had an invalid expiry",
+            ));
+        }
+
+        Ok(token)
+    }
+
     async fn fetch_tenant_access_token_for_conversation_text(
         &self,
         request: &FeishuLarkConversationTextRequest,
@@ -1790,6 +2559,39 @@ struct FeishuLarkAppBotReplyMessageRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct FeishuLarkCardKitCreateRequest {
+    #[serde(rename = "type")]
+    card_type: &'static str,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkCardKitContentUpdateRequest<'a> {
+    content: &'a str,
+    sequence: u64,
+    uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkCardKitSettingsUpdateRequest {
+    settings: String,
+    sequence: u64,
+    uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkCardReferenceContent<'a> {
+    #[serde(rename = "type")]
+    content_type: &'static str,
+    data: FeishuLarkCardReferenceData<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeishuLarkCardReferenceData<'a> {
+    card_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
 struct FeishuLarkTextMessageContent<'a> {
     text: &'a str,
 }
@@ -1831,6 +2633,24 @@ struct FeishuLarkAppBotReplyMessageResponse {
     code: i64,
     msg: Option<String>,
     data: Option<FeishuLarkAppBotReplyMessageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardKitCreateResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuLarkCardKitCreateData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardKitCreateData {
+    card_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuLarkCardKitUpdateResponse {
+    code: i64,
+    msg: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2043,6 +2863,55 @@ fn validate_app_bot_thread_reply_request(
     Ok(())
 }
 
+fn validate_app_bot_streaming_thread_reply_request(
+    request: &FeishuLarkStreamingThreadReplyRequest,
+    provider_id: &str,
+    runtime: &FeishuLarkAppBotRuntime,
+) -> Result<(), ProviderThreadReplyError> {
+    if request.provider_id != provider_id {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request provider_id did not match adapter",
+        ));
+    }
+    if request.provider_type != ProviderType::FeishuLark.as_str() {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request provider_type did not match adapter",
+        ));
+    }
+    if runtime
+        .tenant_key
+        .as_deref()
+        .is_some_and(|configured_tenant_key| request.provider_account_id != configured_tenant_key)
+    {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request tenant did not match Feishu/Lark app config",
+        ));
+    }
+    if present(Some(request.provider_account_id.as_str())).is_none() {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request did not include provider_account_id",
+        ));
+    }
+    if present(Some(request.provider_conversation_id.as_str())).is_none() {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request did not include provider_conversation_id",
+        ));
+    }
+    if present(Some(request.provider_thread_id.as_str())).is_none() {
+        return Err(streaming_thread_reply_error(
+            request,
+            "streaming thread reply request did not include provider_thread_id",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_app_bot_conversation_text_request(
     request: &FeishuLarkConversationTextRequest,
     provider_id: &str,
@@ -2162,8 +3031,36 @@ fn required_thread_reply_response_field(
     })
 }
 
+fn required_streaming_thread_reply_response_field(
+    request: &FeishuLarkStreamingThreadReplyRequest,
+    field: &'static str,
+    value: Option<String>,
+) -> Result<String, ProviderThreadReplyError> {
+    present_owned(value).ok_or_else(|| {
+        streaming_thread_reply_error(
+            request,
+            format!("Feishu/Lark streaming reply response did not include {field}"),
+        )
+    })
+}
+
 fn thread_reply_error(
     request: &ProviderThreadReplyRequest,
+    message: impl Into<String>,
+) -> ProviderThreadReplyError {
+    ProviderThreadReplyError {
+        provider_id: request.provider_id.clone(),
+        provider_type: request.provider_type.clone(),
+        surface_id: request.surface_id.clone(),
+        provider_event_id_hash: request.provider_event_id_hash.clone(),
+        message: message.into().into_boxed_str(),
+        http_status: None,
+        retriable: false,
+    }
+}
+
+fn streaming_thread_reply_error(
+    request: &FeishuLarkStreamingThreadReplyRequest,
     message: impl Into<String>,
 ) -> ProviderThreadReplyError {
     ProviderThreadReplyError {
@@ -2187,6 +3084,76 @@ fn thread_reply_uuid(provider_event_id_hash: &str) -> String {
             &provider_event_id_hash[..index]
         });
     format!("{prefix}{hash_prefix}")
+}
+
+fn streaming_thread_reply_uuid(provider_event_id_hash: &str) -> String {
+    let prefix = "ars_";
+    let max_hash_len = 50 - prefix.len();
+    let hash_prefix = provider_event_id_hash
+        .char_indices()
+        .nth(max_hash_len)
+        .map_or(provider_event_id_hash, |(index, _)| {
+            &provider_event_id_hash[..index]
+        });
+    format!("{prefix}{hash_prefix}")
+}
+
+fn streaming_card_update_uuid(card_id: &str, sequence: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(card_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(sequence.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("arcu_{}", &hash[..24])
+}
+
+fn streaming_markdown_card(content: &str, streaming: bool) -> serde_json::Value {
+    json!({
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": streaming,
+            "summary": {
+                "content": if streaming { STREAMING_REPLY_INITIAL_TEXT } else { "Codex finished" }
+            },
+            "streaming_config": {
+                "print_frequency_ms": { "default": 70 },
+                "print_step": { "default": 1 },
+                "print_strategy": "fast"
+            }
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "element_id": STREAMING_REPLY_ELEMENT_ID,
+                    "content": content
+                }
+            ]
+        }
+    })
+}
+
+fn short_card_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "Codex finished".to_string();
+    }
+    let mut summary = String::new();
+    for ch in trimmed.chars().take(80) {
+        if ch.is_control() {
+            summary.push(' ');
+        } else {
+            summary.push(ch);
+        }
+    }
+    if trimmed.chars().count() > 80 {
+        summary.push_str("...");
+    }
+    summary
 }
 
 fn thread_notification_uuid(signal_id: &str, provider_thread_id: &str) -> String {

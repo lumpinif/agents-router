@@ -831,7 +831,7 @@ pub fn lookup_and_claim_provider_thread_session_reply(
                         provider_conversation_id: binding.provider_conversation_id,
                         provider_message_id: binding.provider_thread_id.clone(),
                         provider_thread_id: binding.provider_thread_id,
-                        route_binding_hash: None,
+                        route_binding_hash: binding.route_binding_hash,
                         status: ResponseSurfaceStatus::Open,
                     },
                     provider_event_id_hash,
@@ -2340,6 +2340,10 @@ mod tests {
             ready.reply.reply_text,
             "Run the tests and fix the failing one."
         );
+        assert_eq!(
+            ready.surface.route_binding_hash.as_deref(),
+            Some("route-hash-1")
+        );
     }
 
     #[test]
@@ -2605,6 +2609,7 @@ mod tests {
             source_id: "codex_desktop".to_string(),
             source_type: "codex_desktop".to_string(),
             source_session_id: "session-1".to_string(),
+            route_binding_hash: Some("route-hash-1".to_string()),
             created_at: test_time(),
         }
     }

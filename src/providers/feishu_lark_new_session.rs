@@ -10,11 +10,17 @@ use crate::agent_controller::{
 use crate::agent_integration_catalog::AgentControllerKind;
 use crate::bridge_binding_ledger::{BridgeBindingLedgerStore, ThreadSessionBindingInput};
 use crate::bridge_control::{BridgeControlReply, BridgeNewSessionCommand};
-use crate::config::{ProviderType, SourceType};
+use crate::config::{ProviderType, SourceType, ValidatedConfig};
 use crate::execution_scope_guard::{ExecutionScopeKey, ExecutionScopeLease};
 use crate::new_session_dispatcher::{NewSessionDispatcher, NewSessionWork};
 use crate::providers::feishu_lark::FeishuLarkProvider;
+use crate::providers::feishu_lark::{
+    FeishuLarkLazyStreamingThreadReplyParts, FeishuLarkStreamingThreadReplyRequest,
+};
 use crate::providers::feishu_lark_control::dispatch_feishu_lark_control_reply;
+use crate::response_surface_runtime::{
+    response_surface_route_binding_hash, route_allows_response_surface_project,
+};
 use crate::runtime::RuntimeState;
 
 const NEW_SESSION_BUSY_NOTICE_TEXT: &str =
@@ -119,7 +125,7 @@ async fn run_lark_new_session_worker(
 
     let provider_reply = FeishuLarkProvider::from_config(current_provider)?;
     let Some(source_type) = SourceType::from_signal_value(&command.source_type) else {
-        send_new_session_text_reply(
+        send_new_session_reply(
             &provider_reply,
             &command,
             "This source cannot start new Codex threads.",
@@ -128,13 +134,19 @@ async fn run_lark_new_session_worker(
         return Ok(());
     };
 
+    let streaming_reply = FeishuLarkLazyStreamingThreadReplyParts::new(
+        provider_reply,
+        streaming_request_from_command(&command),
+    );
+    let progress_observer = streaming_reply.progress_observer();
     let controller = CodexAppServerController::new();
     let observer = LarkNewSessionStartObserver {
         bridge_binding_ledger_store: runtime_state.bridge_binding_ledger(),
         command: command.clone(),
+        route_binding_hash: route_binding_hash_for_new_session(&snapshot.config, &command),
     };
     let result = controller
-        .start_session_with_observer(
+        .start_session_with_observers(
             AgentSessionStartRequest {
                 controller_kind: AgentControllerKind::CodexAppServer,
                 surface_id: bridge_new_session_surface_id(&command),
@@ -145,6 +157,7 @@ async fn run_lark_new_session_worker(
                 provider_event_id_hash: command.provider_event_id_hash.clone(),
             },
             &observer,
+            &progress_observer,
         )
         .await;
 
@@ -157,7 +170,7 @@ async fn run_lark_new_session_worker(
                 event.hash = %command.provider_event_id_hash,
                 event = "provider_control.new_session.controller_succeeded",
             );
-            send_new_session_text_reply(&provider_reply, &command, success.result.result_text())
+            send_new_session_reply(&streaming_reply, &command, success.result.result_text())
                 .await?;
         }
         Err(error) => {
@@ -170,21 +183,32 @@ async fn run_lark_new_session_worker(
                 error = %error.message,
                 event = "provider_control.new_session.controller_failed",
             );
-            send_new_session_text_reply(
-                &provider_reply,
-                &command,
-                new_session_failure_text(&error),
-            )
-            .await?;
+            send_new_session_reply(&streaming_reply, &command, new_session_failure_text(&error))
+                .await?;
         }
     }
 
     Ok(())
 }
 
+fn streaming_request_from_command(
+    command: &BridgeNewSessionCommand,
+) -> FeishuLarkStreamingThreadReplyRequest {
+    FeishuLarkStreamingThreadReplyRequest {
+        provider_id: command.provider_id.clone(),
+        provider_type: command.provider_type.clone(),
+        provider_account_id: command.provider_account_id.clone(),
+        provider_conversation_id: command.provider_conversation_id.clone(),
+        provider_thread_id: command.provider_thread_id.clone(),
+        surface_id: bridge_new_session_surface_id(command),
+        provider_event_id_hash: command.provider_event_id_hash.clone(),
+    }
+}
+
 struct LarkNewSessionStartObserver {
     bridge_binding_ledger_store: BridgeBindingLedgerStore,
     command: BridgeNewSessionCommand,
+    route_binding_hash: Option<String>,
 }
 
 impl AgentSessionStartObserver for LarkNewSessionStartObserver {
@@ -203,6 +227,7 @@ impl AgentSessionStartObserver for LarkNewSessionStartObserver {
                             source_id: self.command.source_id.clone(),
                             source_type: self.command.source_type.clone(),
                             source_session_id: source_session_id.to_string(),
+                            route_binding_hash: self.route_binding_hash.clone(),
                         },
                         Utc::now(),
                     )?;
@@ -231,7 +256,25 @@ impl AgentSessionStartObserver for LarkNewSessionStartObserver {
     }
 }
 
-async fn send_new_session_text_reply(
+fn route_binding_hash_for_new_session(
+    config: &ValidatedConfig,
+    command: &BridgeNewSessionCommand,
+) -> Option<String> {
+    config
+        .routes
+        .iter()
+        .find(|route| {
+            route_allows_response_surface_project(
+                route,
+                &command.source_id,
+                &command.provider_id,
+                &command.project_path,
+            )
+        })
+        .map(response_surface_route_binding_hash)
+}
+
+async fn send_new_session_reply(
     provider_reply: &dyn ProviderThreadReplyAdapter,
     command: &BridgeNewSessionCommand,
     text: &str,

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -5,14 +7,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::time::{Duration, Instant as TokioInstant, sleep_until};
+use tokio::time::{Duration, Instant as TokioInstant, sleep_until, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
     AgentControllerAdapter, AgentControllerError, AgentControllerErrorKind, AgentControllerFuture,
-    AgentControllerRequest, AgentControllerSubmitObserver, AgentControllerSuccess,
-    AgentSessionStartFuture, AgentSessionStartObserver, AgentSessionStartRequest,
-    AgentSessionStartSuccess,
+    AgentControllerProgressObserver, AgentControllerRequest, AgentControllerSubmitObserver,
+    AgentControllerSuccess, AgentSessionStartFuture, AgentSessionStartObserver,
+    AgentSessionStartRequest, AgentSessionStartSuccess, NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
 };
 use crate::agent_integration_catalog::AgentControllerKind;
 
@@ -20,6 +22,13 @@ use crate::agent_integration_catalog::AgentControllerKind;
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const PRE_SUBMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const PRE_SUBMIT_REQUEST_TIMEOUT: Duration = Duration::from_millis(50);
+
+#[cfg(target_os = "macos")]
+const MACOS_CODEX_DESKTOP_BINARY: &str = "/Applications/Codex.app/Contents/Resources/codex";
 
 #[derive(Debug)]
 pub struct CodexAppServerController {
@@ -35,7 +44,7 @@ struct CodexAppServerCommand {
 impl Default for CodexAppServerCommand {
     fn default() -> Self {
         Self {
-            program: "codex".to_string(),
+            program: default_codex_app_server_program(),
             args: vec![
                 "app-server".to_string(),
                 "--listen".to_string(),
@@ -43,6 +52,27 @@ impl Default for CodexAppServerCommand {
             ],
         }
     }
+}
+
+fn default_codex_app_server_program() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        default_codex_app_server_program_for_macos(Path::new(MACOS_CODEX_DESKTOP_BINARY))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "codex".to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_codex_app_server_program_for_macos(desktop_binary: &Path) -> String {
+    if desktop_binary.is_file() {
+        return desktop_binary.to_string_lossy().into_owned();
+    }
+
+    "codex".to_string()
 }
 
 impl CodexAppServerController {
@@ -70,8 +100,12 @@ impl AgentControllerAdapter for CodexAppServerController {
     ) -> AgentControllerFuture<'a> {
         Box::pin(async move {
             let submit_observer = NoopSubmitObserver;
-            self.continue_session_with_submit_observer(request, &submit_observer)
-                .await
+            self.continue_session_with_observers(
+                request,
+                &submit_observer,
+                &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+            )
+            .await
         })
     }
 
@@ -79,6 +113,19 @@ impl AgentControllerAdapter for CodexAppServerController {
         &'a self,
         request: AgentControllerRequest,
         submit_observer: &'a dyn AgentControllerSubmitObserver,
+    ) -> AgentControllerFuture<'a> {
+        self.continue_session_with_observers(
+            request,
+            submit_observer,
+            &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+        )
+    }
+
+    fn continue_session_with_observers<'a>(
+        &'a self,
+        request: AgentControllerRequest,
+        submit_observer: &'a dyn AgentControllerSubmitObserver,
+        progress_observer: &'a dyn AgentControllerProgressObserver,
     ) -> AgentControllerFuture<'a> {
         Box::pin(async move {
             let mut connection = ProcessAppServerConnection::spawn(&self.command)
@@ -91,8 +138,13 @@ impl AgentControllerAdapter for CodexAppServerController {
                     )
                 })?;
 
-            let result =
-                continue_session_with_connection(&mut connection, &request, submit_observer).await;
+            let result = continue_session_with_connection(
+                &mut connection,
+                &request,
+                submit_observer,
+                progress_observer,
+            )
+            .await;
             connection.shutdown().await;
             result
         })
@@ -104,7 +156,12 @@ impl AgentControllerAdapter for CodexAppServerController {
     ) -> AgentSessionStartFuture<'a> {
         Box::pin(async move {
             let observer = NoopStartObserver;
-            self.start_session_with_observer(request, &observer).await
+            self.start_session_with_observers(
+                request,
+                &observer,
+                &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+            )
+            .await
         })
     }
 
@@ -112,6 +169,19 @@ impl AgentControllerAdapter for CodexAppServerController {
         &'a self,
         request: AgentSessionStartRequest,
         observer: &'a dyn AgentSessionStartObserver,
+    ) -> AgentSessionStartFuture<'a> {
+        self.start_session_with_observers(
+            request,
+            observer,
+            &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+        )
+    }
+
+    fn start_session_with_observers<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+        observer: &'a dyn AgentSessionStartObserver,
+        progress_observer: &'a dyn AgentControllerProgressObserver,
     ) -> AgentSessionStartFuture<'a> {
         Box::pin(async move {
             let mut connection = ProcessAppServerConnection::spawn(&self.command)
@@ -124,7 +194,13 @@ impl AgentControllerAdapter for CodexAppServerController {
                     )
                 })?;
 
-            let result = start_session_with_connection(&mut connection, &request, observer).await;
+            let result = start_session_with_connection(
+                &mut connection,
+                &request,
+                observer,
+                progress_observer,
+            )
+            .await;
             connection.shutdown().await;
             result
         })
@@ -226,6 +302,7 @@ async fn continue_session_with_connection(
     connection: &mut impl AppServerConnection,
     request: &AgentControllerRequest,
     submit_observer: &dyn AgentControllerSubmitObserver,
+    progress_observer: &dyn AgentControllerProgressObserver,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
     let controller_started_at = Instant::now();
     info!(
@@ -466,12 +543,14 @@ async fn continue_session_with_connection(
                 format!("failed to record submitted continuation boundary: {error}"),
             )
         })?;
+    flush_progress_snapshot(request, &mut turn_state, progress_observer).await?;
 
     wait_for_final_answer(
         connection,
         request,
         &mut next_request_id,
         &mut turn_state,
+        progress_observer,
         controller_started_at,
     )
     .await
@@ -481,6 +560,7 @@ async fn start_session_with_connection(
     connection: &mut impl AppServerConnection,
     request: &AgentSessionStartRequest,
     observer: &dyn AgentSessionStartObserver,
+    progress_observer: &dyn AgentControllerProgressObserver,
 ) -> Result<AgentSessionStartSuccess, AgentControllerError> {
     let controller_started_at = Instant::now();
     let placeholder = request.as_placeholder_controller_request();
@@ -600,12 +680,14 @@ async fn start_session_with_connection(
                 format!("failed to record submitted new session boundary: {error}"),
             )
         })?;
+    flush_progress_snapshot(&turn_request, &mut turn_state, progress_observer).await?;
 
     let result = wait_for_final_answer(
         connection,
         &turn_request,
         &mut next_request_id,
         &mut turn_state,
+        progress_observer,
         controller_started_at,
     )
     .await?;
@@ -621,6 +703,7 @@ async fn wait_for_final_answer(
     request: &AgentControllerRequest,
     next_request_id: &mut u64,
     turn_state: &mut TurnStartState,
+    progress_observer: &dyn AgentControllerProgressObserver,
     controller_started_at: Instant,
 ) -> Result<AgentControllerSuccess, AgentControllerError> {
     let mut next_poll_at = TokioInstant::now() + TURN_STATUS_POLL_INTERVAL;
@@ -692,14 +775,37 @@ async fn wait_for_final_answer(
                     controller_started_at,
                 )
                 .await?;
+                flush_progress_snapshot(request, turn_state, progress_observer).await?;
                 next_poll_at = TokioInstant::now() + TURN_STATUS_POLL_INTERVAL;
             }
             message = read_message(connection, request, SubmitBoundary::AfterPossibleSubmit) => {
                 let message = message?;
                 turn_state.observe(&message);
+                flush_progress_snapshot(request, turn_state, progress_observer).await?;
             }
         }
     }
+}
+
+async fn flush_progress_snapshot(
+    request: &AgentControllerRequest,
+    turn_state: &mut TurnStartState,
+    progress_observer: &dyn AgentControllerProgressObserver,
+) -> Result<(), AgentControllerError> {
+    let Some(snapshot) = turn_state.take_progress_snapshot() else {
+        return Ok(());
+    };
+
+    progress_observer
+        .text_snapshot(&snapshot)
+        .await
+        .map_err(|error| {
+            error_after_possible_submit(
+                request,
+                AgentControllerErrorKind::Internal,
+                format!("failed to publish Codex progress update: {error}"),
+            )
+        })
 }
 
 async fn poll_turn_status_from_thread_snapshot(
@@ -784,8 +890,13 @@ async fn send_request(
         event = "codex_app_server.request.sent",
     );
 
+    let pre_submit_deadline = (boundary == SubmitBoundary::BeforeSubmit)
+        .then(|| TokioInstant::now() + PRE_SUBMIT_REQUEST_TIMEOUT);
+
     loop {
-        let message = read_message(connection, request, boundary).await?;
+        let message =
+            read_message_for_request(connection, request, boundary, method, pre_submit_deadline)
+                .await?;
         if let Some(state) = turn_state.as_mut() {
             state.observe(&message);
             if let Some(message) = state.error_message.take() {
@@ -819,6 +930,28 @@ async fn send_request(
             return Ok(message.result.unwrap_or(Value::Null));
         }
     }
+}
+
+async fn read_message_for_request(
+    connection: &mut impl AppServerConnection,
+    request: &AgentControllerRequest,
+    boundary: SubmitBoundary,
+    method: &str,
+    pre_submit_deadline: Option<TokioInstant>,
+) -> Result<AppServerMessage, AgentControllerError> {
+    let read = read_message(connection, request, boundary);
+    let Some(deadline) = pre_submit_deadline else {
+        return read.await;
+    };
+
+    timeout_at(deadline, read).await.map_err(|_| {
+        controller_error(
+            request,
+            io_error_kind(method, boundary),
+            boundary,
+            format!("timed out waiting for Codex App Server {method} response before submitting to Codex"),
+        )
+    })?
 }
 
 async fn send_notification(
@@ -1083,6 +1216,8 @@ struct AppServerRpcError {
 struct TurnStartState {
     thread_id: String,
     turn_id: Option<String>,
+    progress_answer: String,
+    pending_progress_snapshot: Option<String>,
     final_answer: Option<String>,
     error_message: Option<String>,
     turn_completed: bool,
@@ -1094,6 +1229,8 @@ impl TurnStartState {
         Self {
             thread_id,
             turn_id: None,
+            progress_answer: String::new(),
+            pending_progress_snapshot: None,
             final_answer: None,
             error_message: None,
             turn_completed: false,
@@ -1152,6 +1289,22 @@ impl TurnStartState {
                     self.turn_id = Some(turn_id.to_string());
                 }
             }
+            Some("item/agentMessage/delta") => {
+                let Some(params) = message.params.as_ref() else {
+                    return;
+                };
+                if !self.bind_and_match_current_turn_from_delta(params) {
+                    return;
+                }
+                let Some(delta) = params.get("delta").and_then(Value::as_str) else {
+                    return;
+                };
+                if delta.is_empty() {
+                    return;
+                }
+                self.progress_answer.push_str(delta);
+                self.pending_progress_snapshot = Some(self.progress_answer.clone());
+            }
             Some("item/completed") => {
                 let Some(params) = message.params.as_ref() else {
                     return;
@@ -1166,7 +1319,7 @@ impl TurnStartState {
                     && item.get("phase").and_then(Value::as_str) == Some("final_answer")
                     && let Some(text) = item.get("text").and_then(Value::as_str)
                 {
-                    self.final_answer = Some(text.to_string());
+                    self.set_final_answer(text);
                 }
             }
             Some("error") => {
@@ -1203,9 +1356,16 @@ impl TurnStartState {
 
         self.last_observed_turn_status = turn_status_from_value(turn).map(str::to_string);
         if let Some(final_answer) = final_answer_from_items(turn.get("items")) {
-            self.final_answer = Some(final_answer.to_string());
+            self.set_final_answer(final_answer);
             self.turn_completed = true;
             return;
+        }
+
+        if let Some(progress_answer) = progress_answer_from_items(turn.get("items"))
+            && progress_answer != self.progress_answer
+        {
+            self.progress_answer = progress_answer.to_string();
+            self.pending_progress_snapshot = Some(self.progress_answer.clone());
         }
 
         if self
@@ -1241,6 +1401,32 @@ impl TurnStartState {
         self.turn_id
             .as_deref()
             .is_none_or(|turn_id| turn_id == event_turn_id)
+    }
+
+    fn bind_and_match_current_turn_from_delta(&mut self, params: &Value) -> bool {
+        if !self.matches_thread(params) {
+            return false;
+        }
+        let Some(event_turn_id) = notification_turn_id(params) else {
+            return false;
+        };
+        if self.turn_id.is_none() {
+            self.turn_id = Some(event_turn_id.to_string());
+            return true;
+        }
+        self.turn_id.as_deref() == Some(event_turn_id)
+    }
+
+    fn set_final_answer(&mut self, text: &str) {
+        self.final_answer = Some(text.to_string());
+        if text != self.progress_answer {
+            self.progress_answer = text.to_string();
+        }
+        self.pending_progress_snapshot = Some(self.progress_answer.clone());
+    }
+
+    fn take_progress_snapshot(&mut self) -> Option<String> {
+        self.pending_progress_snapshot.take()
     }
 }
 
@@ -1317,6 +1503,15 @@ fn final_answer_from_items(items: Option<&Value>) -> Option<&str> {
         .next_back()
 }
 
+fn progress_answer_from_items(items: Option<&Value>) -> Option<&str> {
+    items?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .next_back()
+}
+
 fn is_terminal_turn_status(status: &str) -> bool {
     matches!(
         status,
@@ -1328,6 +1523,7 @@ fn is_terminal_turn_status(status: &str) -> bool {
 mod tests {
     use std::collections::VecDeque;
     use std::io;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::SourceType;
@@ -1337,7 +1533,13 @@ mod tests {
         request: &AgentControllerRequest,
     ) -> Result<AgentControllerSuccess, AgentControllerError> {
         let submit_observer = NoopSubmitObserver;
-        super::continue_session_with_connection(connection, request, &submit_observer).await
+        super::continue_session_with_connection(
+            connection,
+            request,
+            &submit_observer,
+            &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1383,6 +1585,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_message_deltas_publish_progress_snapshots() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.134.0"})),
+            thread_read_response(2, "idle"),
+            response(
+                3,
+                json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
+            ),
+            response(4, json!({"turn": {"id": "turn-2"}})),
+            notification(
+                "item/agentMessage/delta",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-2",
+                    "itemId": "item-2",
+                    "delta": "Hello"
+                }),
+            ),
+            notification(
+                "item/agentMessage/delta",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-2",
+                    "itemId": "item-2",
+                    "delta": ", world"
+                }),
+            ),
+            notification(
+                "item/completed",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-2",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item-2",
+                        "phase": "final_answer",
+                        "text": "Hello, world."
+                    },
+                    "completedAtMs": 1779528751000i64
+                }),
+            ),
+        ]);
+        let request = controller_request("continue");
+        let submit_observer = NoopSubmitObserver;
+        let progress_observer = RecordingProgressObserver::default();
+
+        let result = super::continue_session_with_connection(
+            &mut connection,
+            &request,
+            &submit_observer,
+            &progress_observer,
+        )
+        .await
+        .expect("controller should return final answer");
+
+        assert_eq!(result.result_text(), "Hello, world.");
+        assert_eq!(
+            progress_observer.snapshots(),
+            vec!["Hello", "Hello, world", "Hello, world."]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_message_delta_ignores_other_turns() {
+        let mut connection = FakeAppServerConnection::new(vec![
+            response(1, json!({"userAgent": "Codex Desktop/0.134.0"})),
+            thread_read_response(2, "idle"),
+            response(
+                3,
+                json!({"thread": {"id": "session-1", "sessionId": "session-1"}}),
+            ),
+            response(4, json!({"turn": {"id": "turn-current"}})),
+            notification(
+                "item/agentMessage/delta",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-other",
+                    "itemId": "wrong-item",
+                    "delta": "wrong"
+                }),
+            ),
+            notification(
+                "item/completed",
+                json!({
+                    "threadId": "session-1",
+                    "turnId": "turn-current",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-final",
+                        "phase": "final_answer",
+                        "text": "current final"
+                    },
+                    "completedAtMs": 1779528751000i64
+                }),
+            ),
+        ]);
+        let request = controller_request("continue");
+        let submit_observer = NoopSubmitObserver;
+        let progress_observer = RecordingProgressObserver::default();
+
+        let result = super::continue_session_with_connection(
+            &mut connection,
+            &request,
+            &submit_observer,
+            &progress_observer,
+        )
+        .await
+        .expect("controller should return final answer");
+
+        assert_eq!(result.result_text(), "current final");
+        assert_eq!(progress_observer.snapshots(), vec!["current final"]);
+    }
+
+    #[tokio::test]
     async fn thread_resume_failure_is_before_submit() {
         let mut connection = FakeAppServerConnection::new(vec![
             response(1, json!({"userAgent": "Codex Desktop/0.130.0"})),
@@ -1401,6 +1717,47 @@ mod tests {
             crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
         );
         assert_eq!(connection.sent_len(), 4);
+    }
+
+    #[tokio::test]
+    async fn pre_submit_app_server_hang_fails_before_submit() {
+        let mut connection = HangingAppServerConnection::default();
+        let request = controller_request("continue");
+
+        let error = continue_session_with_connection(&mut connection, &request)
+            .await
+            .expect_err("pre-submit controller hang should fail");
+
+        assert_eq!(error.kind, AgentControllerErrorKind::ControllerUnavailable);
+        assert_eq!(
+            error.submit_boundary,
+            crate::agent_controller::AgentControllerFailureSubmitBoundary::FailedBeforeSubmit
+        );
+        assert!(
+            error
+                .message
+                .contains("timed out waiting for Codex App Server initialize response"),
+            "unexpected error message: {}",
+            error.message
+        );
+        assert_eq!(connection.sent_len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_prefers_codex_desktop_binary_when_present() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let desktop_binary = dir.path().join("codex");
+        std::fs::write(&desktop_binary, b"").expect("fake binary should be written");
+
+        assert_eq!(
+            default_codex_app_server_program_for_macos(&desktop_binary),
+            desktop_binary.to_string_lossy()
+        );
+        assert_eq!(
+            default_codex_app_server_program_for_macos(&dir.path().join("missing")),
+            "codex"
+        );
     }
 
     #[tokio::test]
@@ -1937,9 +2294,14 @@ mod tests {
         let request = session_start_request("Reply OK.");
         let observer = NoopStartObserver;
 
-        let result = start_session_with_connection(&mut connection, &request, &observer)
-            .await
-            .expect("new session should complete");
+        let result = start_session_with_connection(
+            &mut connection,
+            &request,
+            &observer,
+            &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+        )
+        .await
+        .expect("new session should complete");
 
         assert_eq!(result.source_session_id, "new-session-1");
         assert_eq!(result.result.result_text(), "new session result");
@@ -1963,6 +2325,35 @@ mod tests {
     struct FakeAppServerConnection {
         sent: Vec<String>,
         responses: VecDeque<String>,
+    }
+
+    #[derive(Default)]
+    struct RecordingProgressObserver {
+        snapshots: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingProgressObserver {
+        fn snapshots(&self) -> Vec<String> {
+            self.snapshots
+                .lock()
+                .expect("snapshots mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl AgentControllerProgressObserver for RecordingProgressObserver {
+        fn text_snapshot<'a>(
+            &'a self,
+            text: &'a str,
+        ) -> crate::agent_controller::AgentControllerSubmitFuture<'a> {
+            Box::pin(async move {
+                self.snapshots
+                    .lock()
+                    .expect("snapshots mutex should not be poisoned")
+                    .push(text.to_string());
+                Ok(())
+            })
+        }
     }
 
     impl FakeAppServerConnection {
@@ -1990,6 +2381,28 @@ mod tests {
 
         async fn read_line(&mut self) -> io::Result<Option<String>> {
             Ok(self.responses.pop_front())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct HangingAppServerConnection {
+        sent: Vec<String>,
+    }
+
+    impl HangingAppServerConnection {
+        fn sent_len(&self) -> usize {
+            self.sent.len()
+        }
+    }
+
+    impl AppServerConnection for HangingAppServerConnection {
+        async fn send_line(&mut self, line: String) -> io::Result<()> {
+            self.sent.push(line);
+            Ok(())
+        }
+
+        async fn read_line(&mut self) -> io::Result<Option<String>> {
+            std::future::pending().await
         }
     }
 

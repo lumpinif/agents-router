@@ -3,13 +3,16 @@ use tracing::{debug, info, warn};
 
 use crate::agent_controller::{
     AgentControllerClosedLoopDecision, AgentControllerPolicyOverrides, AgentControllerRuntime,
-    ProviderThreadReplyAdapter, ProviderThreadReplyRequest,
+    ClaimedInboundContinuationRequest, ProviderThreadReplyAdapter, ProviderThreadReplyRequest,
     codex_app_server::CodexAppServerController, send_provider_thread_reply_with_retry,
 };
 use crate::continuation_dispatcher::{ClaimedContinuationWork, ContinuationDispatcher};
 use crate::execution_scope_guard::{ExecutionScopeKey, ExecutionScopeLease};
 use crate::provider_inbound::ProviderInboundReady;
-use crate::providers::feishu_lark::FeishuLarkProvider;
+use crate::providers::feishu_lark::{
+    FeishuLarkLazyStreamingThreadReplyParts, FeishuLarkProvider,
+    FeishuLarkStreamingThreadReplyRequest,
+};
 use crate::response_surface_ledger::{InboundEventDedupInput, ResponseSurfaceLedgerStore};
 use crate::runtime::RuntimeState;
 
@@ -128,19 +131,41 @@ async fn run_claimed_lark_continuation_worker(
 
     let controller = CodexAppServerController::new();
     let controller_runtime = AgentControllerRuntime::new(vec![&controller]);
+    let streaming_reply = FeishuLarkLazyStreamingThreadReplyParts::new(
+        provider_reply,
+        streaming_request_from_ready(&ready),
+    );
+    let progress_observer = streaming_reply.progress_observer();
     let closed_loop = controller_runtime
-        .run_claimed_inbound_continuation_closed_loop_with_store(
-            &snapshot.config,
-            &ledger_store,
-            ready.clone(),
-            &provider_reply,
-            Utc::now(),
-            AgentControllerPolicyOverrides::default(),
+        .run_claimed_inbound_continuation_closed_loop_with_store_and_progress(
+            ClaimedInboundContinuationRequest {
+                config: &snapshot.config,
+                ledger_store: &ledger_store,
+                ready: ready.clone(),
+                provider_reply: &streaming_reply,
+                progress_observer: &progress_observer,
+                now: Utc::now(),
+                policy_overrides: AgentControllerPolicyOverrides::default(),
+            },
         )
         .await?;
 
     log_live_closed_loop_decision(&ready.surface.surface_id, &closed_loop);
     Ok(())
+}
+
+fn streaming_request_from_ready(
+    ready: &ProviderInboundReady,
+) -> FeishuLarkStreamingThreadReplyRequest {
+    FeishuLarkStreamingThreadReplyRequest {
+        provider_id: ready.reply.provider_id.clone(),
+        provider_type: ready.reply.provider_type.clone(),
+        provider_account_id: ready.reply.provider_account_id.clone(),
+        provider_conversation_id: ready.reply.provider_conversation_id.clone(),
+        provider_thread_id: ready.reply.provider_thread_id.clone(),
+        surface_id: ready.surface.surface_id.clone(),
+        provider_event_id_hash: ready.provider_event_id_hash.clone(),
+    }
 }
 
 async fn send_lark_source_session_busy_notice(

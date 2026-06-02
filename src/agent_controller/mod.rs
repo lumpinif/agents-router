@@ -77,6 +77,16 @@ pub trait AgentControllerAdapter: Send + Sync {
         self.continue_session(request)
     }
 
+    fn continue_session_with_observers<'a>(
+        &'a self,
+        request: AgentControllerRequest,
+        submit_observer: &'a dyn AgentControllerSubmitObserver,
+        progress_observer: &'a dyn AgentControllerProgressObserver,
+    ) -> AgentControllerFuture<'a> {
+        let _ = progress_observer;
+        self.continue_session_with_submit_observer(request, submit_observer)
+    }
+
     fn start_session_with_observer<'a>(
         &'a self,
         request: AgentSessionStartRequest,
@@ -85,11 +95,36 @@ pub trait AgentControllerAdapter: Send + Sync {
         let _ = observer;
         self.start_session(request)
     }
+
+    fn start_session_with_observers<'a>(
+        &'a self,
+        request: AgentSessionStartRequest,
+        observer: &'a dyn AgentSessionStartObserver,
+        progress_observer: &'a dyn AgentControllerProgressObserver,
+    ) -> AgentSessionStartFuture<'a> {
+        let _ = progress_observer;
+        self.start_session_with_observer(request, observer)
+    }
 }
 
 pub trait AgentControllerSubmitObserver: Send + Sync {
     fn submitted_possible<'a>(&'a self, source_turn_id: &'a str)
     -> AgentControllerSubmitFuture<'a>;
+}
+
+pub trait AgentControllerProgressObserver: Send + Sync {
+    fn text_snapshot<'a>(&'a self, text: &'a str) -> AgentControllerSubmitFuture<'a>;
+}
+
+pub(crate) struct NoopAgentControllerProgressObserver;
+
+pub(crate) static NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER: NoopAgentControllerProgressObserver =
+    NoopAgentControllerProgressObserver;
+
+impl AgentControllerProgressObserver for NoopAgentControllerProgressObserver {
+    fn text_snapshot<'a>(&'a self, _text: &'a str) -> AgentControllerSubmitFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait AgentSessionStartObserver: Send + Sync {
@@ -361,6 +396,16 @@ pub(crate) struct AgentControllerPolicyOverrides {
     provider_capability: Option<&'static ProviderModeCapability>,
 }
 
+pub(crate) struct ClaimedInboundContinuationRequest<'a> {
+    pub(crate) config: &'a ValidatedConfig,
+    pub(crate) ledger_store: &'a ResponseSurfaceLedgerStore,
+    pub(crate) ready: ProviderInboundReady,
+    pub(crate) provider_reply: &'a dyn ProviderThreadReplyAdapter,
+    pub(crate) progress_observer: &'a dyn AgentControllerProgressObserver,
+    pub(crate) now: DateTime<Utc>,
+    pub(crate) policy_overrides: AgentControllerPolicyOverrides,
+}
+
 impl<'a> AgentControllerRuntime<'a> {
     pub fn new(adapters: Vec<&'a dyn AgentControllerAdapter>) -> Self {
         Self { adapters }
@@ -507,15 +552,20 @@ impl<'a> AgentControllerRuntime<'a> {
         }
     }
 
-    pub(crate) async fn run_claimed_inbound_continuation_closed_loop_with_store(
+    pub(crate) async fn run_claimed_inbound_continuation_closed_loop_with_store_and_progress(
         &self,
-        config: &ValidatedConfig,
-        ledger_store: &ResponseSurfaceLedgerStore,
-        ready: ProviderInboundReady,
-        provider_reply: &dyn ProviderThreadReplyAdapter,
-        now: DateTime<Utc>,
-        policy_overrides: AgentControllerPolicyOverrides,
+        request: ClaimedInboundContinuationRequest<'_>,
     ) -> anyhow::Result<AgentControllerClosedLoopDecision> {
+        let ClaimedInboundContinuationRequest {
+            config,
+            ledger_store,
+            ready,
+            provider_reply,
+            progress_observer,
+            now,
+            policy_overrides,
+        } = request;
+
         let prepared = self.prepare_inbound_continuation(
             config,
             &ready,
@@ -537,6 +587,18 @@ impl<'a> AgentControllerRuntime<'a> {
                 .await;
             }
             PreparedInboundContinuation::Skipped(reason) => {
+                info!(
+                    surface.id = %ready.surface.surface_id,
+                    source.id = %ready.surface.source_id,
+                    source.type = %ready.surface.source_type,
+                    source.session.id = %ready.surface.source_session_id,
+                    provider.id = %ready.reply.provider_id,
+                    provider.type = %ready.reply.provider_type,
+                    provider.mode = %ready.reply.provider_mode.as_str(),
+                    event.hash = %ready.provider_event_id_hash,
+                    reason = ?reason,
+                    event = "agent_controller.continuation.skipped",
+                );
                 ledger_store
                     .update(|ledger| {
                         release_inbound_claim(ledger, &ready)?;
@@ -562,7 +624,7 @@ impl<'a> AgentControllerRuntime<'a> {
             now,
         };
         let outcome = match adapter
-            .continue_session_with_submit_observer(request.clone(), &submit_observer)
+            .continue_session_with_observers(request.clone(), &submit_observer, progress_observer)
             .await
         {
             Ok(result) => match controller_execution_from_success(&request, &ready, result) {
@@ -1993,18 +2055,22 @@ mod tests {
         let adapter = SubmittedThenPendingAdapter::default();
         let provider_reply = RecordingProviderThreadReplyAdapter::default();
         let runtime = AgentControllerRuntime::new(vec![&adapter]);
+        let config = enabled_config();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            runtime.run_claimed_inbound_continuation_closed_loop_with_store(
-                &enabled_config(),
-                &ledger_store,
-                ready.clone(),
-                &provider_reply,
-                test_time() + Duration::seconds(2),
-                AgentControllerPolicyOverrides {
-                    agent_integration: Some(available_codex_desktop()),
-                    provider_capability: Some(slack_app_capability()),
+            runtime.run_claimed_inbound_continuation_closed_loop_with_store_and_progress(
+                ClaimedInboundContinuationRequest {
+                    config: &config,
+                    ledger_store: &ledger_store,
+                    ready: ready.clone(),
+                    provider_reply: &provider_reply,
+                    progress_observer: &NOOP_AGENT_CONTROLLER_PROGRESS_OBSERVER,
+                    now: test_time() + Duration::seconds(2),
+                    policy_overrides: AgentControllerPolicyOverrides {
+                        agent_integration: Some(available_codex_desktop()),
+                        provider_capability: Some(slack_app_capability()),
+                    },
                 },
             ),
         )

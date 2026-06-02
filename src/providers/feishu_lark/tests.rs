@@ -825,6 +825,522 @@ async fn app_bot_sends_agent_result_text_to_same_root_thread() {
 }
 
 #[tokio::test]
+async fn app_bot_streaming_thread_reply_creates_updates_and_finishes_cardkit_card() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .and(body_partial_json(json!({
+            "app_id": "cli_test",
+            "app_secret": "test-app-secret"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/cardkit/v1/cards"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "type": "card_json"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "card_id": "card_streaming_result"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_streaming_reply_message_id",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "interactive"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_streaming_result/elements/answer/content",
+        ))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "content": "partial answer",
+            "sequence": 1
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_streaming_result/elements/answer/content",
+        ))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "content": "final answer",
+            "sequence": 2
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_streaming_result/settings",
+        ))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "sequence": 3
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success"
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let mut stream = provider
+        .start_streaming_thread_reply(streaming_thread_reply_request())
+        .await
+        .expect("streaming thread reply should start");
+
+    assert_eq!(
+        stream.provider_reply_message_id,
+        "om_streaming_reply_message_id"
+    );
+    stream
+        .set_markdown("partial answer")
+        .await
+        .expect("streaming card should update");
+    stream
+        .set_markdown("final answer")
+        .await
+        .expect("streaming card should update final answer");
+    let result = stream
+        .finish(Some("final answer"))
+        .await
+        .expect("streaming card should finish");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_streaming_reply_message_id")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    let create_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/cardkit/v1/cards")
+        .expect("CardKit create request should be recorded");
+    let create_body: serde_json::Value = create_request
+        .body_json()
+        .expect("CardKit create body should be JSON");
+    let card: serde_json::Value = serde_json::from_str(
+        create_body["data"]
+            .as_str()
+            .expect("CardKit card data should be a JSON string"),
+    )
+    .expect("CardKit card data should be valid JSON");
+    assert_eq!(card["schema"], "2.0");
+    assert_eq!(card["config"]["streaming_mode"], true);
+    assert_eq!(
+        card["body"]["elements"][0]["element_id"],
+        STREAMING_REPLY_ELEMENT_ID
+    );
+
+    let reply_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply")
+        .expect("streaming reply message should be recorded");
+    let reply_body: serde_json::Value = reply_request
+        .body_json()
+        .expect("reply body should be JSON");
+    let content: serde_json::Value = serde_json::from_str(
+        reply_body["content"]
+            .as_str()
+            .expect("reply content should be a JSON string"),
+    )
+    .expect("reply content should reference a CardKit card");
+    assert_eq!(content["type"], "card");
+    assert_eq!(content["data"]["card_id"], "card_streaming_result");
+
+    let finish_request = requests
+        .iter()
+        .find(|request| {
+            request.url.path() == "/open-apis/cardkit/v1/cards/card_streaming_result/settings"
+        })
+        .expect("CardKit settings request should be recorded");
+    let finish_body: serde_json::Value = finish_request
+        .body_json()
+        .expect("settings body should be JSON");
+    let settings: serde_json::Value = serde_json::from_str(
+        finish_body["settings"]
+            .as_str()
+            .expect("settings should be a JSON string"),
+    )
+    .expect("settings should be JSON");
+    assert_eq!(settings["config"]["streaming_mode"], false);
+    assert_eq!(settings["config"]["summary"]["content"], "final answer");
+}
+
+#[tokio::test]
+async fn lazy_streaming_thread_reply_streams_final_result_without_plain_text_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/cardkit/v1/cards"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "card_id": "card_lazy_stream"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_lazy_streaming_reply",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "interactive"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_lazy_stream/elements/answer/content",
+        ))
+        .and(body_partial_json(json!({
+            "content": "final answer",
+            "sequence": 1
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_lazy_stream/settings",
+        ))
+        .and(body_partial_json(json!({
+            "sequence": 2
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success"
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let reply =
+        FeishuLarkLazyStreamingThreadReplyParts::new(provider, streaming_thread_reply_request());
+    let result = reply
+        .send_thread_reply(thread_reply_request("final answer"))
+        .await
+        .expect("lazy streaming reply should send one streaming card");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_lazy_streaming_reply")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/open-apis/cardkit/v1/cards")
+            .count(),
+        1
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.url.path() == "/open-apis/cardkit/v1/cards/card_lazy_stream/settings"
+        }),
+        "lazy reply should finish the streaming card"
+    );
+}
+
+#[tokio::test]
+async fn lazy_streaming_thread_reply_falls_back_to_text_when_cardkit_start_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/cardkit/v1/cards"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "code": 999,
+            "msg": "cardkit unavailable"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "text",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_text_fallback_reply",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "text"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let reply =
+        FeishuLarkLazyStreamingThreadReplyParts::new(provider, streaming_thread_reply_request());
+    let result = reply
+        .send_thread_reply(thread_reply_request("final answer"))
+        .await
+        .expect("lazy streaming reply should fall back to text");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_text_fallback_reply")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/open-apis/cardkit/v1/cards")
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/elements/answer/content")),
+        "fallback should not update a CardKit card"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/settings")),
+        "fallback should not finish a CardKit card"
+    );
+    let reply_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply")
+        .expect("fallback text reply should be recorded");
+    let reply_body: serde_json::Value = reply_request
+        .body_json()
+        .expect("reply body should be JSON");
+    assert_eq!(reply_body["msg_type"], "text");
+    assert_eq!(reply_body["reply_in_thread"], true);
+    let content: serde_json::Value = serde_json::from_str(
+        reply_body["content"]
+            .as_str()
+            .expect("reply content should be a JSON string"),
+    )
+    .expect("reply content should be text JSON");
+    assert_eq!(content["text"], "final answer");
+}
+
+#[tokio::test]
+async fn lazy_streaming_thread_reply_falls_back_to_text_when_final_card_update_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/cardkit/v1/cards"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "card_id": "card_lazy_stream"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(body_partial_json(json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_lazy_streaming_reply",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "interactive"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/open-apis/cardkit/v1/cards/card_lazy_stream/elements/answer/content",
+        ))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "code": 999,
+            "msg": "card update failed"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(body_partial_json(json!({
+            "msg_type": "text",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_text_fallback_reply",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "text"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let reply =
+        FeishuLarkLazyStreamingThreadReplyParts::new(provider, streaming_thread_reply_request());
+    let result = reply
+        .send_thread_reply(thread_reply_request("final answer"))
+        .await
+        .expect("lazy streaming reply should fall back to text when final card update fails");
+
+    assert_eq!(
+        result.provider_reply_message_id.as_deref(),
+        Some("om_text_fallback_reply")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/open-apis/cardkit/v1/cards")
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path().contains("/elements/answer/content")),
+        "final CardKit update should be attempted before text fallback"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/settings")),
+        "CardKit finish should not run after the final content update fails"
+    );
+    let text_reply_request = requests
+        .iter()
+        .filter(|request| {
+            request.url.path() == "/open-apis/im/v1/messages/om_root_message_id/reply"
+        })
+        .find(|request| {
+            request
+                .body_json::<serde_json::Value>()
+                .ok()
+                .and_then(|body| body.get("msg_type").cloned())
+                == Some(json!("text"))
+        })
+        .expect("fallback text reply should be recorded");
+    let reply_body: serde_json::Value = text_reply_request
+        .body_json()
+        .expect("fallback text reply body should be JSON");
+    let content: serde_json::Value = serde_json::from_str(
+        reply_body["content"]
+            .as_str()
+            .expect("fallback content should be a JSON string"),
+    )
+    .expect("fallback content should be text JSON");
+    assert_eq!(content["text"], "final answer");
+}
+
+#[tokio::test]
 async fn app_bot_thread_reply_http_400_is_not_retriable() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1910,6 +2426,19 @@ fn thread_reply_request(text: &str) -> ProviderThreadReplyRequest {
         provider_event_id_hash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
             .to_string(),
         text: text.to_string(),
+    }
+}
+
+fn streaming_thread_reply_request() -> FeishuLarkStreamingThreadReplyRequest {
+    let request = thread_reply_request(STREAMING_REPLY_INITIAL_TEXT);
+    FeishuLarkStreamingThreadReplyRequest {
+        provider_id: request.provider_id,
+        provider_type: request.provider_type,
+        provider_account_id: request.provider_account_id,
+        provider_conversation_id: request.provider_conversation_id,
+        provider_thread_id: request.provider_thread_id,
+        surface_id: request.surface_id,
+        provider_event_id_hash: request.provider_event_id_hash,
     }
 }
 

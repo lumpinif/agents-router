@@ -164,6 +164,7 @@ im:message:send_as_bot
 im:message.group_msg:readonly
 im:chat:readonly
 im:chat:create
+cardkit:card:write
 ```
 
 Subscribe to:
@@ -217,6 +218,7 @@ For Existing Self-built App, also check:
 - The app has `im:message.group_msg:readonly`.
 - The app has `im:chat:readonly`.
 - The app has `im:chat:create` if you want the project-room card to create rooms.
+- The app has `cardkit:card:write` if you want Codex replies to stream as Markdown cards.
 - Event subscription uses Long Connection / WebSocket.
 - `im.message.receive_v1` is subscribed.
 - `im.chat.member.bot.added_v1` is subscribed.

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -137,6 +139,29 @@ pub fn response_surface_route_binding_hash(route: &RouteConfig) -> String {
     .expect("route binding hash input should serialize");
     let digest = Sha256::digest(raw);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn route_allows_response_surface_project(
+    route: &RouteConfig,
+    source_id: &str,
+    provider_id: &str,
+    project_path: &str,
+) -> bool {
+    if !route.sources.iter().any(|source| source == source_id)
+        || !route
+            .providers
+            .iter()
+            .any(|provider| provider == provider_id)
+        || route.response_surface.is_disabled()
+    {
+        return false;
+    }
+
+    route.only_forward_from_project_paths.is_empty()
+        || route
+            .only_forward_from_project_paths
+            .iter()
+            .any(|allowed_path| Path::new(project_path).starts_with(Path::new(allowed_path)))
 }
 
 #[cfg(test)]

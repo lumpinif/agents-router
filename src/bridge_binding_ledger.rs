@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -165,6 +165,8 @@ pub struct ThreadSessionBindingRecord {
     pub source_id: String,
     pub source_type: String,
     pub source_session_id: String,
+    #[serde(default)]
+    pub route_binding_hash: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -179,6 +181,7 @@ pub struct ThreadSessionBindingInput {
     pub source_id: String,
     pub source_type: String,
     pub source_session_id: String,
+    pub route_binding_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,17 +712,24 @@ impl BridgeBindingLedger {
         now: DateTime<Utc>,
     ) -> anyhow::Result<ThreadSessionBindingRecord> {
         validate_thread_session_binding_input(&input)?;
-        if let Some(record) = self
+        if let Some(record_index) = self
             .state
             .thread_session_bindings
             .iter()
-            .find(|record| thread_binding_matches(record, &ThreadBindingQuery::from(&input)))
+            .position(|record| thread_binding_matches(record, &ThreadBindingQuery::from(&input)))
         {
-            ensure!(
-                thread_session_binding_matches(record, &input),
-                "provider thread is already bound to a different source session"
-            );
-            return Ok(record.clone());
+            let record = &self.state.thread_session_bindings[record_index];
+            if thread_session_binding_matches(record, &input) {
+                return Ok(record.clone());
+            }
+            if thread_session_binding_can_adopt_route_hash(record, &input) {
+                self.state.thread_session_bindings[record_index].route_binding_hash =
+                    input.route_binding_hash.clone();
+                let record = self.state.thread_session_bindings[record_index].clone();
+                self.save()?;
+                return Ok(record);
+            }
+            bail!("provider thread is already bound to a different source session or route");
         }
 
         let record = ThreadSessionBindingRecord {
@@ -732,6 +742,7 @@ impl BridgeBindingLedger {
             source_id: input.source_id,
             source_type: input.source_type,
             source_session_id: input.source_session_id,
+            route_binding_hash: input.route_binding_hash,
             created_at: now,
         };
         self.state.thread_session_bindings.push(record.clone());
@@ -861,7 +872,11 @@ fn validate_thread_session_binding_input(input: &ThreadSessionBindingInput) -> a
     validate_project_path(&input.project_path)?;
     validate_present("source_id", &input.source_id)?;
     validate_present("source_type", &input.source_type)?;
-    validate_present("source_session_id", &input.source_session_id)
+    validate_present("source_session_id", &input.source_session_id)?;
+    if let Some(route_binding_hash) = input.route_binding_hash.as_deref() {
+        validate_present("route_binding_hash", route_binding_hash)?;
+    }
+    Ok(())
 }
 
 fn validate_source_session_thread_binding_query(
@@ -1002,6 +1017,19 @@ fn thread_session_binding_matches(
         && record.source_id == input.source_id
         && record.source_type == input.source_type
         && record.source_session_id == input.source_session_id
+        && record.route_binding_hash == input.route_binding_hash
+}
+
+fn thread_session_binding_can_adopt_route_hash(
+    record: &ThreadSessionBindingRecord,
+    input: &ThreadSessionBindingInput,
+) -> bool {
+    project_paths_share_tree(&record.project_path, &input.project_path)
+        && record.source_id == input.source_id
+        && record.source_type == input.source_type
+        && record.source_session_id == input.source_session_id
+        && record.route_binding_hash.is_none()
+        && input.route_binding_hash.is_some()
 }
 
 fn source_session_thread_binding_matches(
@@ -1099,15 +1127,16 @@ mod tests {
             .expect_err("thread should not silently switch source sessions");
 
         assert!(
-            error
-                .to_string()
-                .contains("provider thread is already bound to a different source session")
+            error.to_string().contains(
+                "provider thread is already bound to a different source session or route"
+            )
         );
         let binding = ledger
             .lookup_thread_session(&thread_query("thread-1"))
             .expect("thread binding should still exist");
         assert_eq!(binding.project_path, "/repo/agents-router");
         assert_eq!(binding.source_session_id, "session-1");
+        assert_eq!(binding.route_binding_hash.as_deref(), Some("route-hash-1"));
     }
 
     #[test]
@@ -1130,6 +1159,30 @@ mod tests {
 
         assert_eq!(rebound.project_path, "/repo/agents-router");
         assert_eq!(rebound.source_session_id, "session-1");
+        assert_eq!(rebound.route_binding_hash.as_deref(), Some("route-hash-1"));
+        assert_eq!(ledger.state.thread_session_bindings.len(), 1);
+    }
+
+    #[test]
+    fn legacy_thread_binding_adopts_route_hash_for_same_session() {
+        let mut ledger = BridgeBindingLedger::in_memory();
+        let now = test_time();
+        let mut legacy = thread_session("thread-1", "/repo/agents-router", "session-1");
+        legacy.route_binding_hash = None;
+        ledger
+            .bind_thread_session_at(legacy, now)
+            .expect("legacy thread should bind without route hash");
+
+        let rebound = ledger
+            .bind_thread_session_at(
+                thread_session("thread-1", "/repo/agents-router/crate", "session-1"),
+                now,
+            )
+            .expect("same legacy source session should adopt the route hash");
+
+        assert_eq!(rebound.project_path, "/repo/agents-router");
+        assert_eq!(rebound.source_session_id, "session-1");
+        assert_eq!(rebound.route_binding_hash.as_deref(), Some("route-hash-1"));
         assert_eq!(ledger.state.thread_session_bindings.len(), 1);
     }
 
@@ -1379,6 +1432,7 @@ mod tests {
             source_id: "codex_desktop".to_string(),
             source_type: "codex_desktop".to_string(),
             source_session_id: source_session_id.to_string(),
+            route_binding_hash: Some("route-hash-1".to_string()),
         }
     }
 

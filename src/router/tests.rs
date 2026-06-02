@@ -782,6 +782,7 @@ async fn personal_agent_bound_project_reuses_existing_thread_for_same_source_ses
                     source_id: "codex_desktop".to_string(),
                     source_type: "codex_desktop".to_string(),
                     source_session_id: "session-1".to_string(),
+                    route_binding_hash: Some("route-hash-1".to_string()),
                 },
                 Utc::now(),
             )?;
@@ -851,6 +852,7 @@ async fn personal_agent_bound_project_reuses_existing_thread_for_descendant_proj
                     source_id: "codex_desktop".to_string(),
                     source_type: "codex_desktop".to_string(),
                     source_session_id: "session-1".to_string(),
+                    route_binding_hash: Some("route-hash-1".to_string()),
                 },
                 Utc::now(),
             )?;

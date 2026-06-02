@@ -829,6 +829,7 @@ impl<'a> Router<'a> {
             source_id: record.source_id.clone(),
             source_type: record.source_type.clone(),
             source_session_id: record.source_session_id.clone(),
+            route_binding_hash: record.route_binding_hash.clone(),
         };
         let result = bridge_binding_ledger
             .update(|ledger| ledger.bind_thread_session_at(input, Utc::now()))

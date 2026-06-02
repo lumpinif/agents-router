@@ -22,9 +22,10 @@ use crate::agent_controller::{
 #[cfg(test)]
 use crate::agent_integration_catalog::AgentIntegrationDescriptor;
 use crate::agent_integration_catalog::agent_integration_for_source;
-#[cfg(test)]
-use crate::bridge_binding_ledger::ThreadSessionBindingInput;
-use crate::bridge_binding_ledger::{BridgeBindingLedger, BridgeBindingLedgerStore};
+use crate::bridge_binding_ledger::{
+    BridgeBindingLedger, BridgeBindingLedgerStore, ThreadSessionBindingInput,
+    ThreadSessionBindingRecord,
+};
 use crate::bridge_control::{
     BridgeControlOutcome, BridgeControlReply, BridgeProjectRoomPrompt, BridgeRoomMessage,
     disconnected_lark_thread_reply, handle_provider_control_command, handle_provider_room_event,
@@ -60,6 +61,9 @@ use crate::response_surface_exposure::evaluate_response_surface_exposure;
 #[cfg(test)]
 use crate::response_surface_ledger::ResponseSurfaceLedger;
 use crate::response_surface_ledger::ResponseSurfaceLedgerStore;
+use crate::response_surface_runtime::{
+    response_surface_route_binding_hash, route_allows_response_surface_project,
+};
 use crate::runtime::RuntimeState;
 
 const LARK_LONG_CONNECTION_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
@@ -428,6 +432,7 @@ impl FeishuLarkLongConnectionRuntime {
 
     pub async fn handle_event_before_platform_ack_with_stores_hidden(
         &self,
+        config: &ValidatedConfig,
         response_surface_ledger_store: &ResponseSurfaceLedgerStore,
         bridge_binding_ledger_store: &BridgeBindingLedgerStore,
         event: FeishuLarkLongConnectionEvent<'_>,
@@ -501,7 +506,12 @@ impl FeishuLarkLongConnectionRuntime {
 
         let thread_binding = bridge_binding_ledger_store
             .update(|ledger| {
-                Ok(ledger.lookup_thread_session(&thread_binding_query_for_reply(&reply)))
+                lookup_thread_session_with_route_hash_migration(
+                    ledger,
+                    config,
+                    &reply,
+                    event.received_at,
+                )
             })
             .await?;
         let Some(thread_binding) = thread_binding else {
@@ -677,6 +687,7 @@ impl FeishuLarkLongConnectionRuntime {
 
     pub async fn receive_event_before_platform_ack_with_stores_hidden(
         &self,
+        config: &ValidatedConfig,
         response_surface_ledger_store: &ResponseSurfaceLedgerStore,
         bridge_binding_ledger_store: &BridgeBindingLedgerStore,
         transport: &mut dyn FeishuLarkLongConnectionTransport,
@@ -713,6 +724,7 @@ impl FeishuLarkLongConnectionRuntime {
             let received_at = Utc::now();
             let decision = self
                 .handle_event_before_platform_ack_with_stores_hidden(
+                    config,
                     response_surface_ledger_store,
                     bridge_binding_ledger_store,
                     FeishuLarkLongConnectionEvent {
@@ -843,9 +855,11 @@ async fn run_live_lark_long_connection_provider(
     );
 
     loop {
+        let snapshot = runtime_state.current()?;
         let response_surface_ledger_store = runtime_state.response_surface_ledger();
         let bridge_binding_ledger_store = runtime_state.bridge_binding_ledger();
         let dispatch_context = FeishuLarkLiveDispatchContext {
+            config: &snapshot.config,
             response_surface_ledger_store: &response_surface_ledger_store,
             bridge_binding_ledger_store: &bridge_binding_ledger_store,
             dispatcher: &dispatcher,
@@ -866,6 +880,7 @@ async fn run_live_lark_long_connection_provider(
 }
 
 struct FeishuLarkLiveDispatchContext<'a> {
+    config: &'a ValidatedConfig,
     response_surface_ledger_store: &'a ResponseSurfaceLedgerStore,
     bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
     dispatcher: &'a dyn ContinuationDispatcher,
@@ -884,6 +899,7 @@ async fn receive_and_dispatch_live_lark_event_hidden(
 ) -> anyhow::Result<()> {
     let decision = long_connection
         .receive_event_before_platform_ack_with_stores_hidden(
+            dispatch_context.config,
             dispatch_context.response_surface_ledger_store,
             dispatch_context.bridge_binding_ledger_store,
             transport,
@@ -1066,6 +1082,72 @@ fn has_codex_desktop_response_surface_route(
                 .any(|route_provider| route_provider == &provider.id)
             && evaluate_response_surface_exposure(agent, provider_capability, route).is_eligible()
     })
+}
+
+fn lookup_thread_session_with_route_hash_migration(
+    ledger: &mut BridgeBindingLedger,
+    config: &ValidatedConfig,
+    reply: &crate::provider_inbound::NormalizedProviderSurfaceReply,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<ThreadSessionBindingRecord>> {
+    let query = thread_binding_query_for_reply(reply);
+    let Some(binding) = ledger.lookup_thread_session(&query) else {
+        return Ok(None);
+    };
+    if binding.route_binding_hash.is_some() {
+        return Ok(Some(binding));
+    }
+    let Some(route_binding_hash) =
+        unique_route_binding_hash_for_thread_session_binding(config, &binding)
+    else {
+        return Ok(Some(binding));
+    };
+    let migrated = ledger.bind_thread_session_at(
+        ThreadSessionBindingInput {
+            provider_id: binding.provider_id,
+            provider_type: binding.provider_type,
+            provider_account_id: binding.provider_account_id,
+            provider_conversation_id: binding.provider_conversation_id,
+            provider_thread_id: binding.provider_thread_id,
+            project_path: binding.project_path,
+            source_id: binding.source_id,
+            source_type: binding.source_type,
+            source_session_id: binding.source_session_id,
+            route_binding_hash: Some(route_binding_hash.clone()),
+        },
+        now,
+    )?;
+    info!(
+        provider.id = %migrated.provider_id,
+        provider.thread.id = %migrated.provider_thread_id,
+        route.binding.hash = %route_binding_hash,
+        event = "bridge_binding.thread_session.route_binding_migrated",
+    );
+    Ok(Some(migrated))
+}
+
+fn unique_route_binding_hash_for_thread_session_binding(
+    config: &ValidatedConfig,
+    binding: &ThreadSessionBindingRecord,
+) -> Option<String> {
+    let mut hashes = config
+        .routes
+        .iter()
+        .filter(|route| {
+            route_allows_response_surface_project(
+                route,
+                &binding.source_id,
+                &binding.provider_id,
+                &binding.project_path,
+            )
+        })
+        .map(response_surface_route_binding_hash);
+
+    let hash = hashes.next()?;
+    if hashes.next().is_some() {
+        return None;
+    }
+    Some(hash)
 }
 
 fn log_platform_ack_sent(provider_id: &str, decision: &FeishuLarkLongConnectionDecision) {
@@ -1869,6 +1951,7 @@ mod tests {
             .await
             .expect("surface should be stored");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
                 "om_reply_message_id",
@@ -1892,6 +1975,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -1912,6 +1996,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -1943,6 +2028,7 @@ mod tests {
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_root_payload(
                 "om_bind_message_id",
@@ -1962,6 +2048,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2012,6 +2099,7 @@ mod tests {
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_direct_payload(
                 "om_direct_bind_message_id",
@@ -2031,6 +2119,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2064,6 +2153,7 @@ mod tests {
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
                 br#"{
@@ -2093,6 +2183,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2131,6 +2222,7 @@ mod tests {
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(
                 br#"{
@@ -2169,6 +2261,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2216,6 +2309,7 @@ mod tests {
             .await
             .expect("room binding should persist");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_root_payload(
                 "om_new_message_id",
@@ -2235,6 +2329,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2262,7 +2357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_transport_dispatches_thread_binding_when_surface_is_missing() {
+    async fn hidden_transport_dispatches_legacy_thread_binding_after_route_hash_migration() {
         let now = test_time();
         let dir = tempdir().expect("temp dir should exist");
         let ledger_store = ResponseSurfaceLedgerStore::new(dir.path().join("ledger.json"))
@@ -2283,6 +2378,7 @@ mod tests {
                         source_id: "codex_desktop".to_string(),
                         source_type: "codex_desktop".to_string(),
                         source_session_id: "session-1".to_string(),
+                        route_binding_hash: None,
                     },
                     now,
                 )?;
@@ -2291,6 +2387,10 @@ mod tests {
             .await
             .expect("thread binding should persist");
         let runtime = app_bot_runtime();
+        let mut config = lark_response_surface_config(true, true);
+        config.routes[0].only_forward_from_project_paths =
+            vec!["/Users/tester/projects".to_string()];
+        let expected_route_hash = response_surface_route_binding_hash(&config.routes[0]);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
                 "om_reply_without_surface",
@@ -2310,6 +2410,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2332,12 +2433,30 @@ mod tests {
             "continue from binding"
         );
         assert_eq!(dispatched[0].ready.surface.source_session_id, "session-1");
+        assert_eq!(
+            dispatched[0].ready.surface.route_binding_hash.as_deref(),
+            Some(expected_route_hash.as_str())
+        );
         assert!(
             dispatched[0]
                 .ready
                 .surface
                 .surface_id
                 .starts_with("bridge-thread-")
+        );
+        let migrated = bridge_binding_ledger_store
+            .update(|ledger| {
+                Ok(ledger
+                    .lookup_thread_session(&thread_binding_query_for_reply(
+                        &dispatched[0].ready.reply,
+                    ))
+                    .expect("thread binding should still exist"))
+            })
+            .await
+            .expect("binding ledger should read");
+        assert_eq!(
+            migrated.route_binding_hash.as_deref(),
+            Some(expected_route_hash.as_str())
         );
     }
 
@@ -2350,6 +2469,7 @@ mod tests {
             BridgeBindingLedgerStore::new(dir.path().join("bridge-bindings.json"))
                 .expect("binding ledger store should build");
         let runtime = app_bot_runtime();
+        let config = lark_response_surface_config(true, true);
         let mut transport = RecordingTransport::with_messages(vec![
             FeishuLarkLongConnectionTransportMessage::Binary(event_frame(lark_reply_payload(
                 "om_unbound_reply",
@@ -2369,6 +2489,7 @@ mod tests {
             &mut transport,
             &mut payload_buffer,
             test_dispatch_context(
+                &config,
                 &ledger_store,
                 &bridge_binding_ledger_store,
                 &dispatcher,
@@ -2823,6 +2944,7 @@ mod tests {
     }
 
     fn test_dispatch_context<'a>(
+        config: &'a ValidatedConfig,
         response_surface_ledger_store: &'a ResponseSurfaceLedgerStore,
         bridge_binding_ledger_store: &'a BridgeBindingLedgerStore,
         dispatcher: &'a RecordingContinuationDispatcher,
@@ -2833,6 +2955,7 @@ mod tests {
         new_session_dispatcher: &'a RecordingNewSessionDispatcher,
     ) -> FeishuLarkLiveDispatchContext<'a> {
         FeishuLarkLiveDispatchContext {
+            config,
             response_surface_ledger_store,
             bridge_binding_ledger_store,
             dispatcher,

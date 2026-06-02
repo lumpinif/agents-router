@@ -119,7 +119,7 @@ Personal Agent App — Experimental
 
 Personal Agent App 是默认推荐选项，因为它支持双向 project room 体验：扫码 setup、私聊 `/new /absolute/project/path ...` 开新 Codex thread、私聊 `/bind /absolute/project/path` 打开项目群选择菜单、项目群 `/bind` 直接连接当前群、一个 Codex thread 对应一个 Lark thread。setup 会显示 QR code，扫码创建 Personal Agent app，并在完成后提示你私聊可以用 `/new /absolute/project/path what you want Codex to do` 开新 Codex thread；也可以在私聊里发送 `/bind /absolute/project/path`，选择建新群、使用已有群，或者忽略这个项目。项目群里则把 Personal Agent 拉进群，@ 它并发送 `/bind /absolute/project/path`。如果之后 Codex 从一个还没连接过的项目产生新更新，Agents Router 会在私聊里给出同一套选择。
 
-如果你已经有自建应用并且明确想连接一个固定群，请选择“已有自建应用”。这个模式需要 Bot 能力、包含 `im:chat:create` 的消息和群权限、`im.message.receive_v1`、`im.chat.member.bot.added_v1`、`card.action.trigger`、Long Connection / WebSocket、Tenant Key、Room Chat ID，以及已发布的新应用版本。如果你只想要一个简单的单向 fallback，请选择“群 Webhook”。
+如果你已经有自建应用并且明确想连接一个固定群，请选择“已有自建应用”。这个模式需要 Bot 能力、包含 `im:chat:create` 和 `cardkit:card:write` 的消息、群和卡片权限、`im.message.receive_v1`、`im.chat.member.bot.added_v1`、`card.action.trigger`、Long Connection / WebSocket、Tenant Key、Room Chat ID，以及已发布的新应用版本。如果你只想要一个简单的单向 fallback，请选择“群 Webhook”。
 
 ## Provider ID
 
