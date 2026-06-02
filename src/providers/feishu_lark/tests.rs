@@ -1112,6 +1112,93 @@ async fn lazy_streaming_thread_reply_streams_final_result_without_plain_text_rep
 }
 
 #[tokio::test]
+async fn lazy_streaming_thread_reply_can_start_before_final_result() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "test-tenant-token",
+            "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/cardkit/v1/cards"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "card_id": "card_lazy_stream"
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages/om_root_message_id/reply"))
+        .and(header("authorization", "Bearer test-tenant-token"))
+        .and(body_partial_json(json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "message_id": "om_lazy_streaming_reply",
+                "root_id": "om_root_message_id",
+                "parent_id": "om_root_message_id",
+                "thread_id": "omt_result_thread",
+                "msg_type": "interactive"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = test_app_bot_provider(server.uri());
+    let reply =
+        FeishuLarkLazyStreamingThreadReplyParts::new(provider, streaming_thread_reply_request());
+    let started = reply
+        .start()
+        .await
+        .expect("streaming card should start before the final answer");
+
+    assert!(started);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/open-apis/cardkit/v1/cards")
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path()
+                == "/open-apis/im/v1/messages/om_root_message_id/reply"),
+        "starting should send the visible Lark thread reply"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/elements/answer/content")),
+        "starting should not wait for or pretend to have final content"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/settings")),
+        "starting should not finish the streaming card"
+    );
+}
+
+#[tokio::test]
 async fn lazy_streaming_thread_reply_falls_back_to_text_when_cardkit_start_fails() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

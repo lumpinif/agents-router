@@ -113,6 +113,10 @@ pub trait AgentControllerSubmitObserver: Send + Sync {
 }
 
 pub trait AgentControllerProgressObserver: Send + Sync {
+    fn execution_started<'a>(&'a self) -> AgentControllerSubmitFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn text_snapshot<'a>(&'a self, text: &'a str) -> AgentControllerSubmitFuture<'a>;
 }
 
@@ -618,6 +622,16 @@ impl<'a> AgentControllerRuntime<'a> {
             event.hash = %request.provider_event_id_hash,
             event = "agent_controller.continuation.started",
         );
+        if let Err(error) = progress_observer.execution_started().await {
+            warn!(
+                surface.id = %ready.surface.surface_id,
+                source.session.id = %request.source_session_id,
+                controller.kind = ?request.controller_kind,
+                event.hash = %request.provider_event_id_hash,
+                error = %error,
+                event = "agent_controller.progress_start.failed",
+            );
+        }
         let submit_observer = StoreSubmittedPossibleObserver {
             ledger_store,
             ready: &ready,

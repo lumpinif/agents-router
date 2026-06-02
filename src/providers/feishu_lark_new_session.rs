@@ -138,6 +138,18 @@ async fn run_lark_new_session_worker(
         provider_reply,
         streaming_request_from_command(&command),
     );
+    if let Err(error) = streaming_reply.start().await {
+        warn!(
+            provider.id = %error.provider_id,
+            provider.type = %error.provider_type,
+            provider.thread.id = %command.provider_thread_id,
+            event.hash = %command.provider_event_id_hash,
+            http.status = error.http_status,
+            error.retriable = error.retriable,
+            error = %error.message,
+            event = "provider_control.new_session.streaming_start.failed",
+        );
+    }
     let progress_observer = streaming_reply.progress_observer();
     let controller = CodexAppServerController::new();
     let observer = LarkNewSessionStartObserver {

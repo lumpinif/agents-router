@@ -38,6 +38,8 @@ type HmacSha256 = Hmac<Sha256>;
 const CODEX_CARD_TEMPLATE: &str = "purple";
 const STREAMING_REPLY_ELEMENT_ID: &str = "answer";
 const STREAMING_REPLY_INITIAL_TEXT: &str = "Codex is working...";
+const STREAMING_PROGRESS_MIN_NEW_BYTES: usize = 24;
+const STREAMING_PROGRESS_MIN_INTERVAL: StdDuration = StdDuration::from_millis(350);
 
 #[derive(Debug, Clone)]
 pub struct FeishuLarkProvider {
@@ -500,6 +502,10 @@ impl FeishuLarkLazyStreamingThreadReplyParts {
         }
     }
 
+    pub(crate) async fn start(&self) -> Result<bool, ProviderThreadReplyError> {
+        self.ensure_started().await
+    }
+
     async fn set_markdown(&self, text: &str) -> Result<bool, ProviderThreadReplyError> {
         if !self.ensure_started().await? {
             return Ok(false);
@@ -678,6 +684,24 @@ impl ProviderThreadReplyAdapter for FeishuLarkLazyStreamingThreadReplyParts {
 }
 
 impl AgentControllerProgressObserver for FeishuLarkLazyStreamingProgressObserver {
+    fn execution_started<'a>(&'a self) -> AgentControllerSubmitFuture<'a> {
+        Box::pin(async move {
+            if let Err(error) = self.parts.start().await {
+                tracing::warn!(
+                    provider.id = %error.provider_id,
+                    provider.type = %error.provider_type,
+                    surface.id = %error.surface_id,
+                    event.hash = %error.provider_event_id_hash,
+                    http.status = error.http_status,
+                    error.retriable = error.retriable,
+                    error = %error.message,
+                    event = "provider_thread_streaming_reply.start.failed",
+                );
+            }
+            Ok(())
+        })
+    }
+
     fn text_snapshot<'a>(&'a self, text: &'a str) -> AgentControllerSubmitFuture<'a> {
         Box::pin(async move {
             if !self.should_send(text) {
@@ -720,7 +744,8 @@ fn should_send_streaming_progress(state: &Mutex<StreamingProgressState>, text: &
         return false;
     }
 
-    let enough_new_content = new_len.saturating_sub(state.last_sent_len) >= 80;
+    let enough_new_content =
+        new_len.saturating_sub(state.last_sent_len) >= STREAMING_PROGRESS_MIN_NEW_BYTES;
     let interval_elapsed = now >= state.next_update_at;
     let paragraph_boundary = text.ends_with('\n');
     if !(enough_new_content || interval_elapsed || paragraph_boundary) {
@@ -728,7 +753,7 @@ fn should_send_streaming_progress(state: &Mutex<StreamingProgressState>, text: &
     }
 
     state.last_sent_len = new_len;
-    state.next_update_at = now + StdDuration::from_millis(750);
+    state.next_update_at = now + STREAMING_PROGRESS_MIN_INTERVAL;
     true
 }
 
