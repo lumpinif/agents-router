@@ -1436,8 +1436,27 @@ fn can_send_test_notification(config: &RawConfig) -> bool {
     config.source("agents_router").is_some()
         && config.routes.iter().any(|route| {
             route.sources.iter().any(|source| source == "agents_router")
-                && !route.providers.is_empty()
+                && route.providers.iter().any(|provider_id| {
+                    config
+                        .provider(provider_id)
+                        .is_some_and(provider_can_receive_test_notification)
+                })
         })
+}
+
+fn provider_can_receive_test_notification(provider: &RawProviderConfig) -> bool {
+    match provider.provider_type {
+        ProviderType::FeishuLark => feishu_lark_provider_can_receive_test_notification(provider),
+        _ => true,
+    }
+}
+
+fn feishu_lark_provider_can_receive_test_notification(provider: &RawProviderConfig) -> bool {
+    provider.mode.as_deref() != Some("app_bot")
+        || provider
+            .chat_id
+            .as_deref()
+            .is_some_and(|chat_id| !chat_id.trim().is_empty())
 }
 
 fn print_local_source_integration_report(report: &LocalSourceIntegrationReport, i18n: I18n) {

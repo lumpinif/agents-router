@@ -1005,6 +1005,50 @@ fn self_built_app_test_notification_does_not_advertise_replies_for_unsupported_a
 }
 
 #[test]
+fn personal_agent_without_fixed_room_cannot_send_start_test_notification() {
+    let config = setup::build_feishu_lark_personal_agent_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "test-app-secret",
+        Some("ou_operator"),
+    );
+
+    assert!(!can_send_test_notification(&config));
+}
+
+#[test]
+fn self_built_app_with_fixed_room_can_send_start_test_notification() {
+    let config = setup::build_feishu_lark_app_bot_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "lark",
+        "cli_9f5343c580712544",
+        "test-app-secret",
+        "2ca1d211f64f6438",
+        "oc_5ce6d572455d361153b7xx51da133945",
+    );
+
+    assert!(can_send_test_notification(&config));
+}
+
+#[test]
+fn custom_bot_with_fixed_webhook_can_send_start_test_notification() {
+    let config = setup::build_feishu_lark_config(
+        setup::AgentIntegrationId::CodexDesktop,
+        AnswerDetail::Preview,
+        PromptDetail::Off,
+        "https://open.larksuite.com/open-apis/bot/v2/hook/secret-token",
+        None,
+    );
+
+    assert!(can_send_test_notification(&config));
+}
+
+#[test]
 fn setup_provider_summary_reports_hidden_credentials_without_printing_values() {
     let telegram_config = setup::build_telegram_config(
         setup::AgentIntegrationId::CodexDesktop,
