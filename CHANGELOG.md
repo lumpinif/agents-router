@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/lumpinif/agents-router/compare/v0.12.0...v0.12.1) (2026-06-06)
+
+
+### Bug Fixes
+
+* skip Personal Agent start test without fixed room ([1400f1e](https://github.com/lumpinif/agents-router/commit/1400f1e32e63cfe2ea700ac916592f68c97d2ba7))
+
 ## [0.12.0](https://github.com/lumpinif/agents-router/compare/v0.11.0...v0.12.0) (2026-06-03)
 
 
